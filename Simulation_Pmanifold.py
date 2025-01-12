@@ -176,16 +176,25 @@ plt.grid()
 plt.savefig("/content/k_space_basins.png", dpi=300)
 plt.show()
 
-# 3D Visualization of k-Space Dynamics
-k_states = np.arange(0, 11)
+# 3D Visualization of k-Space Dynamics from Simulation Results
+k_states = np.arange(0, R + 1)
 population_sizes = [k_manifold_population.get(k, 0) for k in k_states]
-ricci_curvature_values = [ricci_curvature.get(k, 1.0) for k in k_states]
+ricci_curvature_values = [k_curvatures.get((k, k+1), 0) if k < R else k_curvatures.get((k-1, k), 0) for k in k_states]
 
+# Create a grid for the surface
 X, Y = np.meshgrid(k_states, population_sizes)
 Z = np.tile(ricci_curvature_values, (len(population_sizes), 1))
 
+# Plot 3D Surface
 fig = plt.figure(figsize=(12, 8))
 ax = fig.add_subplot(111, projection='3d')
 surf = ax.plot_surface(X, Y, Z, cmap='viridis', edgecolor='none')
-ax.set_title("3D Visualization of k-Space Dynamics", fontsize=14)
-ax.set_xlabel("k-State")
+
+# Add titles and labels
+ax.set_title("3D Visualization of k-Space Dynamics (From Results)", fontsize=14)
+ax.set_xlabel("k-State (Oxidation Level)")
+ax.set_ylabel("Population Size")
+ax.set_zlabel("Ricci Curvature")
+plt.colorbar(surf, shrink=0.5, aspect=5, label="Ricci Curvature")
+plt.savefig("/content/simulation_based_E7_geo.png", dpi=300)
+plt.show()
