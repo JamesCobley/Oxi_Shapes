@@ -4,6 +4,7 @@ from collections import defaultdict
 import seaborn as sns
 import networkx as nx
 from GraphRicciCurvature.OllivierRicci import OllivierRicci
+from mpl_toolkits.mplot3d import Axes3D
 
 # Initialize parameters
 R = 10  # Number of cysteines
@@ -142,4 +143,26 @@ plt.xlabel("k-State")
 plt.ylabel("Population Size")
 plt.grid()
 plt.savefig("/content/k_space_basins.png", dpi=300)
+plt.show()
+
+# Example Data: Replace with actual simulation results
+k_states = np.arange(0, 11)
+population_sizes = np.random.uniform(50, 500, size=11)  # Replace with simulated population sizes
+ricci_curvature = np.array([0.8 if k <= 2 else 0.95 if k >= 9 else 1.0 for k in k_states])
+energy_gradient = 10 * (1 - ricci_curvature)  # Arbitrary scaling for visualization
+
+# Create a grid for the surface
+X, Y = np.meshgrid(k_states, population_sizes)
+Z = np.tile(ricci_curvature, (len(population_sizes), 1))
+
+# Plot 3D Surface
+fig = plt.figure(figsize=(12, 8))
+ax = fig.add_subplot(111, projection='3d')
+surf = ax.plot_surface(X, Y, Z, cmap='viridis', edgecolor='none')
+ax.set_title("3D Visualization of k-Space Dynamics", fontsize=14)
+ax.set_xlabel("k-State (Oxidation Level)")
+ax.set_ylabel("Population Size")
+ax.set_zlabel("Ricci Curvature")
+plt.colorbar(surf, shrink=0.5, aspect=5, label="Ricci Curvature")
+plt.savefig("/content/E7_geo.png", dpi=300)
 plt.show()
