@@ -69,11 +69,12 @@ def calculate_shannon_entropy(population, total_population):
 def calculate_lyapunov_exponent(history):
     differences = []
     for t in range(1, len(history)):
-        prev_dist = np.array([v for v in history[t-1].values()])
-        curr_dist = np.array([v for v in history[t].values()])
+        prev_dist = np.array([v for v in history[t-1][0].values()])  # Extract dictionary from tuple
+        curr_dist = np.array([v for v in history[t][0].values()])    # Extract dictionary from tuple
         divergence = np.abs(curr_dist - prev_dist)
-        differences.append(np.mean(np.log(divergence + 1e-9)))  # Avoid log(0)
+        differences.append(np.mean(np.log(divergence + 1e-9)))  # Avoid log(0) by adding a small value
     return np.mean(differences)
+
 
 # Run simulation
 def run_simulation(transition_dict, population, num_steps, r):
