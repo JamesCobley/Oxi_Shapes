@@ -2,6 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import seaborn as sns
+import networkx as nx
+from GraphRicciCurvature.OllivierRicci import OllivierRicci
 
 # Initialize parameters
 R = 10  # Number of cysteines
@@ -84,32 +86,60 @@ filled_final_population = fill_population_with_zeros(history[-1][0], proteoforms
 final_entropy = history[-1][1]
 lyapunov_exponent = calculate_lyapunov_exponent(history, proteoforms)
 
+# Compute mean redox state
+mean_redox_state = sum(k * count for k, count in [(state.count('1'), count) for state, count in filled_final_population.items()]) / total_population
+
 print(f"Final Population Count: {sum(filled_final_population.values()):.0f}")
 print(f"Final Shannon Entropy: {final_entropy:.4f}")
 print(f"Lyapunov Exponent: {lyapunov_exponent:.4f}")
+print(f"Mean Redox State of cdc20 Population: {mean_redox_state:.4f}")
 
-# Plot entropy trend
-plt.figure(figsize=(10, 6))
-entropies = [h[1] for h in history]
-plt.plot(range(num_steps), entropies, marker='o', label="Shannon Entropy")
-plt.title("Entropy Trend Over Time")
-plt.xlabel("Time Step")
-plt.ylabel("Shannon Entropy")
-plt.grid()
-plt.legend()
+# Compute k-manifold Ricci curvature
+kspace_graph_by_k = nx.Graph()
+k_manifold_population = defaultdict(float)
+
+# Aggregate k-manifold populations
+for state, count in filled_final_population.items():
+    k_value = state.count('1')
+    k_manifold_population[k_value] += count
+    kspace_graph_by_k.add_node(k_value)
+
+# Connect k-manifolds in the graph
+for k1 in k_manifold_population.keys():
+    for k2 in k_manifold_population.keys():
+        if abs(k1 - k2) == 1:  # Connect adjacent k-states
+            kspace_graph_by_k.add_edge(k1, k2)
+
+# Compute Ricci curvature for k-manifolds
+orc_k = OllivierRicci(kspace_graph_by_k, alpha=0.5)
+orc_k.compute_ricci_curvature()
+k_curvatures = nx.get_edge_attributes(orc_k.G, "ricciCurvature")
+
+# Visualize Ricci curvature for k-manifolds
+plt.figure(figsize=(12, 10))
+edge_colors = [k_curvatures.get(edge, 0) for edge in kspace_graph_by_k.edges()]
+pos_k = nx.spring_layout(kspace_graph_by_k)
+nx.draw(
+    kspace_graph_by_k, pos_k, with_labels=True,
+    edge_color=edge_colors, edge_cmap=plt.cm.coolwarm,
+    node_size=500, font_size=10
+)
+sm = plt.cm.ScalarMappable(
+    cmap=plt.cm.coolwarm,
+    norm=plt.Normalize(vmin=min(edge_colors), vmax=max(edge_colors))
+)
+sm.set_array([])
+
+plt.title("Ricci Curvature on k-Manifold Graph")
+plt.savefig("/content/ricci.png", dpi=300)
 plt.show()
 
-# Plot 2D k-space basins
-final_distribution = {k: v for k, v in filled_final_population.items()}
-basin_sizes = defaultdict(float)
-for state, count in final_distribution.items():
-    k_value = state.count('1')
-    basin_sizes[k_value] += count
-
+# Visualize final 2D k-space basins
 plt.figure(figsize=(10, 6))
-sns.barplot(x=list(basin_sizes.keys()), y=list(basin_sizes.values()), palette="viridis")
+sns.barplot(x=list(k_manifold_population.keys()), y=list(k_manifold_population.values()), palette="viridis")
 plt.title("Final Basin Sizes in k-Space")
 plt.xlabel("k-State")
 plt.ylabel("Population Size")
 plt.grid()
+plt.savefig("/content/k_space_basins.png", dpi=300)
 plt.show()
