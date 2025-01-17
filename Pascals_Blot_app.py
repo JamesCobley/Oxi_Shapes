@@ -86,7 +86,7 @@ def plot_immunoblot(molecular_mass, grouped_proteoforms, num_cysteines, coeffici
     return buf
 
 # Streamlit app
-st.title('Pascal's Blot App')
+st.title('Pascals Blot')
 
 uniprot_id = st.text_input("Enter UniProt Accession Number:", "P04406")
 
