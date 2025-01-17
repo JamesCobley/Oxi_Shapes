@@ -130,7 +130,7 @@ if uniprot_id:
 
             if buf:
                 # Display the plot
-                st.image(buf, use_column_width=True, caption='Simulated Pascal\'s Blot')
+                st.image(buf, use_container_width=True, caption='Simulated Pascal\'s Blot')
 
                 # Download button
                 buf.seek(0)
