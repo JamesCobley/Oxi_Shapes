@@ -7,3 +7,5 @@ scipy
 seaborn
 biopython
 openpyxl
+networkx
+GraphRicciCurvature
