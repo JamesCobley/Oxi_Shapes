@@ -86,7 +86,7 @@ def plot_immunoblot(molecular_mass, grouped_proteoforms, num_cysteines, coeffici
     return buf
 
 # Streamlit app
-st.title("Pascal's Blot Simulation App")
+st.title("Pascal\'s Blot Simulation App")
 
 uniprot_id = st.text_input("Enter UniProt Accession Number:", "P04406")
 
@@ -118,9 +118,9 @@ if uniprot_id:
 
         # Cleland Immunoblot suitability
         if oxidised_mass < 152:
-            st.success("Yes, this protein is a good candidate for Pascal's Blot.")
+            st.success("Yes, this protein is a good candidate for Pascal\'s Blot.")
         else:
-            st.warning("No, this protein is not a good candidate for Pascal's Blot.")
+            st.warning("No, this protein is not a good candidate for Pascal\'s Blot.")
 
         if num_cysteines > 0:
             # Coefficients from the standard curve
