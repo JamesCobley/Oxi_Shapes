@@ -1,0 +1,9 @@
+numpy
+pandas
+matplotlib
+requests
+streamlit
+scipy
+seaborn
+biopython
+openpyxl
