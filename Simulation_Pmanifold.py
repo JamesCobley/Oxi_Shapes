@@ -1,3 +1,5 @@
+!pip install networkx
+!pip install GraphRicciCurvature
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
@@ -14,15 +16,15 @@ initial_population = {'0000000000': 8350, '1111111111': 1650}
 # Define k-manifold P-matrix
 k_manifold_P = {
     0: {"oxidation": 0.01, "reduction": 0.0, "stay": 0.99},
-    1: {"oxidation": 0.01, "reduction": 0.94, "stay": 0.05},
-    2: {"oxidation": 0.02, "reduction": 0.95, "stay": 0.03},
+    1: {"oxidation": 0.01, "reduction": 0.9, "stay": 0.09},
+    2: {"oxidation": 0.02, "reduction": 0.96, "stay": 0.05},
     3: {"oxidation": 0.03, "reduction": 0.92, "stay": 0.05},
     4: {"oxidation": 0.04, "reduction": 0.91, "stay": 0.05},
     5: {"oxidation": 0.05, "reduction": 0.90, "stay": 0.05},
     6: {"oxidation": 0.06, "reduction": 0.89, "stay": 0.05},
     7: {"oxidation": 0.07, "reduction": 0.88, "stay": 0.05},
     8: {"oxidation": 0.08, "reduction": 0.87, "stay": 0.05},
-    9: {"oxidation": 0.45, "reduction": 0.50, "stay": 0.05},
+    9: {"oxidation": 0.25, "reduction": 0.70, "stay": 0.05},
     10: {"oxidation": 0.0, "reduction": 0.001, "stay": 0.999},
 }
 
@@ -125,12 +127,6 @@ print(f"Final Population Count: {sum(filled_final_population.values()):.0f}")
 print(f"Final Shannon Entropy: {final_entropy:.4f}")
 print(f"Lyapunov Exponent: {lyapunov_exponent:.4f}")
 print(f"Mean Redox State of cdc20 Population: {mean_redox_state:.4f}")
-
-# Print the number of molecules in each k-state
-print("\nFinal Distribution of Molecules by k-State:")
-for k_value, count in sorted(k_manifold_population.items()):
-    print(f"k = {k_value}: {count:.0f} molecules")
-
 
 # Compute k-manifold Ricci curvature
 kspace_graph_by_k = nx.Graph()
