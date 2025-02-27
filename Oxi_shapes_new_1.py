@@ -1,122 +1,234 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+import matplotlib.tri as tri
+from scipy.spatial import Delaunay
+from scipy.interpolate import griddata
 
-##############################################################################
-# 1. Define Triangle & Occupancy
-##############################################################################
-vertices = np.array([
-    [0.0, 0.0],  # k=0
-    [1.0, 1.0],  # k=1
-    [2.0, 0.0]   # k=2
-])
+###############################################################################
+# 1. Define the Triangle Domain (k-manifolds) and Generate Mesh Points
+###############################################################################
 
-# Larger occupancy differences for a more dramatic shape
-occupancies_vertices = np.array([0.0, 1.0, 0.8])
+# Redefine vertices so that the progression is vertical:
+# A = (0,0) for k₀ (base, high occupancy), 
+# B = (0.5,1.0) for k₁, 
+# C = (0,2) for k₂ (top, low occupancy)
+A = np.array([0.0, 0.0])   # k₀
+B = np.array([0.5, 1.0])   # k₁
+C = np.array([0.0, 2.0])   # k₂
 
-Nx, Ny = 100, 100
-x_vals = np.linspace(0, 2, Nx)
-y_vals = np.linspace(0, 1, Ny)
-X, Y = np.meshgrid(x_vals, y_vals)
+vertices = np.array([A, B, C])
+vertex_occupancies = np.array([0.3, 0.3, 0.4])  # high occupancy at the base, low at the top
 
-def barycentric_interpolate(px, py, v0, v1, v2, f0, f1, f2):
-    """ Interpolate f in the triangle (v0,v1,v2). Return np.nan if outside. """
-    x0, y0 = v0
-    x1, y1 = v1
-    x2, y2 = v2
-    denom = (y1 - y2)*(x0 - x2) + (x2 - x1)*(y0 - y2)
-    w0 = ((y1 - y2)*(px - x2) + (x2 - x1)*(py - y2)) / denom
-    w1 = ((y2 - y0)*(px - x2) + (x0 - x2)*(py - y2)) / denom
-    w2 = 1 - w0 - w1
-    if (w0 < 0) or (w1 < 0) or (w2 < 0):
-        return np.nan
-    return w0*f0 + w1*f1 + w2*f2
+# Function to generate n uniformly random points inside triangle ABC using barycentrics
+def random_points_in_triangle(A, B, C, n):
+    r1 = np.random.rand(n)
+    r2 = np.random.rand(n)
+    mask = r1 + r2 > 1  # reflect points outside the triangle
+    r1[mask] = 1 - r1[mask]
+    r2[mask] = 1 - r2[mask]
+    points = A + np.outer(r1, (B - A)) + np.outer(r2, (C - A))
+    return points
 
-v0, v1, v2 = vertices
-f0, f1, f2 = occupancies_vertices
+num_internal_points = 150
+internal_points = random_points_in_triangle(A, B, C, num_internal_points)
 
-occupancy_grid = np.zeros_like(X)
-mask = np.zeros_like(X, dtype=bool)
+# Combine vertices and internal points into nodes
+nodes = np.vstack((vertices, internal_points))
+num_nodes = nodes.shape[0]
 
-for i in range(Ny):
-    for j in range(Nx):
-        px, py = X[i,j], Y[i,j]
-        val = barycentric_interpolate(px, py, v0, v1, v2, f0, f1, f2)
-        occupancy_grid[i,j] = val
-        mask[i,j] = np.isnan(val)
+# Build the mesh connectivity using Delaunay triangulation
+triangulation = Delaunay(nodes)
+elements = triangulation.simplices
 
-# PDE source term S = +kappa * occupancy
-kappa = 5.0   # Increase for bigger amplitude
-S_grid = kappa * occupancy_grid
-S_grid[mask] = 0.0  # outside triangle => no source
+###############################################################################
+# 2. Compute Occupancy at Each Node via Barycentric Interpolation
+###############################################################################
 
-##############################################################################
-# 2. Solve Poisson: Δz = S with Neumann-like boundary
-##############################################################################
-z = np.zeros_like(X)  # initial guess
-dx = x_vals[1] - x_vals[0]
-dy = y_vals[1] - y_vals[0]
+def barycentric_coords(P, A, B, C):
+    T = np.vstack((B - A, C - A)).T  # 2x2 matrix
+    v = P - A
+    sol = np.linalg.solve(T, v)
+    wB, wC = sol
+    wA = 1 - wB - wC
+    return np.array([wA, wB, wC])
 
-max_iter = 5000
-tolerance = 1e-5
+occupancy = np.zeros(num_nodes)
+for i in range(num_nodes):
+    w = barycentric_coords(nodes[i], A, B, C)
+    occupancy[i] = w[0]*vertex_occupancies[0] + w[1]*vertex_occupancies[1] + w[2]*vertex_occupancies[2]
 
-def apply_neumann_boundary(z_array):
-    """ Approximate Neumann by copying interior values to boundary. """
-    # top/bottom edges
-    for j in range(Nx):
-        z_array[0, j]   = z_array[1, j]     # y=0 boundary
-        z_array[Ny-1,j] = z_array[Ny-2, j]  # y=1 boundary
-    # left/right edges
-    for i in range(Ny):
-        z_array[i, 0]   = z_array[i, 1]
-        z_array[i, Nx-1] = z_array[i, Nx-2]
+###############################################################################
+# 3. Assemble the FEM System for the PDE
+#    We solve: Δφ = - (κ/2)·ρ·exp(2φ)
+###############################################################################
 
-for it in range(max_iter):
-    # apply boundary first
-    apply_neumann_boundary(z)
-    max_diff = 0.0
-    for i in range(1, Ny-1):
-        for j in range(1, Nx-1):
-            # If outside the triangle, skip or treat as boundary
-            if mask[i,j]:
-                continue
-            # Gauss-Seidel update for Poisson in 2D:
-            # Δz = (z[i+1,j] + z[i-1,j] + z[i,j+1] + z[i,j-1] - 4*z[i,j]) / (dx^2)
-            # we want Δz = S => z_new = avg_of_neighbors - (dx^2/4)*S
-            # assuming dx ~ dy for simplicity
-            z_new = (z[i+1,j] + z[i-1,j] + z[i,j+1] + z[i,j-1])/4.0 - (dx**2/4.0)*S_grid[i,j]
-            diff = abs(z_new - z[i,j])
-            if diff > max_diff:
-                max_diff = diff
-            z[i,j] = z_new
-    if max_diff < tolerance:
-        print(f"Converged at iteration {it} with max diff={max_diff}")
+def fem_assemble_system(nodes, elements, occupancy, kappa=1.0):
+    num_nodes = nodes.shape[0]
+    A_mat = sp.lil_matrix((num_nodes, num_nodes))
+    b_vec = np.zeros(num_nodes)
+    
+    for elem in elements:
+        indices = elem
+        coords = nodes[indices]  # shape: 3x2
+        
+        # Compute area of the triangle
+        mat = np.array([
+            [1, coords[0,0], coords[0,1]],
+            [1, coords[1,0], coords[1,1]],
+            [1, coords[2,0], coords[2,1]]
+        ])
+        area = 0.5 * np.abs(np.linalg.det(mat))
+        if area == 0:
+            continue
+        
+        # Compute gradients for the linear basis functions
+        x = coords[:,0]
+        y = coords[:,1]
+        b_coeff = np.array([y[1]-y[2],
+                            y[2]-y[0],
+                            y[0]-y[1]])
+        c_coeff = np.array([x[2]-x[1],
+                            x[0]-x[2],
+                            x[1]-x[0]])
+        K_local = np.zeros((3,3))
+        for i_local in range(3):
+            for j_local in range(3):
+                K_local[i_local, j_local] = (b_coeff[i_local]*b_coeff[j_local] + c_coeff[i_local]*c_coeff[j_local])/(4*area)
+        
+        # Assemble local stiffness into global matrix
+        for i_local, i_global in enumerate(indices):
+            for j_local, j_global in enumerate(indices):
+                A_mat[i_global, j_global] += K_local[i_local, j_local]
+        
+        # Assemble load vector (source term) using average occupancy
+        rho_avg = np.mean(occupancy[indices])
+        for i_local, i_global in enumerate(indices):
+            b_vec[i_global] += - (kappa/2) * rho_avg * area / 3.0
+    return A_mat, b_vec
+
+A_mat, b_vec = fem_assemble_system(nodes, elements, occupancy, kappa=1.0)
+
+###############################################################################
+# 4. Solve the Nonlinear PDE Using Newton-Raphson
+#    We solve: A·φ - b - exp(2φ)*occupancy = 0
+###############################################################################
+
+phi = np.zeros(num_nodes)  # initial guess for φ
+max_iter = 100
+tol = 1e-6
+
+for iteration in range(max_iter):
+    F = A_mat @ phi - b_vec - np.exp(2*phi)*occupancy
+    J = A_mat - sp.diags(2*np.exp(2*phi)*occupancy)
+    delta_phi = spla.spsolve(J.tocsr(), -F)
+    phi += delta_phi
+    if np.linalg.norm(delta_phi) < tol:
+        print(f"Newton converged in {iteration} iterations.")
         break
+else:
+    print("Newton did not converge.")
 
-##############################################################################
-# 3. Visualize the Floating Shape
-##############################################################################
-import numpy.ma as ma
-z_masked = ma.masked_array(z, mask=mask)
+###############################################################################
+# 5. Compute the Ricci Curvature at Each Node
+#    For a conformally flat metric g = exp(2φ)δ, the scalar curvature is: 
+#         R = -2·exp(-2φ)·Δφ,
+#    where we approximate Δφ with A·φ.
+###############################################################################
 
-fig = plt.figure(figsize=(10,8))
+R = -2.0 * np.exp(-2*phi) * (A_mat @ phi)
+
+###############################################################################
+# 6. Apply the Density-Induced "Gravity" Effect
+#    Here, higher occupancy deforms the shape downward.
+#    We define the final vertical coordinate as:
+#         z = φ - occupancy
+###############################################################################
+
+z = phi - occupancy
+
+###############################################################################
+# 7. Compute Segmentation Lines (Horizontal Cuts) to Divide the Triangle
+#    Since there is a linear progression from k₀ (base) to k₂ (top), we
+#    compute horizontal segmentation curves at y = y_min + 1/3*(y_max-y_min)
+#    and y = y_min + 2/3*(y_max-y_min), which will separate k₀/k₁ and k₁/k₂.
+###############################################################################
+
+y_min = np.min(nodes[:,1])
+y_max = np.max(nodes[:,1])
+y_seg1 = y_min + (y_max - y_min) / 3.0
+y_seg2 = y_min + 2*(y_max - y_min) / 3.0
+
+def horizontal_intersection(y_line, vertices):
+    """
+    For a given horizontal line y = y_line and a triangle defined by vertices,
+    compute the intersection points (there will be two).
+    """
+    pts = []
+    # Triangle edges: (v0,v1), (v1,v2), (v2,v0)
+    for i in range(3):
+        v1 = vertices[i]
+        v2 = vertices[(i+1)%3]
+        # Check if the horizontal line crosses the edge:
+        if (v1[1] - y_line) * (v2[1] - y_line) <= 0 and v1[1] != v2[1]:
+            t = (y_line - v1[1]) / (v2[1] - v1[1])
+            x_intersect = v1[0] + t*(v2[0]-v1[0])
+            pts.append([x_intersect, y_line])
+    return np.array(pts)
+
+# Use the triangle's vertices (A, B, C) to compute intersections.
+seg_line1 = horizontal_intersection(y_seg1, vertices)
+seg_line2 = horizontal_intersection(y_seg2, vertices)
+
+# Interpolate z-values along these segmentation lines using griddata from FEM nodes.
+z_seg1 = griddata(nodes, z, seg_line1, method='linear')
+z_seg2 = griddata(nodes, z, seg_line2, method='linear')
+
+###############################################################################
+# 8. Plot the Deformed Triangle Colored by Ricci Curvature, with Segmentation
+###############################################################################
+
+# Create a triangulation for plotting the FEM mesh
+triang_plot = tri.Triangulation(nodes[:,0], nodes[:,1], elements)
+
+fig = plt.figure(figsize=(12, 9))
 ax = fig.add_subplot(111, projection='3d')
 
-surf = ax.plot_surface(X, Y, z_masked, cmap='viridis', edgecolor='none', alpha=0.9)
-ax.set_xlabel('X (k-manifold axis)')
-ax.set_ylabel('Y (k-manifold axis)')
-ax.set_zlabel('z(x,y)')
-ax.set_title('Poisson-Based Deformation with Neumann-like Boundary')
-plt.colorbar(surf, shrink=0.5, aspect=10, label='z value')
+# Normalize Ricci curvature for coloring
+R_norm = (R - R.min())/(R.max()-R.min() + 1e-10)
+facecolors = plt.cm.viridis(R_norm)
 
-# Mark corners
-corner_z = []
-for (cx, cy) in vertices:
-    j = int(round((cx - x_vals[0]) / dx))
-    i = int(round((cy - y_vals[0]) / dy))
-    corner_z.append(z[i,j])
-corner_z = np.array(corner_z)
-ax.scatter(vertices[:,0], vertices[:,1], corner_z, color='r', s=80, label='Vertices')
-ax.legend()
-plt.savefig("/content/oxishape.png", dpi=300)
+# Plot the deformed surface with z = (φ - occupancy) and color by R.
+surf = ax.plot_trisurf(triang_plot, z, cmap='viridis',
+                         shade=True, edgecolor='none',
+                         antialiased=True, linewidth=0.2, alpha=0.9,
+                         facecolors=facecolors)
+
+ax.set_title("Deformed k-Manifold Triangle (Density-Induced Well & Segmentation)")
+ax.set_xlabel("X (manifold axis)")
+ax.set_ylabel("Y (manifold axis)")
+ax.set_zlabel("Deformation z = φ - occupancy")
+
+# Add a colorbar for Ricci curvature
+mappable = plt.cm.ScalarMappable(cmap='viridis')
+mappable.set_array(R)
+fig.colorbar(mappable, ax=ax, shrink=0.5, aspect=10, label='Ricci Curvature')
+
+# Label the vertices with their k-manifold tags.
+vertex_labels = ["K₀", "K₁", "K₂"]
+for i, label in enumerate(vertex_labels):
+    x_label, y_label = vertices[i][0], vertices[i][1]
+    # Interpolate z at the vertex location
+    z_label = griddata(nodes, z, np.array([[x_label, y_label]]), method='linear')[0]
+    ax.text(x_label, y_label, z_label, f" {label}", fontsize=12, color='k', weight='bold')
+
+# Overlay segmentation lines (horizontal cuts)
+if seg_line1.shape[0] == 2:
+    ax.plot(seg_line1[:,0], seg_line1[:,1], z_seg1, color='k', lw=2, label='k₀/k₁ boundary')
+if seg_line2.shape[0] == 2:
+    ax.plot(seg_line2[:,0], seg_line2[:,1], z_seg2, color='k', lw=2, label='k₁/k₂ boundary')
+
+plt.legend()
+plt.savefig("oxishape_segmented.png", dpi=300)
 plt.show()
