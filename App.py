@@ -187,36 +187,41 @@ if st.button("Generate Oxi‑Shape"):
     for msg in convergence_info:
         st.write(msg)
     
-    # Create a Delaunay triangulation for plotting
-    triang_plot = tri.Triangulation(nodes[:, 0], nodes[:, 1], elements)
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    # Normalize Ricci curvature for color mapping
-    R_norm = (R_curv - R_curv.min()) / (R_curv.max() - R_curv.min() + 1e-10)
-    facecolors = plt.cm.viridis(R_norm)
-    surf = ax.plot_trisurf(triang_plot, z, cmap="viridis", shade=True,
-                             edgecolor="none", antialiased=True, linewidth=0.2,
-                             alpha=0.9, facecolors=facecolors)
-    ax.set_title("Oxi‑Shape (Diamond Geometry)")
-    ax.set_xlabel("X axis")
-    ax.set_ylabel("Y axis")
-    ax.set_zlabel("z = φ - occupancy")
-    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, label="Ricci Curvature")
-    
-    # Draw grid lines and label each k-manifold (row)
-    start = 0
-    for k in range(int(R) + 1):
-        n_points = int(comb(R, k))
-        row_nodes = nodes[start:start+n_points]
-        row_z = z[start:start+n_points]
-        # Sort nodes by x for drawing a continuous line
-        sort_idx = np.argsort(row_nodes[:,0])
-        row_nodes = row_nodes[sort_idx]
-        row_z = row_z[sort_idx]
-        ax.plot(row_nodes[:,0], row_nodes[:,1], row_z, color="black", linestyle="--", alpha=0.7)
-        # Label the row at the leftmost point
-        ax.text(row_nodes[0,0], row_nodes[0,1], row_z[0], f" k={k}", color="red", fontsize=10, weight="bold")
-        start += n_points
+   # Create a Delaunay triangulation for plotting
+triang_plot = tri.Triangulation(nodes[:, 0], nodes[:, 1], elements)
+fig = plt.figure(figsize=(8, 6))
+ax = fig.add_subplot(111, projection="3d")
+
+# Compute the average Ricci curvature for each triangle face
+triangles = triang_plot.triangles  # shape: (n_triangles, 3)
+triangle_values = np.mean(R_curv[triangles], axis=1)
+R_norm_tri = (triangle_values - R_curv.min()) / (R_curv.max() - R_curv.min() + 1e-10)
+facecolors = plt.cm.viridis(R_norm_tri)
+
+# Plot the surface with facecolors defined per triangle face
+surf = ax.plot_trisurf(triang_plot, z, cmap="viridis", shade=True,
+                         edgecolor="none", antialiased=True, linewidth=0.2,
+                         alpha=0.9, facecolors=facecolors)
+
+ax.set_title("Oxi‑Shape (Diamond Geometry)")
+ax.set_xlabel("X axis")
+ax.set_ylabel("Y axis")
+ax.set_zlabel("z = φ - occupancy")
+fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, label="Ricci Curvature")
+
+# Draw grid lines for each k-manifold (row) and label them
+start = 0
+for k in range(int(R) + 1):
+    n_points = int(comb(R, k))
+    row_nodes = nodes[start:start+n_points]
+    row_z = z[start:start+n_points]
+    sort_idx = np.argsort(row_nodes[:, 0])
+    row_nodes = row_nodes[sort_idx]
+    row_z = row_z[sort_idx]
+    ax.plot(row_nodes[:, 0], row_nodes[:, 1], row_z, color="black", linestyle="--", alpha=0.7)
+    # Label the leftmost point of the row with k value
+    ax.text(row_nodes[0, 0], row_nodes[0, 1], row_z[0], f" k={k}", color="red", fontsize=10, weight="bold")
+    start += n_points
     
     st.pyplot(fig)
     
