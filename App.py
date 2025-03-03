@@ -226,9 +226,9 @@ def run_app():
         
         # 8. Provide a download button for the 300 dpi PNG image
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=300)
+        fig.savefig(buf, format="svg", dpi=300)
         buf.seek(0)
-        st.download_button("Download Image (300 dpi PNG)", data=buf,
+        st.download_button("Download Image (300 dpi SVG)", data=buf,
                            file_name="oxishape_vertex.png", mime="image/png")
 
 if __name__ == "__main__":
