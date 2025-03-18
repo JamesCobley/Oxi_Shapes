@@ -1,5 +1,5 @@
 # Oxi_Shapes
-This repository contains the [Python](https://www.python.org/)-scripted source code for Oxi-Shapes work--available as a preprint[]. The open-sourced code is deisgned to be used in the Google [Colab](https://colab.google/) environment, which can be accessed online for free. 
+This repository contains the [Python](https://www.python.org/)-scripted source code for Oxi-Shapes work--available as a preprint[()]. The open-sourced code is deisgned to be used in the Google [Colab](https://colab.google/) environment, which can be accessed online for free. 
 # Scripts
 An overview of each script is provided:
 1. Figures: Several scripts
