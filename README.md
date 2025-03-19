@@ -3,9 +3,10 @@ This repository contains the [Python](https://www.python.org/)-scripted source c
 # Scripts
 A breif overview of the scripts by their use-case is as follows:
 1. Figure_1. Composed of panels derived from [Fig_script_1](https://github.com/JamesCobley/Oxi_Shapes/blob/main/Fig_script_1.py) and [Fig_script_2](https://github.com/JamesCobley/Oxi_Shapes/blob/main/Fig_script_1.py). Extended_Data_Figure_1 was created from Fig_script_2 and the [ExF1](https://github.com/JamesCobley/Oxi_Shapes/blob/main/ExF1.py) scripts. 
-2. Figure_2. 
-3. Application. The Oxi-Shapes [Streamlit](https://streamlit.io/) app was generated using the [app](https://github.com/JamesCobley/Oxi_Shapes/blob/main/App.py) script. The application can be accessed for free [online](https://oxishapes.streamlit.app/).
-4. Simulations. 
+2. Figure_2.
+3. Static and dynamic geoemtry. The [C_shapes](https://github.com/JamesCobley/Oxi_Shapes/blob/main/C_shapes.py) script prints the i-space cardinality, k-space strucutre (binomial coefficients), and allowed and barred transition as an excel file for any R interger. 
+4. Application. The Oxi-Shapes [Streamlit](https://streamlit.io/) app was generated using the [app](https://github.com/JamesCobley/Oxi_Shapes/blob/main/App.py) script. The application can be accessed for free [online](https://oxishapes.streamlit.app/).
+5. Simulations. 
 # Resources 
 This repository contains the white paper, where the detailed mathematical basis of Oxi-Shapes is elaborated, and the experimental methods section, which provides further details on the scripts above and general procedures. 
 # Data Availability
