@@ -1,5 +1,8 @@
 import itertools
 import pandas as pd
+import math
+from scipy.special import comb  # For binomial coefficients
+from google.colab import files  # For downloading the Excel file
 
 # Function to generate all binary proteoforms based on the number of cysteines (R)
 def generate_proteoforms(R):
@@ -35,15 +38,23 @@ def find_barred_transitions(proteoform, allowed_transitions, proteoforms):
     """Find barred transitions by excluding allowed ones."""
     return [pf for pf in proteoforms if pf not in allowed_transitions]
 
+# Function to compute Pascal's row for a given R
+def pascal_row(R):
+    """Compute Pascal's Triangle row for a given R (binomial coefficients)."""
+    return [int(comb(R, k)) for k in range(R + 1)]
+
 # Function to generate full transition dataset and save as Excel file
 def generate_transition_data(R, file_name="proteoform_transitions.xlsx"):
     """Generate proteoform transitions and save to an Excel file."""
     proteoforms = generate_proteoforms(R)
     data = []
+    
+    # Compute Pascal's row (binomial coefficients)
+    binomial_coefficients = pascal_row(R)
 
     for proteoform in proteoforms:
         k_value = proteoform.count('1')  # Number of oxidized cysteines
-        percent_ox = (k_value / R) * 100  # Percentage oxidation
+        percent_ox = (k_value / R) * 100 if R > 0 else 0  # Percentage oxidation
         allowed_transitions = find_allowed_transitions(proteoform, proteoforms, R)
         barred_transitions = find_barred_transitions(proteoform, allowed_transitions, proteoforms)
 
@@ -68,22 +79,32 @@ def generate_transition_data(R, file_name="proteoform_transitions.xlsx"):
     # Convert to DataFrame
     df = pd.DataFrame(data)
 
+    # Create a summary DataFrame for i-space and k-space cardinalities
+    summary_df = pd.DataFrame({
+        "i-Space Cardinality": [2**R],
+        "k-Space Cardinality": [R + 1],
+        "Pascal Row": [", ".join(map(str, binomial_coefficients))]  # **Fixed Formatting**
+    })
+
     # Save to Excel
-    df.to_excel(file_name, index=False)
+    with pd.ExcelWriter(file_name, engine='xlsxwriter') as writer:
+        df.to_excel(writer, sheet_name="Proteoform Transitions", index=False)
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
     print(f"Excel file saved successfully as {file_name}")
 
-    return df, file_name
+    return df, summary_df, file_name
 
 # Run the script with user input for R
 R = int(input("Enter the number of cysteines (R): "))
 file_name = input("Enter the file name (with .xlsx extension) to save the output: ")
 
 # Generate and save the transition data
-df, file_path = generate_transition_data(R, file_name)
+df, summary_df, file_path = generate_transition_data(R, file_name)
 
 # Provide a download link
-from google.colab import files
 files.download(file_path)
 
-# Display the first few rows of the DataFrame
-df.head()
+# Display summary data
+print("\nSummary Data:")
+print(summary_df)
