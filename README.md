@@ -1,9 +1,11 @@
 # Oxi_Shapes
 This repository contains the [Python](https://www.python.org/)-scripted source code for the preprint entitled "Oxi-Shapes: The Theroem-derived Proteoform Geometry". The open-sourced code is deisgned to be used in the freely-available Google [Colab](https://colab.google/) environment. 
 # Scripts
-An overview of each script is provided:
-1. Figures: Several scripts
-2. Application:
+A breif overview of the script by use-case is as follows:
+1. Figure_1. Composed of panels derived from [Fig_script_1](https://github.com/JamesCobley/Oxi_Shapes/blob/main/Fig_script_1.py) and [Fig_script_2](https://github.com/JamesCobley/Oxi_Shapes/blob/main/Fig_script_1.py).
+2. Figure_2. 
+3. Application. The Oxi-Shapes streamlit app was generated using the [app](https://github.com/JamesCobley/Oxi_Shapes/blob/main/App.py) script.
+4. Simulations. 
 # Resources 
 This repository contains the white paper, where the detailed mathematical basis of Oxi-Shapes is elaborated, and the experimental methods section, which provides further details on the scripts above and general procedures. 
 # Data Availability
