@@ -10,7 +10,7 @@ A breif overview of the scripts by their use-case is as follows:
 # Resources 
 This repository contains the white paper, where the detailed mathematical basis of Oxi-Shapes is elaborated, and the experimental methods section, which provides further details on the scripts above and general procedures. 
 # Data Availability
-This repository contains the published data, and their metadata, used to compute the Oxi-shapes mentioned in the preprint. 
+This repository contains the published data, and their metadata, used to compute the Oxi-shapes mentioned in the preprint. Each of data file has been uploaded.
 # Further Reading
 For further reading one may wish to read the published papers on [oxiforms](https://onlinelibrary.wiley.com/doi/full/10.1002/bies.202200248), [the unmapped cysteine proteoform space](https://journals.physiology.org/doi/abs/10.1152/ajpcell.00152.2024), and the [nonlinear dynamics of cysteine proteoforms](https://www.sciencedirect.com/science/article/pii/S2213231725000369).
 # Contact
