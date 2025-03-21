@@ -8,7 +8,7 @@ A breif overview of the scripts by their use-case is as follows:
 4. Application. The Oxi-Shapes [Streamlit](https://streamlit.io/) app was generated using the [app](https://github.com/JamesCobley/Oxi_Shapes/blob/main/App.py) script. The application can be accessed for free [online](https://oxishapes.streamlit.app/). The application was used to create Extended Figure 3 and 4.
 5. Simulations. 
 # Resources 
-This repository contains the white paper, where the detailed mathematical basis of Oxi-Shapes is elaborated, and the experimental methods section, which provides further details on the scripts above and general procedures. 
+This repository contains the white paper, where the detailed mathematical basis of Oxi-Shapes is elaborated (supplemental information), and the  methods section, which provides further details on the scripts above and general procedures. 
 # Data Availability
 This repository contains the published data, and their metadata, used to compute the Oxi-shapes mentioned in the preprint. Each of data file has been uploaded.
 # Further Reading
