@@ -8,14 +8,14 @@ import pickle
 from scipy.spatial import Delaunay
 from scipy.interpolate import griddata
 
-###############################################################################
+###############################################
 # 1. Define the Square Domain for R=3 (4 k-states)
 #    Corners:
 #      A = (0,0)  -> K₀
 #      B = (1,0)  -> K₁
 #      C = (1,1)  -> K₂
 #      D = (0,1)  -> K₃
-###############################################################################
+###############################################
 A = np.array([0.0, 0.0])  # K₀
 B = np.array([1.0, 0.0])  # K₁
 C = np.array([1.0, 1.0])  # K₂
@@ -25,7 +25,9 @@ D = np.array([0.0, 1.0])  # K₃
 vertices = np.vstack((A, B, C, D))
 vertex_occupancies = np.array([0.25, 0.75, 0.0, 0.0])  # Example fractional occupancy values
 
-# Generate internal points uniformly in the square [0,1]×[0,1]
+###############################################
+# 2. Generate internal points uniformly in the square [0,1]×[0,1]
+###############################################
 def random_points_in_square(n):
     return np.random.rand(n, 2)
 
@@ -40,11 +42,11 @@ num_nodes = nodes.shape[0]
 triangulation = Delaunay(nodes)
 elements = triangulation.simplices
 
-###############################################################################
-# 2. Bilinear Interpolation for Occupancy
+###############################################
+# 3. Bilinear Interpolation for Occupancy
 #    For a point (x,y) in [0,1]²:
 #      ρ(x,y) = (1-x)(1-y)*ρ_A + x(1-y)*ρ_B + x*y*ρ_C + (1-x)*y*ρ_D
-###############################################################################
+###############################################
 def bilinear_occupancy(x, y, occ):
     wA = (1 - x) * (1 - y)
     wB = x * (1 - y)
@@ -57,9 +59,9 @@ for i in range(num_nodes):
     x_i, y_i = nodes[i]
     occupancy[i] = bilinear_occupancy(x_i, y_i, vertex_occupancies)
 
-###############################################################################
-# 3. Assemble FEM Matrices (Stiffness A and Mass M)
-###############################################################################
+###############################################
+# 4. Assemble FEM Matrices (Stiffness A and Mass M)
+###############################################
 def fem_assemble_matrices(nodes, elements):
     num_nodes = nodes.shape[0]
     A_mat = sp.lil_matrix((num_nodes, num_nodes))
@@ -93,10 +95,10 @@ def fem_assemble_matrices(nodes, elements):
 
 A_mat, M_mat = fem_assemble_matrices(nodes, elements)
 
-###############################################################################
-# 4. Solve the Nonlinear PDE Using Continuation and Damped Newton-Raphson
-#    We solve: A·φ + (κ/2)*M*(ρ e^(2φ)) = 0, with κ ramped from 0 to 1.
-###############################################################################
+###############################################
+# 5. Solve the Nonlinear PDE Using Continuation and Damped Newton-Raphson
+#    Equation: A·φ + (κ/2)*M*(ρ e^(2φ)) = 0, with κ ramped from 0 to 1.
+###############################################
 phi = np.zeros(num_nodes)
 max_iter = 500
 tol = 1e-1
@@ -120,23 +122,20 @@ for kappa in kappa_values[1:]:
     else:
         print(f"  Did NOT converge at kappa = {kappa:.3f}")
 
-###############################################################################
-# 5. Compute Ricci Curvature
-#    Approximate Δφ using a lumped mass matrix (row sum of M)
-#    R = -2 e^(-2φ) Δφ
-###############################################################################
+###############################################
+# 6. Compute Ricci Curvature and Deformed Height
+#    Approximate Δφ via a lumped mass matrix and compute:
+#      R = -2 exp(-2φ) Δφ
+#    and define deformed height as: z = φ - occupancy
+###############################################
 M_lumped = np.array(M_mat.sum(axis=1)).flatten()
 lap_phi = A_mat.dot(phi) / M_lumped
 R = -2.0 * np.exp(-2*phi) * lap_phi
-
-###############################################################################
-# 6. Density-Induced "Gravity": z = φ - occupancy
-###############################################################################
 z = phi - occupancy
 
-###############################################################################
-# 7. Plot the Deformed Square with Ricci Curvature Coloring and Vertex Labels
-###############################################################################
+###############################################
+# 7. Plot the Deformed Square (Oxi-Shape) with Ricci Curvature Coloring and Vertex Labels
+###############################################
 triang_plot = tri.Triangulation(nodes[:,0], nodes[:,1], elements)
 fig = plt.figure(figsize=(12,9))
 ax = fig.add_subplot(111, projection='3d')
@@ -158,17 +157,20 @@ mappable = plt.cm.ScalarMappable(cmap='viridis')
 mappable.set_array(R)
 fig.colorbar(mappable, ax=ax, shrink=0.5, aspect=10, label='Ricci Curvature')
 
-# Label the four corners as K₀, K₁, K₂, K₃
+# Label the four corners as K₀, K₁, K₂, K₃.
 corner_labels = ["K₀", "K₁", "K₂", "K₃"]
 for i, label in enumerate(corner_labels):
     xL, yL = vertices[i]
     zL = griddata(nodes, z, np.array([[xL, yL]]), method='linear')[0]
     ax.text(xL, yL, zL, f" {label}", fontsize=12, color='k', weight='bold')
+
 plt.savefig("oxishape_continuation.png", dpi=300)
 plt.show()
 
-#Save the soltution for the second pipeline step
-solution = {"phi": phi, "R_vals": R_vals, "occ_vector": occ_vector}
+###############################################
+# 8. Save the PDE Solution for Pipeline Step 2
+###############################################
+solution = {"phi": phi, "R_vals": R, "occ_vector": occupancy}
 with open("pde_solution.pkl", "wb") as f:
     pickle.dump(solution, f)
 print("PDE solution saved to 'pde_solution.pkl'.")
