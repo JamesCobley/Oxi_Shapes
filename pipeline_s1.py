@@ -1,8 +1,10 @@
+#!/usr/bin/env python
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import matplotlib.tri as tri
+import pickle
 from scipy.spatial import Delaunay
 from scipy.interpolate import griddata
 
@@ -164,3 +166,9 @@ for i, label in enumerate(corner_labels):
     ax.text(xL, yL, zL, f" {label}", fontsize=12, color='k', weight='bold')
 plt.savefig("oxishape_continuation.png", dpi=300)
 plt.show()
+
+#Save the soltution for the second pipeline step
+solution = {"phi": phi, "R_vals": R_vals, "occ_vector": occ_vector}
+with open("pde_solution.pkl", "wb") as f:
+    pickle.dump(solution, f)
+print("PDE solution saved to 'pde_solution.pkl'.")
