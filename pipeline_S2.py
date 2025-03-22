@@ -8,6 +8,7 @@ from scipy.spatial import Delaunay
 import pandas as pd
 import networkx as nx
 import pickle
+from scipy.interpolate import griddata
 
 ###############################################
 # 1. Define Discrete i-States for R=3 (8 states)
@@ -28,7 +29,6 @@ coords_dict = {
     "110": (1.0,  -1.0),  # k = 2
     "111": (0.0,  -2.0)   # k = 3
 }
-
 node_index = {s: i for i, s in enumerate(pf_states)}
 discrete_nodes = np.array([coords_dict[s] for s in pf_states])
 
@@ -41,20 +41,10 @@ triangulation = Delaunay(nodes)
 elements = triangulation.simplices
 
 ###############################################
-# 3. Define New Allowed Transitions Based on k–Manifolds
+# 3. (Optional) Allowed Transitions from Table 4 
 ###############################################
-# New rule: 
-#   For k=0: allowed k: [1]
-#   For k=1: allowed k: [0, 2]
-#   For k=2: allowed k: [1, 3]
-#   For k=3: allowed k: [2]
-new_allowed = {
-    0: [1],
-    1: [0, 2],
-    2: [1, 3],
-    3: [2]
-}
-# (Barred transitions are implicitly all others.)
+# (We will use a new rule based solely on k-values in this pipeline step.)
+# For reference, the original allowed_map is not used here.
 
 ###############################################
 # 4. Initialize Discrete Population (100 molecules)
@@ -76,7 +66,7 @@ def get_occ_vector_discrete(pop_dict):
     return occ
 
 ###############################################
-# 5. FEM Assembly & PDE Solver (same as pipeline step 1)
+# 5. FEM Assembly & PDE Solver (Same as Pipeline Step 1)
 ###############################################
 def fem_assemble_matrices(nodes, elements):
     num_nodes = nodes.shape[0]
@@ -131,32 +121,42 @@ def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, da
     return phi, R_curv
 
 ###############################################
-# 6. Load PDE Baseline Solution (or re-solve if needed)
+# 6. Load the PDE Baseline Solution from Pipeline Step 1
 ###############################################
-# Option 1: Load from file (if you saved from pipeline step 1)
-# with open("pde_solution.pkl", "rb") as f:
-#     solution = pickle.load(f)
-#     phi_baseline = solution["phi"]
-#     R_baseline = solution["R_vals"]
-#     occ_vector_baseline = solution["occ_vector"]
-#
-# Option 2: Re-solve for baseline occupancy (here we re-solve)
-occ_vector = get_occ_vector_discrete(pop_dict)
-phi_baseline, R_baseline = solve_pde_for_occupancy(nodes, elements, occ_vector)
+# We assume that you saved the baseline solution in pipeline step 1 as "pde_solution.pkl"
+with open("pde_solution.pkl", "rb") as f:
+    solution = pickle.load(f)
+phi_baseline = solution["phi"]
+R_baseline = solution["R_vals"]
+occ_vector_baseline = solution["occ_vector"]
+
+# (For reference, you could also re-solve here:
+# occ_vector = get_occ_vector_discrete(pop_dict)
+# phi_baseline, R_baseline = solve_pde_for_occupancy(nodes, elements, occ_vector)
+# )
 
 ###############################################
-# 7. New Rule-Based Monte Carlo Update (Using k-based Allowed Transitions)
+# 7. New Rule-Based Monte Carlo Update (No External Perturbation)
 ###############################################
-# New allowed transitions mapping based solely on k-values:
-new_allowed = {
-    0: [1],
-    1: [0, 2],
-    2: [1, 3],
-    3: [2]
-}
+# Define new allowed transitions based solely on k–values:
+# k=0: allowed → k=1
+# k=1: allowed → k=0 and k=2
+# k=2: allowed → k=1 and k=3
+# k=3: allowed → k=2
+def new_allowed_k(state):
+    k_val = count_ones(state)
+    if k_val == 0:
+        return [s for s in pf_states if count_ones(s)==1]
+    elif k_val == 1:
+        return [s for s in pf_states if count_ones(s) in [0,2]]
+    elif k_val == 2:
+        return [s for s in pf_states if count_ones(s) in [1,3]]
+    elif k_val == 3:
+        return [s for s in pf_states if count_ones(s)==2]
+    else:
+        return []
 
-# New field equation function for discrete states:
-# We'll use the same parameters as before.
+# Field equation parameters for discrete updates:
 alpha_field = 0.1
 beta_field = 1.0
 DeltaE_flip = 5.0
@@ -169,26 +169,22 @@ def new_field_delta_f_discrete(state_i, state_j, occ_vec, R_vals, external_weigh
     return energy_term + curvature_term + external_weight
 
 def new_mc_probabilities_discrete(state, occ_vec, R_vals, external_weight):
-    # Determine the current k-value of state.
-    k_val = count_ones(state)
-    # Allowed transitions are those discrete states whose k-value is in new_allowed[k_val].
-    allowed_states = [s for s in pf_states if count_ones(s) in new_allowed[k_val]]
+    allowed_states = new_allowed_k(state)
     p_list = []
     for s_target in allowed_states:
         df = new_field_delta_f_discrete(state, s_target, occ_vec, R_vals, external_weight)
-        p_list.append(np.exp(-df/(0.001987 * 310.15)))
+        p_list.append(np.exp(- df/(0.001987 * 310.15)))
     p_list = np.array(p_list)
-    # Define p_stay to ensure total probability sums to 1.
     p_stay = max(0, 1 - np.sum(p_list))
     full_p = np.concatenate(([p_stay], p_list))
     full_p = full_p / np.sum(full_p)
     return full_p, allowed_states
 
-# Initialize molecule states (100 molecules) as before.
+# Initialize the discrete molecule states from the population dictionary.
 molecule_states = []
 for s, cnt in pop_dict.items():
     molecule_states += [s] * int(round(cnt))
-molecule_states = np.array(molecule_states)
+molecule_states = np.array(molecule_states)  # Should be 100 in total.
 
 state_history = [molecule_states.copy()]
 global_redox_history = []
@@ -200,20 +196,18 @@ def global_redox(states):
 global_redox_history.append(global_redox(molecule_states))
 
 def get_occ_vector_discrete_from_states(states):
-    counts = {s: np.sum(states==s) for s in pf_states}
+    counts = {s: np.sum(states == s) for s in pf_states}
     occ = np.zeros(len(pf_states))
     for s, cnt in counts.items():
         occ[node_index[s]] = cnt / total_molecules
     return occ
 
-# Set external perturbation: for first 5 steps use 0.1; afterward 0.
-external_force_first5 = 0.1
-
+# Run the Monte Carlo simulation for 10 steps with no external perturbation.
 num_steps_mc = 10
 for t in range(1, num_steps_mc+1):
-    external_weight = external_force_first5 if t < 5 else 0.0
+    external_weight = 0.0  # No external force.
     occ_vec = get_occ_vector_discrete_from_states(molecule_states)
-    # Re-solve PDE for the current discrete occupancy.
+    # Optionally, you could re-solve the PDE each step if occupancy changes:
     phi, R_vals = solve_pde_for_occupancy(nodes, elements, occ_vec)
     new_states = []
     for state in molecule_states:
@@ -230,7 +224,7 @@ for t in range(1, num_steps_mc+1):
 ###############################################
 # 8. Final Outputs: k-Bin Distribution, Global Redox, Shannon Entropy
 ###############################################
-final_distribution = {s: np.sum(molecule_states==s) for s in pf_states}
+final_distribution = {s: np.sum(molecule_states == s) for s in pf_states}
 final_total = sum(final_distribution.values())
 k_bin = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}
 for s, cnt in final_distribution.items():
@@ -247,7 +241,7 @@ def shannon_entropy_discrete(states):
     tot = len(states)
     entropy = 0.0
     for s in pf_states:
-        p = np.sum(states==s) / tot
+        p = np.sum(states == s) / tot
         if p > 0:
             entropy -= p * np.log2(p)
     return entropy
@@ -265,7 +259,7 @@ plt.figure(figsize=(8,5))
 plt.plot(global_redox_history, 'o-')
 plt.xlabel("Time Steps")
 plt.ylabel("Global Redox State (%)")
-plt.title("Evolution of Global Redox State Over 10 Steps")
+plt.title("Evolution of Global Redox State Over 10 Steps (No External Force)")
 plt.grid(True)
 plt.savefig("global_redox_evolution.png", dpi=300)
 plt.show()
@@ -275,7 +269,7 @@ plt.show()
 ###############################################
 discrete_history = []
 for states in state_history:
-    counts = {s: np.sum(states==s) for s in pf_states}
+    counts = {s: np.sum(states == s) for s in pf_states}
     discrete_history.append(counts)
 df_states = pd.DataFrame(discrete_history)
 df_states.index.name = 'Time_Step'
