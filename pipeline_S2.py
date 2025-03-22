@@ -9,6 +9,8 @@ import pandas as pd
 import networkx as nx
 import pickle
 from scipy.interpolate import griddata
+from mpl_toolkits.mplot3d import Axes3D
+from sklearn.linear_model import LinearRegression  # For computing Lyapunov exponent
 
 ###############################################
 # 1. Define Discrete i-States for R=3 (8 states)
@@ -42,9 +44,8 @@ elements = triangulation.simplices
 
 ###############################################
 # 3. (Optional) Allowed Transitions from Table 4 
+# (Not used here because we now use a new allowed mapping below.)
 ###############################################
-# (We will use a new rule based solely on k-values in this pipeline step.)
-# For reference, the original allowed_map is not used here.
 
 ###############################################
 # 4. Initialize Discrete Population (100 molecules)
@@ -123,26 +124,20 @@ def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, da
 ###############################################
 # 6. Load the PDE Baseline Solution from Pipeline Step 1
 ###############################################
-# We assume that you saved the baseline solution in pipeline step 1 as "pde_solution.pkl"
 with open("pde_solution.pkl", "rb") as f:
     solution = pickle.load(f)
 phi_baseline = solution["phi"]
 R_baseline = solution["R_vals"]
 occ_vector_baseline = solution["occ_vector"]
 
-# (For reference, you could also re-solve here:
-# occ_vector = get_occ_vector_discrete(pop_dict)
-# phi_baseline, R_baseline = solve_pde_for_occupancy(nodes, elements, occ_vector)
-# )
-
 ###############################################
 # 7. New Rule-Based Monte Carlo Update (No External Perturbation)
 ###############################################
-# Define new allowed transitions based solely on k–values:
-# k=0: allowed → k=1
-# k=1: allowed → k=0 and k=2
-# k=2: allowed → k=1 and k=3
-# k=3: allowed → k=2
+# New allowed transitions based solely on k-values:
+# k = 0: allowed → k = 1
+# k = 1: allowed → k = 0 and 2
+# k = 2: allowed → k = 1 and 3
+# k = 3: allowed → k = 2
 def new_allowed_k(state):
     k_val = count_ones(state)
     if k_val == 0:
@@ -162,7 +157,6 @@ beta_field = 1.0
 DeltaE_flip = 5.0
 
 def new_field_delta_f_discrete(state_i, state_j, occ_vec, R_vals, external_weight):
-    # Use the discrete node corresponding to state_i.
     i_ndx = node_index[state_i]
     energy_term = DeltaE_flip * np.exp(alpha_field * occ_vec[i_ndx])
     curvature_term = - beta_field * R_vals[i_ndx]
@@ -180,11 +174,11 @@ def new_mc_probabilities_discrete(state, occ_vec, R_vals, external_weight):
     full_p = full_p / np.sum(full_p)
     return full_p, allowed_states
 
-# Initialize the discrete molecule states from the population dictionary.
+# Initialize the discrete molecule states.
 molecule_states = []
 for s, cnt in pop_dict.items():
     molecule_states += [s] * int(round(cnt))
-molecule_states = np.array(molecule_states)  # Should be 100 in total.
+molecule_states = np.array(molecule_states)
 
 state_history = [molecule_states.copy()]
 global_redox_history = []
@@ -202,12 +196,11 @@ def get_occ_vector_discrete_from_states(states):
         occ[node_index[s]] = cnt / total_molecules
     return occ
 
-# Run the Monte Carlo simulation for 10 steps with no external perturbation.
-num_steps_mc = 10
+num_steps_mc = 240
 for t in range(1, num_steps_mc+1):
     external_weight = 0.0  # No external force.
     occ_vec = get_occ_vector_discrete_from_states(molecule_states)
-    # Optionally, you could re-solve the PDE each step if occupancy changes:
+    # Re-solve PDE to update φ and R (using the current occupancy)
     phi, R_vals = solve_pde_for_occupancy(nodes, elements, occ_vec)
     new_states = []
     for state in molecule_states:
@@ -222,7 +215,26 @@ for t in range(1, num_steps_mc+1):
     global_redox_history.append(global_redox(molecule_states))
 
 ###############################################
-# 8. Final Outputs: k-Bin Distribution, Global Redox, Shannon Entropy
+# 8. Function to Compute Lyapunov Exponent
+###############################################
+def compute_lyapunov(time_series, dt=1.0):
+    # Compute differences between successive time points
+    diffs = np.diff(time_series)
+    # To avoid log(0), replace zeros with a very small value
+    diffs[diffs == 0] = 1e-10
+    log_diffs = np.log(np.abs(diffs))
+    # Time vector for differences
+    t = np.arange(1, len(time_series))
+    # Linear regression: fit log_diffs = lambda * t + const
+    t = t.reshape(-1, 1)
+    model = LinearRegression().fit(t, log_diffs)
+    lyap = model.coef_[0] / dt
+    return lyap
+
+lyapunov_exponent = compute_lyapunov(np.array(global_redox_history), dt=1.0)
+
+###############################################
+# 9. Final Discrete Outputs: k-Bin Distribution, Global Redox, Shannon Entropy
 ###############################################
 final_distribution = {s: np.sum(molecule_states == s) for s in pf_states}
 final_total = sum(final_distribution.values())
@@ -236,6 +248,7 @@ for k_val in sorted(k_bin.keys()):
     print(f"k={k_val}: {k_bin[k_val]:.2f} molecules ({frac:.2f}%)")
 print("Total molecules at start:", total_molecules)
 print("Total molecules at end:  ", final_total)
+print("Lyapunov Exponent:", lyapunov_exponent)
 
 def shannon_entropy_discrete(states):
     tot = len(states)
@@ -253,7 +266,7 @@ print("Shannon entropy at end:  ", entropy_final)
 print("Global Redox State (final):", global_redox_history[-1], "%")
 
 ###############################################
-# 9. Plot Global Redox Evolution Over Time
+# 10. Plot Global Redox Evolution Over Time
 ###############################################
 plt.figure(figsize=(8,5))
 plt.plot(global_redox_history, 'o-')
@@ -265,7 +278,7 @@ plt.savefig("global_redox_evolution.png", dpi=300)
 plt.show()
 
 ###############################################
-# 10. Record Monte Carlo State History to Excel
+# 11. Record Monte Carlo State History to Excel
 ###############################################
 discrete_history = []
 for states in state_history:
