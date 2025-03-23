@@ -21,11 +21,6 @@ phi_cont = sol["phi"]
 R_cont = sol["R_vals"]
 occupancy_cont = sol["occ_vector"]
 
-# Option 1: If continuous nodes were also saved, you could interpolate:
-# phi_warm = griddata(continuous_nodes, phi_cont, nodes, method='linear')
-# For demonstration, we assume that the first num_nodes entries of phi_cont 
-# can serve as an initial guess for the discrete domain.
-
 ###############################################
 # 1. Define Discrete i-States for R=3 (8 states)
 ###############################################
@@ -110,10 +105,10 @@ def fem_assemble_matrices(nodes, elements):
                 M_mat[i_global, j_global] += M_local[i_local, j_local]
     return A_mat.tocsr(), M_mat.tocsr()
 
-def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, damping=0.05, phi0=None):
+# Modified PDE solver: now optionally returns the final delta norm (residual).
+def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, damping=0.05, phi0=None, return_res=False):
     A_mat, M_mat = fem_assemble_matrices(nodes, elements)
     num_nodes = nodes.shape[0]
-    # Warm-start: use provided phi0 or start from zeros.
     if phi0 is None:
         phi = np.zeros(num_nodes)
     else:
@@ -121,6 +116,7 @@ def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, da
     kappa_target = 1.0
     num_steps = 20
     kappa_values = np.linspace(0, kappa_target, num_steps+1)
+    last_delta = None
     for kappa in kappa_values[1:]:
         for it in range(max_iter):
             nonlin = occ_vec * np.exp(2*phi)
@@ -129,17 +125,21 @@ def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, da
             J = A_mat + M_mat.dot(sp.diags(occ_vec * np.exp(2*phi))) + reg*sp.eye(num_nodes)
             delta_phi = spla.spsolve(J, -F)
             phi += damping * delta_phi
-            if np.linalg.norm(delta_phi) < tol:
+            delta_norm = np.linalg.norm(delta_phi)
+            if delta_norm < tol:
+                last_delta = delta_norm
                 break
     M_lumped = np.array(M_mat.sum(axis=1)).flatten()
     lap_phi = A_mat.dot(phi) / M_lumped
     R_curv = -2.0 * np.exp(-2*phi) * lap_phi
+    if return_res:
+        return phi, R_curv, last_delta
     return phi, R_curv
 
 ###############################################
 # 5. Warm Start Setup: Use the loaded PDE solution as the initial guess
 ###############################################
-# Here, we use the first num_nodes entries from the continuous PDE solution.
+# We use the first num_nodes entries from the continuous solution.
 phi_warm = phi_cont[:num_nodes]
 
 ###############################################
@@ -222,14 +222,29 @@ def compute_lyapunov(time_series, dt=1.0):
     return lyap
 
 ###############################################
-# 9. Monte Carlo Simulation Loop (10 steps, No External Force)
+# 9. Monte Carlo Simulation Loop (e.g., 240 steps, No External Force)
 ###############################################
-num_steps_mc = 10
+num_steps_mc = 240
+tol = 1e-1  # convergence tolerance
+max_extra_iterations = 20  # maximum extra iterations every 10 steps
+
 for t in range(1, num_steps_mc+1):
     external_weight = 0.0  # No external force.
     occ_vec = get_occ_vector_discrete_from_states(molecule_states)
-    # Update the PDE solution using the warm-start from the previous step.
-    phi_warm, R_vals = solve_pde_for_occupancy(nodes, elements, occ_vec, phi0=phi_warm)
+    
+    # Update PDE solution with warm-start and obtain convergence metric.
+    phi_warm, R_vals, res_norm = solve_pde_for_occupancy(nodes, elements, occ_vec, phi0=phi_warm, return_res=True)
+    
+    # Every 10 steps, enforce additional convergence.
+    if t % 10 == 0:
+        extra_iter = 0
+        while (res_norm is None or res_norm > tol) and extra_iter < max_extra_iterations:
+            phi_warm, R_vals, res_norm = solve_pde_for_occupancy(nodes, elements, occ_vec, phi0=phi_warm, return_res=True)
+            extra_iter += 1
+        if res_norm is None or res_norm > tol:
+            print(f"Warning: PDE did not fully converge at step {t} (residual: {res_norm})")
+    
+    # Monte Carlo update of molecule states.
     new_states = []
     for state in molecule_states:
         full_p, allowed_states = new_mc_probabilities_discrete(state, occ_vec, R_vals, external_weight)
@@ -287,7 +302,7 @@ plt.figure(figsize=(8,5))
 plt.plot(global_redox_history, 'o-')
 plt.xlabel("Time Steps")
 plt.ylabel("Global Redox State (%)")
-plt.title("Evolution of Global Redox State Over 10 Steps (No External Force)")
+plt.title("Evolution of Global Redox State Over 240 Steps (No External Force)")
 plt.grid(True)
 plt.savefig("global_redox_evolution.png", dpi=300)
 plt.show()
