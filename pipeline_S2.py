@@ -10,7 +10,21 @@ import networkx as nx
 import pickle
 from scipy.interpolate import griddata
 from mpl_toolkits.mplot3d import Axes3D
-from sklearn.linear_model import LinearRegression  # For computing Lyapunov exponent
+from sklearn.linear_model import LinearRegression
+
+###############################################
+# Load continuous PDE solution from pipeline step 1
+###############################################
+with open("pde_solution.pkl", "rb") as f:
+    sol = pickle.load(f)
+phi_cont = sol["phi"]
+R_cont = sol["R_vals"]
+occupancy_cont = sol["occ_vector"]
+
+# Option 1: If continuous nodes were also saved, you could interpolate:
+# phi_warm = griddata(continuous_nodes, phi_cont, nodes, method='linear')
+# For demonstration, we assume that the first num_nodes entries of phi_cont 
+# can serve as an initial guess for the discrete domain.
 
 ###############################################
 # 1. Define Discrete i-States for R=3 (8 states)
@@ -20,7 +34,7 @@ pf_states = ["000", "001", "010", "011", "100", "101", "110", "111"]
 def count_ones(s):
     return s.count('1')
 
-# Coordinates for the 8 discrete states (diamond layout)
+# Define coordinates for each discrete state (reflecting the k–manifold ordering)
 coords_dict = {
     "000": (0.0,  1.0),   # k = 0
     "001": (-1.0, 0.0),   # k = 1
@@ -37,25 +51,22 @@ discrete_nodes = np.array([coords_dict[s] for s in pf_states])
 ###############################################
 # 2. Build the Discrete Domain for FEM (8 nodes)
 ###############################################
-nodes = discrete_nodes.copy()
+nodes = discrete_nodes.copy()  # shape (8, 2)
 num_nodes = nodes.shape[0]
 triangulation = Delaunay(nodes)
 elements = triangulation.simplices
 
 ###############################################
-# 3. (Optional) Allowed Transitions from Table 4 
-# (Not used here because we now use a new allowed mapping below.)
-###############################################
-
-###############################################
-# 4. Initialize Discrete Population (100 molecules)
+# 3. Initialize Discrete Population at the k–Manifold Level
 ###############################################
 total_molecules = 100.0
 pop_dict = {s: 0.0 for s in pf_states}
-pop_dict["000"] = 0.25 * total_molecules
+pop_dict["000"] = 25.0  
+# Distribute 75 molecules equally among k=1 states (states with one '1')
 for s in pf_states:
     if count_ones(s) == 1:
-        pop_dict[s] = (0.75 * total_molecules) / 3.0
+        pop_dict[s] = 75.0 / 3.0
+# For k>=2, set to zero.
 for s in pf_states:
     if count_ones(s) >= 2:
         pop_dict[s] = 0.0
@@ -67,7 +78,7 @@ def get_occ_vector_discrete(pop_dict):
     return occ
 
 ###############################################
-# 5. FEM Assembly & PDE Solver (Same as Pipeline Step 1)
+# 4. FEM Assembly & Adaptive PDE Solver (Discrete Domain)
 ###############################################
 def fem_assemble_matrices(nodes, elements):
     num_nodes = nodes.shape[0]
@@ -79,7 +90,7 @@ def fem_assemble_matrices(nodes, elements):
         mat = np.array([[1, coords[0,0], coords[0,1]],
                         [1, coords[1,0], coords[1,1]],
                         [1, coords[2,0], coords[2,1]]])
-        area = 0.5 * np.abs(np.linalg.det(mat))
+        area = 0.5 * abs(np.linalg.det(mat))
         if area < 1e-14:
             continue
         x = coords[:,0]
@@ -99,10 +110,14 @@ def fem_assemble_matrices(nodes, elements):
                 M_mat[i_global, j_global] += M_local[i_local, j_local]
     return A_mat.tocsr(), M_mat.tocsr()
 
-def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, damping=0.05):
+def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, damping=0.05, phi0=None):
     A_mat, M_mat = fem_assemble_matrices(nodes, elements)
     num_nodes = nodes.shape[0]
-    phi = np.zeros(num_nodes)
+    # Warm-start: use provided phi0 or start from zeros.
+    if phi0 is None:
+        phi = np.zeros(num_nodes)
+    else:
+        phi = phi0.copy()
     kappa_target = 1.0
     num_steps = 20
     kappa_values = np.linspace(0, kappa_target, num_steps+1)
@@ -122,22 +137,21 @@ def solve_pde_for_occupancy(nodes, elements, occ_vec, max_iter=150, tol=1e-1, da
     return phi, R_curv
 
 ###############################################
-# 6. Load the PDE Baseline Solution from Pipeline Step 1
+# 5. Warm Start Setup: Use the loaded PDE solution as the initial guess
 ###############################################
-with open("pde_solution.pkl", "rb") as f:
-    solution = pickle.load(f)
-phi_baseline = solution["phi"]
-R_baseline = solution["R_vals"]
-occ_vector_baseline = solution["occ_vector"]
+# Here, we use the first num_nodes entries from the continuous PDE solution.
+phi_warm = phi_cont[:num_nodes]
+
+###############################################
+# 6. (Optional) Re-solve the PDE for the baseline occupancy on the discrete domain.
+###############################################
+occ_vector = get_occ_vector_discrete(pop_dict)
+phi_baseline, R_baseline = solve_pde_for_occupancy(nodes, elements, occ_vector)
+print("Discrete PDE baseline solved.")
 
 ###############################################
 # 7. New Rule-Based Monte Carlo Update (No External Perturbation)
 ###############################################
-# New allowed transitions based solely on k-values:
-# k = 0: allowed → k = 1
-# k = 1: allowed → k = 0 and 2
-# k = 2: allowed → k = 1 and 3
-# k = 3: allowed → k = 2
 def new_allowed_k(state):
     k_val = count_ones(state)
     if k_val == 0:
@@ -151,7 +165,6 @@ def new_allowed_k(state):
     else:
         return []
 
-# Field equation parameters for discrete updates:
 alpha_field = 0.1
 beta_field = 1.0
 DeltaE_flip = 5.0
@@ -196,12 +209,27 @@ def get_occ_vector_discrete_from_states(states):
         occ[node_index[s]] = cnt / total_molecules
     return occ
 
-num_steps_mc = 240
+###############################################
+# 8. Lyapunov Exponent Calculation Function
+###############################################
+def compute_lyapunov(time_series, dt=1.0):
+    diffs = np.diff(time_series)
+    diffs[diffs == 0] = 1e-10  # avoid log(0)
+    log_diffs = np.log(np.abs(diffs)).reshape(-1, 1)
+    t = np.arange(1, len(time_series)).reshape(-1, 1)
+    model = LinearRegression().fit(t, log_diffs)
+    lyap = model.coef_[0][0] / dt
+    return lyap
+
+###############################################
+# 9. Monte Carlo Simulation Loop (10 steps, No External Force)
+###############################################
+num_steps_mc = 10
 for t in range(1, num_steps_mc+1):
     external_weight = 0.0  # No external force.
     occ_vec = get_occ_vector_discrete_from_states(molecule_states)
-    # Re-solve PDE to update φ and R (using the current occupancy)
-    phi, R_vals = solve_pde_for_occupancy(nodes, elements, occ_vec)
+    # Update the PDE solution using the warm-start from the previous step.
+    phi_warm, R_vals = solve_pde_for_occupancy(nodes, elements, occ_vec, phi0=phi_warm)
     new_states = []
     for state in molecule_states:
         full_p, allowed_states = new_mc_probabilities_discrete(state, occ_vec, R_vals, external_weight)
@@ -215,26 +243,14 @@ for t in range(1, num_steps_mc+1):
     global_redox_history.append(global_redox(molecule_states))
 
 ###############################################
-# 8. Function to Compute Lyapunov Exponent
+# 10. Compute Lyapunov Exponent from Global Redox Time Series
 ###############################################
-def compute_lyapunov(time_series, dt=1.0):
-    # Compute differences between successive time points
-    diffs = np.diff(time_series)
-    # To avoid log(0), replace zeros with a very small value
-    diffs[diffs == 0] = 1e-10
-    log_diffs = np.log(np.abs(diffs))
-    # Time vector for differences
-    t = np.arange(1, len(time_series))
-    # Linear regression: fit log_diffs = lambda * t + const
-    t = t.reshape(-1, 1)
-    model = LinearRegression().fit(t, log_diffs)
-    lyap = model.coef_[0] / dt
-    return lyap
-
-lyapunov_exponent = compute_lyapunov(np.array(global_redox_history), dt=1.0)
+global_redox_array = np.array(global_redox_history)
+lyapunov_exponent = compute_lyapunov(global_redox_array, dt=1.0)
+print("Estimated Lyapunov Exponent:", lyapunov_exponent)
 
 ###############################################
-# 9. Final Discrete Outputs: k-Bin Distribution, Global Redox, Shannon Entropy
+# 11. Final Discrete Outputs: k-Bin Distribution, Global Redox, Shannon Entropy
 ###############################################
 final_distribution = {s: np.sum(molecule_states == s) for s in pf_states}
 final_total = sum(final_distribution.values())
@@ -248,7 +264,7 @@ for k_val in sorted(k_bin.keys()):
     print(f"k={k_val}: {k_bin[k_val]:.2f} molecules ({frac:.2f}%)")
 print("Total molecules at start:", total_molecules)
 print("Total molecules at end:  ", final_total)
-print("Lyapunov Exponent:", lyapunov_exponent)
+print("Global Redox State (final):", global_redox_history[-1], "%")
 
 def shannon_entropy_discrete(states):
     tot = len(states)
@@ -263,10 +279,9 @@ entropy_initial = shannon_entropy_discrete(state_history[0])
 entropy_final = shannon_entropy_discrete(molecule_states)
 print("Shannon entropy at start:", entropy_initial)
 print("Shannon entropy at end:  ", entropy_final)
-print("Global Redox State (final):", global_redox_history[-1], "%")
 
 ###############################################
-# 10. Plot Global Redox Evolution Over Time
+# 12. Plot Global Redox Evolution Over Time
 ###############################################
 plt.figure(figsize=(8,5))
 plt.plot(global_redox_history, 'o-')
@@ -278,20 +293,12 @@ plt.savefig("global_redox_evolution.png", dpi=300)
 plt.show()
 
 ###############################################
-# 11. Record Monte Carlo State History to Excel
+# 13. Record Aggregated k-Manifold History to Excel
 ###############################################
-discrete_history = []
-for states in state_history:
-    counts = {s: np.sum(states == s) for s in pf_states}
-    discrete_history.append(counts)
-df_states = pd.DataFrame(discrete_history)
-df_states.index.name = 'Time_Step'
-df_states.columns.name = 'i_state'
-
 agg_history = []
-for counts in discrete_history:
+for counts in state_history:
     agg = {}
-    for s, cnt in counts.items():
+    for s, cnt in {s: np.sum(counts==s) for s in pf_states}.items():
         k_val = count_ones(s)
         agg[k_val] = agg.get(k_val, 0) + cnt
     agg_history.append(agg)
@@ -300,6 +307,5 @@ df_k.index.name = 'Time_Step'
 df_k.columns = ['k=' + str(k) for k in sorted(df_k.columns)]
 
 with pd.ExcelWriter("simulation_results.xlsx") as writer:
-    df_states.to_excel(writer, sheet_name="i_state_counts")
     df_k.to_excel(writer, sheet_name="k_manifold_counts")
-print("Monte Carlo state history saved to 'simulation_results.xlsx'.")
+print("Monte Carlo aggregated k-manifold history saved to 'simulation_results.xlsx'.")
