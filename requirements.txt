@@ -9,3 +9,4 @@ openpyxl
 networkx
 GraphRicciCurvature
 xlsxwriter
+scikit-learn
