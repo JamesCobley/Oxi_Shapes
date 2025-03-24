@@ -4,8 +4,6 @@ import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 import pickle
-import os
-
 from GraphRicciCurvature.OllivierRicci import OllivierRicci
 
 ###############################################
@@ -44,16 +42,12 @@ rho_vec = np.array([occupancy[state] for state in pf_states])
 
 orc = OllivierRicci(G.copy(), alpha=0.5, method="OTD", verbose="ERROR")
 orc.compute_ricci_curvature()
-G = orc.G  # This is the graph with edge attributes updated
+G = orc.G  # Updated graph with curvature
 
-
-# Check what keys are actually attached to each edge
+# Standardize key name if needed
 for u, v in G.edges():
-    print(f"Edge ({u}, {v}) keys: {G[u][v].keys()}")
-
-
-# Now each edge has a 'ricciCurvature' attribute
-# You can access it via: G[u][v]['ricciCurvature']
+    if 'ricci' in G[u][v]:
+        G[u][v]['ricciCurvature'] = G[u][v]['ricci']
 
 ###############################################
 # 4. Build Laplacian Matrix (Unweighted)
@@ -95,7 +89,6 @@ phi = {state: phi_vec[i] for i, state in enumerate(pf_states)}
 # 6. Visualize the Oxi-Shape with OR Curvature
 ###############################################
 
-# Layout to preserve Pascal diamond symmetry
 pos = {
     "000": (0, 3),
     "001": (-2, 2), "010": (0, 2), "100": (2, 2),
@@ -106,13 +99,12 @@ pos = {
 node_colors = [phi[state] for state in pf_states]
 node_sizes = [3000 * occupancy[state] for state in pf_states]
 
-# Normalize Ricci curvature for color mapping
 edge_colors = []
 for u, v in G.edges():
-    r = G[u][v]['ricciCurvature']
-    edge_colors.append(r)
+    edge_colors.append(G[u][v].get('ricciCurvature', 0.0))
 
-edge_cmap = plt.cm.coolwarm
+edge_cmap = plt.cm.viridis
+node_cmap = plt.cm.viridis
 edge_norm = plt.Normalize(vmin=min(edge_colors), vmax=max(edge_colors))
 
 fig, ax = plt.subplots(figsize=(10, 8), dpi=300)
@@ -126,14 +118,14 @@ nx.draw(
     edge_vmin=min(edge_colors),
     edge_vmax=max(edge_colors),
     width=3,
-    cmap='plasma',
+    cmap=node_cmap,
     font_weight='bold',
     ax=ax
 )
 
 # Node colorbar
-sm = plt.cm.ScalarMappable(cmap='plasma', norm=plt.Normalize(vmin=min(node_colors), vmax=max(node_colors)))
-sm.set_array([])  # Required in newer matplotlib
+sm = plt.cm.ScalarMappable(cmap=node_cmap, norm=plt.Normalize(vmin=min(node_colors), vmax=max(node_colors)))
+sm.set_array([])
 plt.colorbar(sm, ax=ax, label="Scalar Field φ")
 
 # Edge colorbar
@@ -141,9 +133,11 @@ sm2 = plt.cm.ScalarMappable(cmap=edge_cmap, norm=edge_norm)
 sm2.set_array([])
 plt.colorbar(sm2, ax=ax, label="Ollivier-Ricci Curvature (edges)")
 
+plt.title("Oxi-Shape with OR Curvature on R=3 Pascal Diamond (viridis)")
+plt.axis("off")
 
-# Save and show the image
-image_filename = "oxishape_orc_pascal_diamond.png"
+# Save and show
+image_filename = "oxishape_orc_pascal_diamond_viridis.png"
 plt.savefig(image_filename, dpi=300, bbox_inches='tight')
 plt.show()
 print(f"Oxi-Shape image saved as '{image_filename}'.")
@@ -159,11 +153,11 @@ solution = {
     "states": pf_states,
     "graph": G,
     "orc_edge_curvatures": {
-        (u, v): G[u][v]['ricciCurvature'] for u, v in G.edges()
+        (u, v): G[u][v].get('ricciCurvature', None) for u, v in G.edges()
     }
 }
 
-pickle_filename = "oxishape_solution_with_orc.pkl"
+pickle_filename = "oxishape_solution_with_orc_viridis.pkl"
 with open(pickle_filename, "wb") as f:
     pickle.dump(solution, f)
 
