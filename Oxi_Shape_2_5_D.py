@@ -43,15 +43,15 @@ rho_vec = np.array([occupancy[state] for state in pf_states])
 
 orc = OllivierRicci(G.copy(), alpha=0.5, method="OTD", verbose="ERROR")
 orc.compute_ricci_curvature()
-G = orc.G  # Updated graph with curvature
+G = orc.G  # Use updated graph
 
-# Standardize key name if needed
+# Standardize Ricci key
 for u, v in G.edges():
     if 'ricci' in G[u][v]:
         G[u][v]['ricciCurvature'] = G[u][v]['ricci']
 
 ###############################################
-# 4. Build Laplacian Matrix (Unweighted)
+# 4. Build Graph Laplacian (Unweighted)
 ###############################################
 
 A = np.zeros((N, N))
@@ -63,7 +63,7 @@ D = np.diag(A.sum(axis=1))
 L = D - A
 
 ###############################################
-# 5. Solve the nonlinear Oxi-Shape equation
+# 5. Solve the nonlinear field equation for φ
 ###############################################
 
 phi_vec = np.zeros(N)
@@ -87,45 +87,77 @@ else:
 phi = {state: phi_vec[i] for i, state in enumerate(pf_states)}
 
 ###############################################
-# 6. 2.5D Static Visualization (z = φ or 0)
+# 6. Flat Graph Visualization (Volume Invariant)
 ###############################################
 
-# Pascal diamond x-y layout
-pos_2d = {
+flat_pos = {
     "000": (0, 3),
     "001": (-2, 2), "010": (0, 2), "100": (2, 2),
     "011": (-1, 1), "101": (0, 1), "110": (1, 1),
     "111": (0, 0)
 }
 
-# Compute 3D coordinates: z = φ if occupied, else z = 0
+node_colors = [phi[state] for state in pf_states]
+node_sizes = [3000 * occupancy[state] for state in pf_states]
+edge_colors = [G[u][v].get('ricciCurvature', 0.0) for u, v in G.edges()]
+edge_cmap = plt.cm.viridis
+edge_norm = plt.Normalize(vmin=min(edge_colors), vmax=max(edge_colors))
+
+fig, ax = plt.subplots(figsize=(10, 8), dpi=300)
+nx.draw(
+    G, flat_pos,
+    with_labels=True,
+    node_color=node_colors,
+    node_size=node_sizes,
+    edge_color=edge_colors,
+    edge_cmap=edge_cmap,
+    edge_vmin=min(edge_colors),
+    edge_vmax=max(edge_colors),
+    width=3,
+    cmap='viridis',
+    font_weight='bold',
+    ax=ax
+)
+
+sm1 = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(vmin=min(node_colors), vmax=max(node_colors)))
+sm1.set_array([])
+plt.colorbar(sm1, ax=ax, label="Scalar Field φ")
+
+sm2 = plt.cm.ScalarMappable(cmap=edge_cmap, norm=edge_norm)
+sm2.set_array([])
+plt.colorbar(sm2, ax=ax, label="Ollivier-Ricci Curvature (edges)")
+
+plt.title("Flat Oxi-Shape: Ricci + φ Field on Pascal Diamond")
+plt.axis("off")
+plt.savefig("oxishape_flat_pascal.png", dpi=300, bbox_inches='tight')
+plt.show()
+
+###############################################
+# 7. 2.5D Oxi-Shape Visualization (z = φ or 0)
+###############################################
+
 node_positions_3d = np.array([
-    [pos_2d[state][0], pos_2d[state][1], phi[state] if occupancy[state] > 0 else 0.0]
+    [flat_pos[state][0], flat_pos[state][1], phi[state] if occupancy[state] > 0 else 0.0]
     for state in pf_states
 ])
-
 edges = [(i, j) for i in range(N) for j in range(i+1, N)
          if hamming_distance(pf_states[i], pf_states[j]) == 1]
 
 fig = plt.figure(figsize=(10, 8), dpi=300)
 ax = fig.add_subplot(111, projection='3d')
 
-# Draw edges
 for i, j in edges:
     x = [node_positions_3d[i][0], node_positions_3d[j][0]]
     y = [node_positions_3d[i][1], node_positions_3d[j][1]]
     z = [node_positions_3d[i][2], node_positions_3d[j][2]]
     ax.plot(x, y, z, color='black', alpha=0.6)
 
-# Draw nodes
 xs, ys, zs = node_positions_3d[:, 0], node_positions_3d[:, 1], node_positions_3d[:, 2]
 sc = ax.scatter(xs, ys, zs, c=zs, cmap='viridis', s=300, edgecolors='k')
 
-# Annotate
 for i, state in enumerate(pf_states):
     ax.text(xs[i], ys[i], zs[i], state, fontsize=10, weight='bold')
 
-# Colorbar
 cb = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.1)
 cb.set_label("Scalar Field φ (deforms z-axis)")
 ax.set_title("2.5D Oxi-Shape: φ-Deformed Pascal Diamond")
@@ -138,22 +170,25 @@ plt.savefig("oxishape_pascal_2p5D.png", dpi=300, bbox_inches='tight')
 plt.show()
 
 ###############################################
-# 7. Save the solution to a pickle file
+# 8. Save All Solution Data for Pipeline Step 2
 ###############################################
 
 solution = {
     "phi": phi,
+    "phi_vector": phi_vec,
     "occupancy": occupancy,
+    "rho_vector": rho_vec,
     "laplacian": L,
     "states": pf_states,
     "graph": G,
     "orc_edge_curvatures": {
         (u, v): G[u][v].get('ricciCurvature', None) for u, v in G.edges()
-    }
+    },
+    "layout": flat_pos,
+    "node_positions_3D": node_positions_3d.tolist()
 }
 
-pickle_filename = "oxishape_solution_with_2p5D.pkl"
-with open(pickle_filename, "wb") as f:
+with open("oxishape_solution_full.pkl", "wb") as f:
     pickle.dump(solution, f)
 
-print(f"Oxi-Shape solution with φ-deformation saved to '{pickle_filename}'.")
+print("✔ Full solution saved to 'oxishape_solution_full.pkl'")
