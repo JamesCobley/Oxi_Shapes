@@ -176,3 +176,104 @@ if __name__ == '__main__':
     }
     sim_result = simulate_forward(alpha=0.1, beta=0.5, rho_init=rho_start)
     save_simulation_results(sim_result, filename_prefix='oxi_step2_result')
+
+###############################################
+# 7. Extra Metrics: Lyapunov, Entropy, Final Distributions
+###############################################
+def compute_lyapunov(redox_series, dt=1.0):
+    diffs = np.diff(redox_series)
+    diffs[diffs == 0] = 1e-10
+    log_diffs = np.log(np.abs(diffs)).reshape(-1, 1)
+    t = np.arange(1, len(redox_series)).reshape(-1, 1)
+    model = LinearRegression().fit(t, log_diffs)
+    return model.coef_[0][0] / dt
+
+def analyze_outputs(results):
+    rho_t = results['rho_t']
+    pf_states = results['pf_states']
+    redox_series = np.array(results['redox_t'])
+    final_rho = rho_t[-1]
+    k_bin = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}
+    for i, s in enumerate(pf_states):
+        k = count_ones(s)
+        k_bin[k] += final_rho[i]
+    print('Final k-Bin Distribution:')
+    for k in sorted(k_bin):
+        print(f'k={k}: {k_bin[k]*100:.2f}%')
+    lyap = compute_lyapunov(redox_series)
+    print('Lyapunov Exponent:', lyap)
+    plt.figure(figsize=(8,5))
+    plt.plot(redox_series, 'o-')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Global Redox State (%)')
+    plt.title('Redox Evolution')
+    plt.grid(True)
+    plt.savefig('global_redox_evolution.png', dpi=300)
+    plt.show()
+
+###############################################
+# 8. Hot-start φ₀ from Pipeline Step 1 if available
+###############################################
+import os
+def load_phi0_from_step1(filename='pde_solution.pkl', num_nodes=8):
+    if os.path.exists(filename):
+        with open(filename, 'rb') as f:
+            sol = pickle.load(f)
+        print('Loaded φ₀ from Step 1 solution.')
+        return sol.get('phi', np.zeros(num_nodes))[:num_nodes]
+    print('No Step 1 φ₀ found. Using zeros.')
+    return np.zeros(num_nodes)
+
+def simulate_forward(alpha, beta, rho_init, steps=240, total_molecules=100, gamma=0.0, use_hotstart=True):
+    rho_vec = np.array([rho_init.get(s, 0.0) for s in pf_states])
+    node_coords = np.array([coords_dict[s] for s in pf_states])
+    elements = Delaunay(node_coords).simplices
+    num_nodes = len(pf_states)
+    phi0 = load_phi0_from_step1(num_nodes=num_nodes) if use_hotstart else None
+    phi, R_vals = solve_phi_and_ricci(rho_vec, node_coords, elements, alpha=alpha, gamma=gamma, phi0=phi0)
+    heat_vec = np.zeros(num_nodes)
+    history_rho = [rho_vec.copy()]
+    history_redox = [np.dot([count_ones(s)/3 for s in pf_states], rho_vec) * 100]
+    history_entropy = [-np.sum([p*np.log2(p) for p in rho_vec if p > 0])]
+    for t in range(steps):
+        new_rho = np.zeros_like(rho_vec)
+        for i, state in enumerate(pf_states):
+            neighbors = [n for n in G.neighbors(state)]
+            dE = []
+            for neighbor in neighbors:
+                j = state_index[neighbor]
+                delta_phi = phi[j] - phi[i]
+                q = -delta_phi
+                heat_vec[j] += q
+                g_i, g_j = degeneracy[count_ones(state)], degeneracy[count_ones(neighbor)]
+                entropy_term = np.log(g_j / g_i)
+                delta_f = delta_phi * np.exp(alpha * rho_vec[i]) - beta * R_vals[i] + entropy_term + gamma * heat_vec[i]
+                dE.append(np.exp(-delta_f / (0.001987 * 310.15)))
+            if dE:
+                dE = np.array(dE)
+                dE = dE / np.sum(dE)
+                for idx, neighbor in enumerate(neighbors):
+                    j = state_index[neighbor]
+                    new_rho[j] += rho_vec[i] * dE[idx]
+            else:
+                new_rho[i] += rho_vec[i]
+        rho_vec = new_rho / np.sum(new_rho)
+        try:
+            phi, R_vals = solve_phi_and_ricci(rho_vec, node_coords, elements, alpha=alpha, gamma=gamma, phi0=phi)
+        except:
+            print(f'[Warning] Ricci solver failed at step {t}. Using last φ.')
+        history_rho.append(rho_vec.copy())
+        redox = np.dot([count_ones(s)/3 for s in pf_states], rho_vec) * 100
+        history_redox.append(redox)
+        entropy = -np.sum([p*np.log2(p) for p in rho_vec if p > 0])
+        history_entropy.append(entropy)
+    return {
+        'rho_t': history_rho,
+        'redox_t': history_redox,
+        'entropy_t': history_entropy,
+        'final_phi': phi,
+        'final_ricci': R_vals,
+        'final_heat': heat_vec,
+        'coords': coords_dict,
+        'pf_states': pf_states
+    }
