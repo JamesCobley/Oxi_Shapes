@@ -5,7 +5,6 @@ requests
 streamlit
 scipy
 seaborn
-biopython
 openpyxl
 networkx
 GraphRicciCurvature
