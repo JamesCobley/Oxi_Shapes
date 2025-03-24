@@ -277,3 +277,29 @@ def simulate_forward(alpha, beta, rho_init, steps=240, total_molecules=100, gamm
         'coords': coords_dict,
         'pf_states': pf_states
     }
+
+###############################################
+# 9. Display Result Summary When Run Directly
+###############################################
+    analyze_outputs(sim_result)
+
+    # Extended result printout
+    final_rho = sim_result['rho_t'][-1]
+    molecule_counts = {s: int(round(r * 100)) for s, r in zip(sim_result['pf_states'], final_rho)}
+    k_bin_counts = {k: 0 for k in range(4)}
+    for s, count in molecule_counts.items():
+        k = count_ones(s)
+        k_bin_counts[k] += count
+    total_molecules = sum(molecule_counts.values())
+    print('\nFinal State Summary:')
+    print(f'Total Molecules: {total_molecules}')
+    print('Molecules per k-bin:')
+    for k in sorted(k_bin_counts):
+        print(f'  k={k}: {k_bin_counts[k]}')
+    print('Molecules per i-state:')
+    for s in sim_result['pf_states']:
+        print(f'  {s}: {molecule_counts[s]}')
+    print(f'Shannon Entropy (final): {sim_result["entropy_t"][-1]:.4f}')
+    print(f'Lyapunov Exponent: {compute_lyapunov(sim_result["redox_t"]):.6f}')
+    fisher_metric = np.sum((np.diff(sim_result['rho_t'], axis=0)**2))
+    print(f'Fisher Information Metric (trajectory): {fisher_metric:.6f}')
