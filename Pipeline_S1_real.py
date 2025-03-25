@@ -89,7 +89,13 @@ for _ in range(max_iter):
     F = L @ phi_vec + nonlin
     J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
     delta_phi = np.linalg.solve(J, -F)
+
+    # 🔐 Enforce φ = 0 update at unoccupied nodes (robust enforcement)
+    unoccupied_mask = rho_vec == 0
+    delta_phi[unoccupied_mask] = 0.0
+
     phi_vec += damping * delta_phi
+
     if np.linalg.norm(delta_phi) < tol:
         print(f"Converged after {_+1} iterations.")
         break
