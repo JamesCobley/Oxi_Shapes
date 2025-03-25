@@ -5,7 +5,7 @@
 Oxi-Shapes: Pipeline Step 1 — Generate the redox diamond solution for the given fractional occupancy
 Encodes the full binomial diamond state space and allowed and barred as edges.
 Inputs: Fractional positional density data.
-Outputs: Pickle solution file, PNG solution image with scalar, printouts checking the geometry.
+Outputs: Pickle solution file, plots (geometry, energy, heat), printouts checking the geometry.
 """
 
 # Core imports
