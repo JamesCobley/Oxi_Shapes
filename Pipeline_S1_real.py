@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+# coding: utf-8
+
+"""
+Oxi-Shapes: Pipeline Step 1 — Generate the redox dimaond solution for the given fractional occupacny
+Encodes the full binomial diamond state space and allowed and barred as edges
+Inputs: Fractional positional density data
+Outputs: Pickle soltuon file, PNG solution image with scalar, printouts checking the geometry.
+"""
 
 import numpy as np
 import networkx as nx
@@ -80,8 +88,8 @@ L = D - A
 
 phi_vec = np.zeros(N)
 kappa = 1.0
-max_iter = 7000
-tol = 1e-6
+max_iter = 10000
+tol = 1e-3
 damping = 0.05
 
 for _ in range(max_iter):
@@ -167,3 +175,28 @@ plt.title("Flat Oxi-Shape: Ricci + φ Field")
 plt.axis("off")
 plt.savefig("oxishape_flat.png", dpi=300, bbox_inches='tight')
 plt.show()
+
+###############################################
+# 8. Check the geometry is correct
+###############################################
+
+import pickle
+
+with open("oxishape_solution_full.pkl", "rb") as f:
+    solution = pickle.load(f)
+
+# Summarize key fields
+print("States and φ values:")
+for state in solution['states']:
+    phi_val = solution['phi'][state]
+    rho_val = solution['occupancy'][state]
+    print(f"  {state}: φ = {phi_val:.4f}, ρ = {rho_val}")
+
+print("\nBetti-0:", solution['betti_0'])
+print("Connected components:", solution['connected_components'])
+
+print("\nSample Ricci curvatures:")
+for (u, v), ricci in list(solution['orc_edge_curvatures'].items())[:5]:
+    print(f"  ({u}, {v}): {ricci:.4f}")
+
+print("\nLaplacian matrix:\n", solution['laplacian'])
