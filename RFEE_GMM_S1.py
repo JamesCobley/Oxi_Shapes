@@ -2,13 +2,13 @@
 # coding: utf-8
 
 """
-Oxi-Shapes: Pipeline Step 1 — Generate the redox dimaond solution for the given fractional occupacny
-Encodes the full binomial diamond state space and allowed and barred as edges
-Inputs: Fractional positional density data
-Outputs: Pickle soltuon file, PNG solution image with scalar, printouts checking the geometry.
+Oxi-Shapes: Pipeline Step 1 — Generate the redox diamond solution for the given fractional occupancy
+Encodes the full binomial diamond state space and allowed and barred as edges.
+Inputs: Fractional positional density data.
+Outputs: Pickle solution file, PNG solution image with scalar, printouts checking the geometry.
 """
 
-# Add at top with other imports
+# Core imports
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -97,6 +97,7 @@ for _ in range(max_iter):
     F = L @ phi_vec + nonlin
     J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
     delta_phi = np.linalg.solve(J, -F)
+    # Do not update nodes with zero occupancy
     delta_phi[rho_vec == 0] = 0.0
     phi_vec += damping * delta_phi
     if np.linalg.norm(delta_phi) < tol:
@@ -112,31 +113,48 @@ lap_rho = L @ rho_vec
 heat_vec = -lap_rho
 heat_landscape = {state: heat_vec[i] for i, state in enumerate(pf_states)}
 
-
 ###############################################
-# Derive Morse and Heat Landscapes
+# Derive Morse and Heat Landscapes from First Principles
 ###############################################
+# Define a state coordinate X = k / R (with R=3 for R=3 system)
+def compute_state_coordinate(state, R=3):
+    return state.count('1') / R
 
-morse_energy = {s: 0.5 * occupancy[s] * np.exp(2 * phi[s]) for s in pf_states}
+# Define a Morse potential function
+def morse_potential(X, D_e, a, X0):
+    return D_e * (1 - np.exp(-a * (X - X0)))**2
+
+# Choose Morse parameters (to be refined based on first-principles considerations)
+D_e = 5.0      # Dissociation energy (arbitrary units)
+a_param = 2.0  # Controls the width of the potential well
+X0 = 0.5       # Equilibrium coordinate
+
+# Compute Morse energy for each state based on its normalized oxidation level
+morse_energy = {}
+for s in pf_states:
+    X = compute_state_coordinate(s, R=3)
+    morse_energy[s] = morse_potential(X, D_e, a_param, X0)
+
+# For now, we'll set the heat landscape to zero (to be refined later)
 heat_landscape = {s: 0.0 for s in pf_states}
 
 ###############################################
-# Save Graph Structure + φ to Pickle
+# Save Graph Structure + φ, Morse, and Heat Landscapes to Pickle
 ###############################################
 
 solution = {
-    "phi": phi,
-    "phi_vector": phi_vec,
-    "occupancy": occupancy,
-    "rho_vector": rho_vec,
-    "laplacian": L,
+    "phi": phi,                      # Dictionary: {state: φ value}
+    "phi_vector": phi_vec,           # Array of φ values in order of pf_states
+    "occupancy": occupancy,          # Original occupancy dictionary
+    "rho_vector": rho_vec,           # Array of fractional occupancies
+    "laplacian": L,                  # Graph Laplacian
     "states": pf_states,
     "graph": G,
     "active_subgraph": G_active,
     "connected_components": connected,
     "betti_0": betti_0,
     "orc_edge_curvatures": {(u, v): G[u][v]['ricciCurvature'] for u, v in G.edges()},
-    "morse_energy": morse_energy,
+    "morse_energy": morse_energy,    # Now a true Morse potential based on k/3
     "heat_landscape": heat_landscape
 }
 
