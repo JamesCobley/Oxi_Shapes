@@ -11,6 +11,8 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import pickle
 import pandas as pd
+from scipy.spatial import Delaunay
+from matplotlib.tri import Triangulation
 from networkx.algorithms.components import connected_components
 from mpl_toolkits.mplot3d import Axes3D
 
@@ -152,6 +154,43 @@ for s in pf_states:
     x, y = flat_pos[s]
     z_val = occupancy[s] if occupancy[s]>1e-14 else 0.0
     node_positions_3D[s] = (x, y, z_val)
+
+# Build triangulated mesh using (x, y) node positions
+node_xy = np.array([flat_pos[s] for s in pf_states])
+z_c_ricci = np.array([
+    sum([
+        G[u][v]['cRicci'] for (u, v) in G.edges() if u == s or v == s
+    ]) / max(1, sum([1 for (u, v) in G.edges() if u == s or v == s]))
+    for s in pf_states
+])
+tri = Delaunay(node_xy)
+triangles = tri.simplices
+
+# 3D Surface plot colored by C-Ricci curvature
+fig = plt.figure(figsize=(10, 8), dpi=300)
+ax = fig.add_subplot(111, projection='3d')
+triang = Triangulation(node_xy[:, 0], node_xy[:, 1], triangles)
+surf = ax.plot_trisurf(
+    triang, z_c_ricci, cmap='coolwarm', edgecolor='k', linewidth=0.5, antialiased=True
+)
+ax.set_title("C-Ricci Curvature Surface (Oxi-Shape)")
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.set_zlabel("Ricci Height (z)")
+fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="C-Ricci")
+plt.savefig("oxishape_surface_cRicci.png", dpi=300, bbox_inches='tight')
+plt.show()
+
+# Store triangulation and z-values in solution object
+solution["cRicci_nodewise"] = dict(zip(pf_states, z_c_ricci))
+solution["triangulation"] = {
+    "vertices": node_xy,
+    "triangles": triangles.tolist(),
+    "z_values": z_c_ricci.tolist()
+}
+
+# Add final field equation print
+print("\nRicci(x) = α(x) ⋅ ρ(x) + β(x) ⋅ Q(x) - γ(x) ⋅ S(x) + δ(x) ⋅ E_Morse(x)")
 
 ###############################################
 # 7. Build the 24-Row Transition Table (Edges in Both Directions)
