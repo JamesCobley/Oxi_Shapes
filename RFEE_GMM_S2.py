@@ -2,14 +2,15 @@
 # coding: utf-8
 
 """
-Oxi-Shapes: Pipeline Step 2 — Time Evolution Engine (Updated with Dynamic Parameters)
+Oxi-Shapes: Pipeline Step 2 — Time Evolution Engine (Dynamic Fields Version)
 Encodes the full thermo-geometric evolution model based on first principles.
 This version:
-  • Loads geometry, occupancy, Morse energy, and custom discrete C-Ricci (from Pipeline Step 1)
-  • Derives dynamic parameters (α, β, γ) for each state based on its current occupancy, energy, and local curvature.
-  • Uses these to compute transition probabilities (for oxidation, reduction, or staying) that sum to 1.
-  • Updates the occupancy (ρ) while preserving total volume (i.e. ∑ρ = 1).
-Outputs: φ(x,t), updated ρ(x,t), redox signal, k-bin evolution, entropy, Lyapunov exponent, Excel export.
+  • Loads geometry, occupancy, Morse energy, and custom discrete C-Ricci from Pipeline Step 1.
+  • Treats α, β, and γ as dynamic per-node fields that are updated every simulation step.
+  • Uses these dynamic parameters to compute the free-energy difference (Δf) for allowed transitions
+    (oxidation: k+1, reduction: k-1, or stay), ensuring that the probability simplex for each molecule sums to 1.
+  • Enforces volume conservation by normalizing occupancy at each step.
+Outputs: Time evolution of φ, ρ, redox state, entropy, k-bin history, Lyapunov exponent, Excel export.
 """
 
 import numpy as np
@@ -30,44 +31,41 @@ from scipy.spatial import Delaunay
 with open('oxishape_solution_full.pkl', 'rb') as f:
     oxi_shape_data = pickle.load(f)
 
-pf_states   = oxi_shape_data['states']
-# Use the 3D node positions stored in Pipeline Step 1;
-# for 2D triangulation we use the first two coordinates.
+pf_states = oxi_shape_data['states']
+# For 2D triangulation, use the first two components of the 3D node positions.
 node_positions_3D = oxi_shape_data['node_positions_3D']
-flat_coords = np.array([ (node_positions_3D[s][0], node_positions_3D[s][1]) for s in pf_states ])
-
-# Load allowed transitions graph with custom C-Ricci (stored under 'graph') and its cRicci values.
+flat_coords = np.array([(node_positions_3D[s][0], node_positions_3D[s][1]) for s in pf_states])
+# Load the allowed transitions graph (with custom C-Ricci stored on edges)
 G = oxi_shape_data['graph']
-# Also extract the edge dictionary for cRicci (for convenience)
+# Load the edge dictionary for custom C-Ricci (for hotstart use)
 cRicci_edges = oxi_shape_data['cRicci']
 morse_energy = oxi_shape_data['morse_energy']
-occupancy = oxi_shape_data['occupancy']  # normalized occupancy (sum = 1)
+occupancy = oxi_shape_data['occupancy']  # normalized occupancy (∑ρ = 1)
 
 state_index = {s: i for i, s in enumerate(pf_states)}
 index_state = {i: s for s, i in state_index.items()}
 
-# Degeneracy map (for entropy)
+# Degeneracy map for entropy
 degeneracy = {0: 1, 1: 3, 2: 3, 3: 1}
-def count_ones(s): 
+def count_ones(s):
     return s.count('1')
 
 ###############################################
-# 2. Dynamic Parameter Function: Derive α, β, γ per State
+# 2. Dynamic Parameter Function (Per Node)
 ###############################################
 def dynamic_parameters(state):
     """
-    Derive dynamic parameters (alpha, beta, gamma) for a given state.
-    Example:
-      - alpha_dyn = alpha_base * (1 + occupancy)
-      - beta_dyn  = beta_base  * (1 + (morse_energy / reference))
-      - gamma_dyn = gamma_base * (1 + |average cRicci| )
+    Compute dynamic parameters (alpha, beta, gamma) for a given state.
+    Example formulas (adjust as needed):
+      alpha_dyn = alpha_base * (1 + occupancy[state])
+      beta_dyn  = beta_base  * (1 + (morse_energy[state] / 5.0))
+      gamma_dyn = gamma_base * (1 + |average_cRicci|)
     """
     alpha_base = 0.1
     beta_base  = 0.5
-    gamma_base = 0.1  # Use a nonzero value if you wish to include heat effects
+    gamma_base = 0.1
     occ = occupancy[state]
     energy = morse_energy[state]
-    # Compute average cRicci from the state's neighbors in G
     neighbors = list(G.neighbors(state))
     if neighbors:
         c_vals = [G[state][nbr]['cRicci'] for nbr in neighbors]
@@ -75,12 +73,12 @@ def dynamic_parameters(state):
     else:
         c_avg = 0.0
     alpha_dyn = alpha_base * (1 + occ)
-    beta_dyn  = beta_base * (1 + energy/5.0)  # 5.0 is a reference energy scale
+    beta_dyn  = beta_base  * (1 + energy / 5.0)
     gamma_dyn = gamma_base * (1 + abs(c_avg))
     return alpha_dyn, beta_dyn, gamma_dyn
 
 ###############################################
-# 3. FEM Assembly and φ Solver (as in previous version)
+# 3. FEM Assembly and φ Solver (Same as before)
 ###############################################
 def fem_assemble_matrices(nodes, elements):
     num_nodes = nodes.shape[0]
@@ -102,7 +100,7 @@ def fem_assemble_matrices(nodes, elements):
         K_local = np.zeros((3,3))
         for i_local in range(3):
             for j_local in range(3):
-                K_local[i_local, j_local] = (b[i_local]*b[j_local] + c[i_local]*c[j_local])/(4*area)
+                K_local[i_local,j_local] = (b[i_local]*b[j_local] + c[i_local]*c[j_local])/(4*area)
         M_local = (area/12.0)*np.array([[2,1,1],[1,2,1],[1,1,2]])
         for i_local, i_global in enumerate(idx):
             for j_local, j_global in enumerate(idx):
@@ -114,7 +112,7 @@ def solve_phi_and_ricci(rho, nodes, elements, alpha=1.0, gamma=0.0, phi0=None, d
     A, M = fem_assemble_matrices(nodes, elements)
     num_nodes = len(rho)
     phi = np.zeros(num_nodes) if phi0 is None else phi0.copy()
-    reg = 1e-8  # Regularization term
+    reg = 1e-8
     for _ in range(max_iter):
         nonlinear = 0.5 * rho * np.exp(2 * phi)
         F = A @ phi + M @ nonlinear
@@ -129,7 +127,7 @@ def solve_phi_and_ricci(rho, nodes, elements, alpha=1.0, gamma=0.0, phi0=None, d
     return phi, Ricci
 
 ###############################################
-# 4. Lyapunov Exponent & Analysis Functions
+# 4. Lyapunov Exponent & Analysis Functions (Same as before)
 ###############################################
 def compute_lyapunov(redox_series, dt=1.0):
     diffs = np.diff(redox_series)
@@ -153,7 +151,7 @@ def analyze_outputs(results):
     plt.show()
 
 ###############################################
-# 5. Hot-Start Function for φ from Pipeline Step 1
+# 5. Hot-Start Function for φ from Pipeline Step 1 (Same as before)
 ###############################################
 def load_phi0_from_step1(filename='oxishape_solution_full.pkl', pf_states=pf_states, num_nodes=None):
     if os.path.exists(filename):
@@ -171,43 +169,43 @@ def load_phi0_from_step1(filename='oxishape_solution_full.pkl', pf_states=pf_sta
     return np.zeros(num_nodes)
 
 ###############################################
-# 6. Main Evolution Engine for Oxi-Shapes
+# 6. Main Evolution Engine for Oxi-Shapes (Dynamic Fields Version)
 ###############################################
 def simulate_forward(alpha, beta, rho_init, steps=240, total_molecules=100, gamma=0.0, use_hotstart=True):
     """
-    At each step, for each state, dynamic parameters (alpha, beta, gamma) are derived based on the state’s 
-    current occupancy, Morse energy, and local cRicci. These are then used to compute the free-energy 
-    difference for allowed transitions (oxidation: k+1, reduction: k-1, and stay) so that each molecule’s 
-    probability simplex sums to 1.
+    At each step, for each state, dynamic parameters (alpha, beta, gamma) are derived using dynamic_parameters.
+    Transitions (oxidation, reduction, stay) are computed from free-energy differences that incorporate these parameters.
+    The occupancy is updated and normalized (volume conservation), and φ is recalculated.
     """
-    # Convert initial occupancy to vector.
+    # Initial occupancy vector
     rho_vec = np.array([rho_init.get(s, 0.0) for s in pf_states])
-    # Use flat 2D coordinates from the 3D embedding (first two components).
-    node_coords_local = np.array([ (node_positions_3D[s][0], node_positions_3D[s][1]) for s in pf_states])
+    # Use flat 2D coordinates from node_positions_3D (first two components)
+    node_coords_local = np.array([(node_positions_3D[s][0], node_positions_3D[s][1]) for s in pf_states])
     elements = Delaunay(node_coords_local).simplices
     num_nodes = len(pf_states)
     
-    # Hotstart for φ.
+    # Hotstart for φ
     phi0 = load_phi0_from_step1(num_nodes=num_nodes) if use_hotstart else None
     phi, _ = solve_phi_and_ricci(rho_vec, node_coords_local, elements, alpha=alpha, gamma=gamma, phi0=phi0)
     
+    # Initialize heat vector and histories
     heat_vec = np.zeros(num_nodes)
-    history_rho   = [rho_vec.copy()]
-    redox_init    = np.dot([count_ones(s)/3 for s in pf_states], rho_vec) * 100
+    history_rho = [rho_vec.copy()]
+    redox_init = np.dot([count_ones(s)/3 for s in pf_states], rho_vec) * 100
     history_redox = [redox_init]
     history_entropy = [-np.sum([p*np.log2(p) for p in rho_vec if p > 0])]
     
-    # Time evolution loop.
+    # Main time evolution loop
     for t in range(steps):
         new_rho = np.zeros_like(rho_vec)
         for i, state in enumerate(pf_states):
-            # Get dynamic parameters for this state.
+            # Derive dynamic parameters for the current state
             alpha_dyn, beta_dyn, gamma_dyn = dynamic_parameters(state)
             current_k = count_ones(state)
             transitions = []
-            # Option 1: Stay in the same state (delta_f = 0).
+            # Option: stay in the same state (free-energy difference = 0)
             transitions.append((state, "stay", 0.0))
-            # Options from allowed neighbors:
+            # Allowed transitions: oxidation (k+1) or reduction (k-1)
             for neighbor in list(G.neighbors(state)):
                 neighbor_k = count_ones(neighbor)
                 if neighbor_k == current_k + 1:
@@ -215,42 +213,40 @@ def simulate_forward(alpha, beta, rho_init, steps=240, total_molecules=100, gamm
                 elif neighbor_k == current_k - 1:
                     move_type = "reduction"
                 else:
-                    # Skip barred transitions.
-                    continue
+                    continue  # Skip barred transitions
                 j = state_index[neighbor]
                 delta_phi = phi[j] - phi[i]
-                # Heat term: for simplicity, we take heat as -delta_phi.
                 q = -delta_phi
-                # Update heat vector if desired (here we accumulate)
+                # Optionally accumulate heat (here we add q to neighbor's heat)
                 heat_vec[j] += q
-                # Entropy term: based on degeneracy difference.
+                # Entropy term based on degeneracy
                 g_i = degeneracy[current_k]
                 g_j = degeneracy[neighbor_k]
                 entropy_term = np.log(g_j / g_i) if g_i > 0 else 0.0
-                # Get the custom cRicci for this edge.
+                # Get custom cRicci from Pipeline Step 1 for this edge
                 cRicci_term = cRicci_edges.get((state, neighbor), cRicci_edges.get((neighbor, state), 0.0))
-                # Compute free-energy difference delta_f using dynamic parameters.
                 RT = 0.001987 * 310.15
                 delta_f = (delta_phi * np.exp(alpha_dyn * rho_vec[i])
                            - beta_dyn * cRicci_term
                            + entropy_term
                            + gamma_dyn * heat_vec[i])
                 transitions.append((neighbor, move_type, delta_f))
-            # Compute Boltzmann weights.
+            # Compute Boltzmann weights for all transitions from this state
             weights = np.array([np.exp(-tf/RT) for (_, _, tf) in transitions])
             if np.sum(weights) < 1e-12:
                 weights = np.ones_like(weights) / len(weights)
             else:
                 weights /= np.sum(weights)
-            # Redistribute occupancy.
+            # Redistribute occupancy from state i according to the computed probabilities
             for (target, mtype, tf), w in zip(transitions, weights):
                 j = state_index[target]
                 new_rho[j] += rho_vec[i] * w
+        
         total_occ = np.sum(new_rho)
         if total_occ < 1e-12:
             print(f"[Warning] Occupancy vanished at step {t}. Breaking.")
             break
-        # Normalize occupancy to enforce volume conservation.
+        # Normalize occupancy to conserve volume
         rho_vec = new_rho / total_occ
         
         try:
@@ -270,12 +266,12 @@ def simulate_forward(alpha, beta, rho_init, steps=240, total_molecules=100, gamm
         'entropy_t': history_entropy,
         'final_phi': phi,
         'final_heat': heat_vec,
-        'coords': flat_coords,  # 2D coordinates from node_positions_3D
+        'coords': flat_coords,  # 2D coordinates for visualization
         'pf_states': pf_states
     }
 
 ###############################################
-# 7. Save Simulation Results Function
+# 7. Save Simulation Results Function (Same as before)
 ###############################################
 def save_simulation_results(results, filename_prefix='oxi_step2_result'):
     with open(f'{filename_prefix}.pkl', 'wb') as f:
@@ -294,7 +290,7 @@ def save_simulation_results(results, filename_prefix='oxi_step2_result'):
 # 8. Main Script Execution
 ###############################################
 if __name__ == '__main__':
-    # Use initial occupancy from Pipeline Step 1 (volume conserved)
+    # Use initial occupancy from Pipeline Step 1 (should already be normalized)
     rho_start = {s: occupancy.get(s, 0.0) for s in pf_states}
     
     sim_result = simulate_forward(alpha=0.1, beta=0.5, rho_init=rho_start, steps=240, gamma=0.0, use_hotstart=True)
