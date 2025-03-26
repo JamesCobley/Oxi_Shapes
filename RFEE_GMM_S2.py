@@ -2,10 +2,13 @@
 # coding: utf-8
 
 """
-Oxi-Shapes: Pipeline Step 2 — Time Evolution Engine (Updated)
-This version derives dynamic alpha, beta, gamma for each coordinate (state) based on its starting point,
-and uses these to compute per-molecule transition probabilities (P oxidation, P reduction, P stay)
-that sum to 1 for each molecule.
+Oxi-Shapes: Pipeline Step 2 — Time Evolution Engine (Updated with Dynamic Parameters)
+Encodes the full thermo-geometric evolution model based on first principles.
+This version:
+  • Loads geometry, occupancy, Morse energy, and custom discrete C-Ricci (from Pipeline Step 1)
+  • Derives dynamic parameters (α, β, γ) for each state based on its current occupancy, energy, and local curvature.
+  • Uses these to compute transition probabilities (for oxidation, reduction, or staying) that sum to 1.
+  • Updates the occupancy (ρ) while preserving total volume (i.e. ∑ρ = 1).
 Outputs: φ(x,t), updated ρ(x,t), redox signal, k-bin evolution, entropy, Lyapunov exponent, Excel export.
 """
 
@@ -28,197 +31,105 @@ with open('oxishape_solution_full.pkl', 'rb') as f:
     oxi_shape_data = pickle.load(f)
 
 pf_states   = oxi_shape_data['states']
-# For 2D triangulation, we use the first two coordinates of the 3D node positions.
+# Use the 3D node positions stored in Pipeline Step 1;
+# for 2D triangulation we use the first two coordinates.
 node_positions_3D = oxi_shape_data['node_positions_3D']
 flat_coords = np.array([ (node_positions_3D[s][0], node_positions_3D[s][1]) for s in pf_states ])
-G = oxi_shape_data['graph']      # allowed transitions graph with custom cRicci stored in edges
-cRicci_edges = oxi_shape_data['cRicci']  # Dictionary {(u,v): cRicci value}
+
+# Load allowed transitions graph with custom C-Ricci (stored under 'graph') and its cRicci values.
+G = oxi_shape_data['graph']
+# Also extract the edge dictionary for cRicci (for convenience)
+cRicci_edges = oxi_shape_data['cRicci']
 morse_energy = oxi_shape_data['morse_energy']
-occupancy = oxi_shape_data['occupancy']   # normalized occupancy (sum = 1)
+occupancy = oxi_shape_data['occupancy']  # normalized occupancy (sum = 1)
 
 state_index = {s: i for i, s in enumerate(pf_states)}
 index_state = {i: s for s, i in state_index.items()}
 
-# Degeneracy map remains the same
+# Degeneracy map (for entropy)
 degeneracy = {0: 1, 1: 3, 2: 3, 3: 1}
-def count_ones(s):
+def count_ones(s): 
     return s.count('1')
 
 ###############################################
-# 2. Function to Derive Dynamic Parameters per State
+# 2. Dynamic Parameter Function: Derive α, β, γ per State
 ###############################################
 def dynamic_parameters(state):
     """
-    Derive dynamic parameters (alpha, beta, gamma) for a given state based on its starting values.
-    For example, you might let:
-      - alpha_dyn = alpha_base * (1 + occupancy(state))
-      - beta_dyn  = beta_base  * (1 + (morse_energy[state] / 5.0))   # 5.0 is a reference energy
-      - gamma_dyn = gamma_base * (1 + cRicci_value)  (or simply gamma_base)
-    Adjust the formulas as needed.
+    Derive dynamic parameters (alpha, beta, gamma) for a given state.
+    Example:
+      - alpha_dyn = alpha_base * (1 + occupancy)
+      - beta_dyn  = beta_base  * (1 + (morse_energy / reference))
+      - gamma_dyn = gamma_base * (1 + |average cRicci| )
     """
-    # Base values (could be derived from calibration)
-    alpha_base = 1.0
+    alpha_base = 0.1
     beta_base  = 0.5
-    gamma_base = 0.8
+    gamma_base = 0.1  # Use a nonzero value if you wish to include heat effects
     occ = occupancy[state]
     energy = morse_energy[state]
-    # For cRicci, average over edges from state
-    neighbor_cricci = [G[state][nbr]['cRicci'] for nbr in G.neighbors(state)]
-    if neighbor_cricci:
-        c_avg = np.mean(neighbor_cricci)
+    # Compute average cRicci from the state's neighbors in G
+    neighbors = list(G.neighbors(state))
+    if neighbors:
+        c_vals = [G[state][nbr]['cRicci'] for nbr in neighbors]
+        c_avg = np.mean(c_vals)
     else:
         c_avg = 0.0
-    # Example dynamic update:
     alpha_dyn = alpha_base * (1 + occ)
-    beta_dyn  = beta_base  * (1 + energy/5.0)
+    beta_dyn  = beta_base * (1 + energy/5.0)  # 5.0 is a reference energy scale
     gamma_dyn = gamma_base * (1 + abs(c_avg))
     return alpha_dyn, beta_dyn, gamma_dyn
 
 ###############################################
-# 3. Modified Simulation Loop: Compute Transition Probabilities per State
+# 3. FEM Assembly and φ Solver (as in previous version)
 ###############################################
-def simulate_forward(alpha, beta, rho_init, steps=240, total_molecules=100, gamma=0.0, use_hotstart=True):
-    """
-    For each state, dynamically derive alpha, beta, gamma.
-    Then compute transition probabilities for oxidation (k+1), reduction (k-1), and stay.
-    Each molecule's probability simplex sums to 1.
-    """
-    # Initial occupancy from input (should be same as loaded occupancy)
-    rho_vec = np.array([rho_init.get(s, 0.0) for s in pf_states])
-    # Use flat 2D coordinates from node_positions_3D (first two components)
-    node_coords_local = np.array([ (node_positions_3D[s][0], node_positions_3D[s][1]) for s in pf_states ])
-    elements = Delaunay(node_coords_local).simplices
-    num_nodes = len(pf_states)
-    
-    # Hotstart for φ if desired
-    phi0 = load_phi0_from_step1(num_nodes=num_nodes) if use_hotstart else None
-    phi, _ = solve_phi_and_ricci(rho_vec, node_coords_local, elements, alpha=alpha, gamma=gamma, phi0=phi0)
-    
-    # Initialize heat vector and history arrays
-    heat_vec = np.zeros(num_nodes)
-    history_rho   = [rho_vec.copy()]
-    history_redox = [np.dot([count_ones(s)/3 for s in pf_states], rho_vec) * 100]
-    history_entropy = [-np.sum([p*np.log2(p) for p in rho_vec if p>0])]
-    
-    # For each step, update occupancy based on transitions computed per state
-    for t in range(steps):
-        new_rho = np.zeros_like(rho_vec)
-        for i, state in enumerate(pf_states):
-            # Get dynamic parameters for this state
-            alpha_dyn, beta_dyn, gamma_dyn = dynamic_parameters(state)
-            current_k = count_ones(state)
-            # Define three potential moves: stay, oxidation (k+1), reduction (k-1)
-            transitions = []
-            # Stay option: no change in state => delta_f = 0
-            transitions.append((state, "stay", 0.0))
-            # Allowed neighbor moves:
-            for neighbor in list(G.neighbors(state)):
-                neighbor_k = count_ones(neighbor)
-                if neighbor_k == current_k + 1:
-                    move_type = "oxidation"
-                elif neighbor_k == current_k - 1:
-                    move_type = "reduction"
-                else:
-                    # If neighbor is not exactly one level different, skip (barred transition)
-                    continue
-                j = state_index[neighbor]
-                # Compute delta_phi (difference in φ)
-                delta_phi = phi[j] - phi[i]
-                # Compute a heat term: for simplicity, use -delta_phi
-                q = -delta_phi
-                # Update heat vector for neighbor (this could be accumulated over transitions)
-                # (Here, we do not accumulate over states to avoid double counting)
-                # Compute an entropy term based on degeneracy difference:
-                g_i = degeneracy[current_k]
-                g_j = degeneracy[neighbor_k]
-                entropy_term = np.log(g_j / g_i) if g_i>0 else 0.0
-                # Get the custom cRicci for this edge (from Pipeline Step 1)
-                cRicci_term = cRicci_edges.get((state, neighbor), cRicci_edges.get((neighbor, state), 0.0))
-                # Compute free-energy difference delta_f using dynamic parameters:
-                # Note: The functional form below is illustrative.
-                RT = 0.001987 * 310.15
-                delta_f = (delta_phi * np.exp(alpha_dyn * rho_vec[i])
-                           - beta_dyn * cRicci_term
-                           + entropy_term
-                           + gamma_dyn * heat_vec[i])
-                transitions.append((neighbor, move_type, delta_f))
-            # Now compute Boltzmann weights for all transitions (including stay)
-            # We require that the probabilities sum to 1 for the state
-            weights = np.array([np.exp(-tf/RT) for (_, _, tf) in transitions])
-            if np.sum(weights) < 1e-12:
-                weights = np.ones_like(weights) / len(weights)
-            else:
-                weights /= np.sum(weights)
-            # Distribute occupancy from state i according to these probabilities:
-            for (target, mtype, tf), w in zip(transitions, weights):
-                j = state_index[target]
-                new_rho[j] += rho_vec[i] * w
-        
-        # Enforce volume conservation by normalizing new_rho so that sum(new_rho)=1
-        total_occ = np.sum(new_rho)
-        if total_occ < 1e-12:
-            print(f"[Warning] Occupancy vanished at step {t}. Breaking.")
+def fem_assemble_matrices(nodes, elements):
+    num_nodes = nodes.shape[0]
+    A_mat = lil_matrix((num_nodes, num_nodes))
+    M_mat = lil_matrix((num_nodes, num_nodes))
+    for elem in elements:
+        idx = elem
+        coords = nodes[idx]
+        mat = np.array([[1, coords[0,0], coords[0,1]],
+                        [1, coords[1,0], coords[1,1]],
+                        [1, coords[2,0], coords[2,1]]])
+        area = 0.5 * abs(np.linalg.det(mat))
+        if area < 1e-14:
+            continue
+        x = coords[:,0]
+        y = coords[:,1]
+        b = np.array([y[1]-y[2], y[2]-y[0], y[0]-y[1]])
+        c = np.array([x[2]-x[1], x[0]-x[2], x[1]-x[0]])
+        K_local = np.zeros((3,3))
+        for i_local in range(3):
+            for j_local in range(3):
+                K_local[i_local, j_local] = (b[i_local]*b[j_local] + c[i_local]*c[j_local])/(4*area)
+        M_local = (area/12.0)*np.array([[2,1,1],[1,2,1],[1,1,2]])
+        for i_local, i_global in enumerate(idx):
+            for j_local, j_global in enumerate(idx):
+                A_mat[i_global,j_global] += K_local[i_local,j_local]
+                M_mat[i_global,j_global] += M_local[i_local,j_local]
+    return A_mat.tocsr(), M_mat.tocsr()
+
+def solve_phi_and_ricci(rho, nodes, elements, alpha=1.0, gamma=0.0, phi0=None, damping=0.05, tol=1e-6, max_iter=500):
+    A, M = fem_assemble_matrices(nodes, elements)
+    num_nodes = len(rho)
+    phi = np.zeros(num_nodes) if phi0 is None else phi0.copy()
+    reg = 1e-8  # Regularization term
+    for _ in range(max_iter):
+        nonlinear = 0.5 * rho * np.exp(2 * phi)
+        F = A @ phi + M @ nonlinear
+        J = A + M @ csr_matrix(np.diag(rho * np.exp(2 * phi))) + reg * sp.eye(num_nodes)
+        delta_phi = spsolve(J, -F)
+        phi += damping * delta_phi
+        if np.linalg.norm(delta_phi) < tol:
             break
-        rho_vec = new_rho / total_occ
-        
-        # Optionally update φ by re-solving PDE (if desired to capture new geometry)
-        try:
-            phi, _ = solve_phi_and_ricci(rho_vec, node_coords_local, elements, alpha=alpha, gamma=gamma, phi0=phi)
-        except Exception as e:
-            print(f"[Warning] φ solver failed at step {t} with error: {e}. Using last φ.")
-        
-        history_rho.append(rho_vec.copy())
-        redox = np.dot([count_ones(s)/3 for s in pf_states], rho_vec) * 100
-        history_redox.append(redox)
-        entropy = -np.sum([p*np.log2(p) for p in rho_vec if p>0])
-        history_entropy.append(entropy)
-    
-    return {
-        'rho_t': history_rho,
-        'redox_t': history_redox,
-        'entropy_t': history_entropy,
-        'final_phi': phi,
-        'final_heat': heat_vec,
-        'coords': flat_coords,  # 2D coordinates for visualization
-        'pf_states': pf_states
-    }
+    M_lumped = np.array(M.sum(axis=1)).flatten()
+    lap_phi = A @ phi / M_lumped
+    Ricci = -2.0 * np.exp(-2 * phi) * lap_phi
+    return phi, Ricci
 
 ###############################################
-# 5. Hot-Start Function for φ from Pipeline Step 1
-###############################################
-def load_phi0_from_step1(filename='oxishape_solution_full.pkl', pf_states=pf_states, num_nodes=None):
-    if os.path.exists(filename):
-        with open(filename, 'rb') as f:
-            sol = pickle.load(f)
-        print('Loaded φ₀ from Step 1 solution.')
-        phi_dict = sol.get('phi', {})
-        if num_nodes is None:
-            num_nodes = len(pf_states)
-        phi0 = np.array([phi_dict[s] for s in pf_states[:num_nodes]])
-        return phi0
-    print('[Info] No Step 1 φ₀ found. Using zeros.')
-    if num_nodes is None:
-        num_nodes = len(pf_states)
-    return np.zeros(num_nodes)
-
-###############################################
-# 6. Save Simulation Results
-###############################################
-def save_simulation_results(results, filename_prefix='oxi_step2_result'):
-    with open(f'{filename_prefix}.pkl', 'wb') as f:
-        pickle.dump(results, f)
-    print(f"Simulation saved as {filename_prefix}.pkl")
-    df_k = pd.DataFrame([
-        {f'k={k}': sum(r[i] for i, s in enumerate(results['pf_states']) if count_ones(s) == k)
-         for k in range(4)}
-        for r in results['rho_t']
-    ])
-    df_k.index.name = 'Time_Step'
-    df_k.to_excel(f'{filename_prefix}_k_history.xlsx')
-    print(f'k-bin time series exported to {filename_prefix}_k_history.xlsx')
-
-###############################################
-# 7. Lyapunov Exponent & Analysis Function
+# 4. Lyapunov Exponent & Analysis Functions
 ###############################################
 def compute_lyapunov(redox_series, dt=1.0):
     diffs = np.diff(redox_series)
@@ -242,10 +153,148 @@ def analyze_outputs(results):
     plt.show()
 
 ###############################################
+# 5. Hot-Start Function for φ from Pipeline Step 1
+###############################################
+def load_phi0_from_step1(filename='oxishape_solution_full.pkl', pf_states=pf_states, num_nodes=None):
+    if os.path.exists(filename):
+        with open(filename, 'rb') as f:
+            sol = pickle.load(f)
+        print('Loaded φ₀ from Step 1 solution.')
+        phi_dict = sol.get('phi', {})
+        if num_nodes is None:
+            num_nodes = len(pf_states)
+        phi0 = np.array([phi_dict[s] for s in pf_states[:num_nodes]])
+        return phi0
+    print('[Info] No Step 1 φ₀ found. Using zeros.')
+    if num_nodes is None:
+        num_nodes = len(pf_states)
+    return np.zeros(num_nodes)
+
+###############################################
+# 6. Main Evolution Engine for Oxi-Shapes
+###############################################
+def simulate_forward(alpha, beta, rho_init, steps=240, total_molecules=100, gamma=0.0, use_hotstart=True):
+    """
+    At each step, for each state, dynamic parameters (alpha, beta, gamma) are derived based on the state’s 
+    current occupancy, Morse energy, and local cRicci. These are then used to compute the free-energy 
+    difference for allowed transitions (oxidation: k+1, reduction: k-1, and stay) so that each molecule’s 
+    probability simplex sums to 1.
+    """
+    # Convert initial occupancy to vector.
+    rho_vec = np.array([rho_init.get(s, 0.0) for s in pf_states])
+    # Use flat 2D coordinates from the 3D embedding (first two components).
+    node_coords_local = np.array([ (node_positions_3D[s][0], node_positions_3D[s][1]) for s in pf_states])
+    elements = Delaunay(node_coords_local).simplices
+    num_nodes = len(pf_states)
+    
+    # Hotstart for φ.
+    phi0 = load_phi0_from_step1(num_nodes=num_nodes) if use_hotstart else None
+    phi, _ = solve_phi_and_ricci(rho_vec, node_coords_local, elements, alpha=alpha, gamma=gamma, phi0=phi0)
+    
+    heat_vec = np.zeros(num_nodes)
+    history_rho   = [rho_vec.copy()]
+    redox_init    = np.dot([count_ones(s)/3 for s in pf_states], rho_vec) * 100
+    history_redox = [redox_init]
+    history_entropy = [-np.sum([p*np.log2(p) for p in rho_vec if p > 0])]
+    
+    # Time evolution loop.
+    for t in range(steps):
+        new_rho = np.zeros_like(rho_vec)
+        for i, state in enumerate(pf_states):
+            # Get dynamic parameters for this state.
+            alpha_dyn, beta_dyn, gamma_dyn = dynamic_parameters(state)
+            current_k = count_ones(state)
+            transitions = []
+            # Option 1: Stay in the same state (delta_f = 0).
+            transitions.append((state, "stay", 0.0))
+            # Options from allowed neighbors:
+            for neighbor in list(G.neighbors(state)):
+                neighbor_k = count_ones(neighbor)
+                if neighbor_k == current_k + 1:
+                    move_type = "oxidation"
+                elif neighbor_k == current_k - 1:
+                    move_type = "reduction"
+                else:
+                    # Skip barred transitions.
+                    continue
+                j = state_index[neighbor]
+                delta_phi = phi[j] - phi[i]
+                # Heat term: for simplicity, we take heat as -delta_phi.
+                q = -delta_phi
+                # Update heat vector if desired (here we accumulate)
+                heat_vec[j] += q
+                # Entropy term: based on degeneracy difference.
+                g_i = degeneracy[current_k]
+                g_j = degeneracy[neighbor_k]
+                entropy_term = np.log(g_j / g_i) if g_i > 0 else 0.0
+                # Get the custom cRicci for this edge.
+                cRicci_term = cRicci_edges.get((state, neighbor), cRicci_edges.get((neighbor, state), 0.0))
+                # Compute free-energy difference delta_f using dynamic parameters.
+                RT = 0.001987 * 310.15
+                delta_f = (delta_phi * np.exp(alpha_dyn * rho_vec[i])
+                           - beta_dyn * cRicci_term
+                           + entropy_term
+                           + gamma_dyn * heat_vec[i])
+                transitions.append((neighbor, move_type, delta_f))
+            # Compute Boltzmann weights.
+            weights = np.array([np.exp(-tf/RT) for (_, _, tf) in transitions])
+            if np.sum(weights) < 1e-12:
+                weights = np.ones_like(weights) / len(weights)
+            else:
+                weights /= np.sum(weights)
+            # Redistribute occupancy.
+            for (target, mtype, tf), w in zip(transitions, weights):
+                j = state_index[target]
+                new_rho[j] += rho_vec[i] * w
+        total_occ = np.sum(new_rho)
+        if total_occ < 1e-12:
+            print(f"[Warning] Occupancy vanished at step {t}. Breaking.")
+            break
+        # Normalize occupancy to enforce volume conservation.
+        rho_vec = new_rho / total_occ
+        
+        try:
+            phi, _ = solve_phi_and_ricci(rho_vec, node_coords_local, elements, alpha=alpha, gamma=gamma, phi0=phi)
+        except Exception as e:
+            print(f"[Warning] φ solver failed at step {t} with error: {e}. Using last φ.")
+        
+        history_rho.append(rho_vec.copy())
+        redox = np.dot([count_ones(s)/3 for s in pf_states], rho_vec) * 100
+        history_redox.append(redox)
+        entropy = -np.sum([p*np.log2(p) for p in rho_vec if p > 0])
+        history_entropy.append(entropy)
+    
+    return {
+        'rho_t': history_rho,
+        'redox_t': history_redox,
+        'entropy_t': history_entropy,
+        'final_phi': phi,
+        'final_heat': heat_vec,
+        'coords': flat_coords,  # 2D coordinates from node_positions_3D
+        'pf_states': pf_states
+    }
+
+###############################################
+# 7. Save Simulation Results Function
+###############################################
+def save_simulation_results(results, filename_prefix='oxi_step2_result'):
+    with open(f'{filename_prefix}.pkl', 'wb') as f:
+        pickle.dump(results, f)
+    print(f"Simulation saved as {filename_prefix}.pkl")
+    df_k = pd.DataFrame([
+        {f'k={k}': sum(r[i] for i, s in enumerate(results['pf_states']) if count_ones(s)==k)
+         for k in range(4)}
+        for r in results['rho_t']
+    ])
+    df_k.index.name = 'Time_Step'
+    df_k.to_excel(f'{filename_prefix}_k_history.xlsx')
+    print(f'k-bin time series exported to {filename_prefix}_k_history.xlsx')
+
+###############################################
 # 8. Main Script Execution
 ###############################################
 if __name__ == '__main__':
-    # Use initial occupancy from Pipeline Step 1
+    # Use initial occupancy from Pipeline Step 1 (volume conserved)
     rho_start = {s: occupancy.get(s, 0.0) for s in pf_states}
     
     sim_result = simulate_forward(alpha=0.1, beta=0.5, rho_init=rho_start, steps=240, gamma=0.0, use_hotstart=True)
