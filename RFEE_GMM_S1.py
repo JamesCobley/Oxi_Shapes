@@ -182,6 +182,10 @@ plt.savefig("oxishape_surface_cRicci.png", dpi=300, bbox_inches='tight')
 plt.show()
 
 # Store triangulation and z-values in solution object
+# ✅ Fix: initialize the solution dictionary here
+solution = {}
+
+# Store triangulation and z-values in solution object
 solution["cRicci_nodewise"] = dict(zip(pf_states, z_c_ricci))
 solution["triangulation"] = {
     "vertices": node_xy,
