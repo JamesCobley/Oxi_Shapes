@@ -2,8 +2,10 @@
 # coding: utf-8
 
 """
-Oxi-Shapes: Pipeline Step 1 — Compute a custom C-Ricci, ensure volume conservation (sum(rho)=1),
-pin unoccupied nodes at z=0, and build a 24-row transition table for pipeline step 2.
+Oxi-Shapes: Pipeline Step 1 — Compute a custom C-Ricci (from Dirichlet energy via a cotangent Laplacian),
+ensure volume conservation (sum(rho)=1), pin unoccupied nodes at z=0, and build a 24-row transition table
+for pipeline step 2. This version also computes an anisotropy field that penalizes transitions in high-curvature
+directions (i.e. the barred transitions).
 """
 
 import numpy as np
@@ -109,35 +111,45 @@ for s in pf_states:
     morse_energy[s] = morse_potential(X, D_e, a_param, X0)
 
 ###############################################
-# 5. Define Custom C-Ricci (Occupancy, Morse, Heat, Entropy)
+# 5. Compute Enriched C-Ricci from Dirichlet Energy via Cotangent Laplacian
 ###############################################
-degeneracy_map = {0:1, 1:3, 2:3, 3:1}
+# First, define a function to compute the cotangent Laplacian on the triangulated mesh.
+def compute_cotangent_laplacian(node_xy, triangles):
+    N = node_xy.shape[0]
+    W = np.zeros((N, N))
+    for tri in triangles:
+        i, j, k = tri
+        pts = node_xy[[i, j, k], :]
+        # Compute edge vectors
+        v0 = pts[1] - pts[0]
+        v1 = pts[2] - pts[0]
+        v2 = pts[2] - pts[1]
+        # Compute angles using dot products
+        angle_i = np.arccos(np.clip(np.dot(v0, v1) / (np.linalg.norm(v0) * np.linalg.norm(v1)), -1, 1))
+        angle_j = np.arccos(np.clip(np.dot(-v0, v2) / (np.linalg.norm(v0) * np.linalg.norm(v2)), -1, 1))
+        angle_k = np.arccos(np.clip(np.dot(-v1, -v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1, 1))
+        # Cotangent weights
+        cot_i = 1 / np.tan(angle_i) if np.tan(angle_i) != 0 else 0
+        cot_j = 1 / np.tan(angle_j) if np.tan(angle_j) != 0 else 0
+        cot_k = 1 / np.tan(angle_k) if np.tan(angle_k) != 0 else 0
+        # Accumulate weights for edges (j,k) opposite i, etc.
+        W[j, k] += cot_i
+        W[k, j] += cot_i
+        W[i, k] += cot_j
+        W[k, i] += cot_j
+        W[i, j] += cot_k
+        W[j, i] += cot_k
+    # Construct Laplacian: off-diagonals = -W, diagonals = sum(W_row)
+    L_t = -W
+    for i in range(N):
+        L_t[i, i] = np.sum(W[i, :])
+    return L_t
 
-alpha_param = 1.0
-beta_param  = 1.0
-gamma_param = 1.0
-delta_param = 1.0
+# Constant that scales curvature (analogous to a gravitational constant)
+lambda_const = 1.0
 
-def c_ricci(u, v):
-    occ_factor = (occupancy[u] + occupancy[v]) / 2.0
-    energy_factor = (morse_energy[u] + morse_energy[v]) / 2.0
-    heat_u = 1.0 if occupancy[u]>1e-14 else 0.0
-    heat_v = 1.0 if occupancy[v]>1e-14 else 0.0
-    heat_factor = (heat_u + heat_v)/2.0
-    ent_u = np.log(degeneracy_map[u.count('1')])
-    ent_v = np.log(degeneracy_map[v.count('1')])
-    entropy_factor = (ent_u + ent_v)/2.0
-    return (alpha_param * occ_factor
-            - beta_param  * energy_factor
-            + gamma_param * heat_factor
-            + delta_param * entropy_factor)
-
-for (u, v) in G.edges():
-    G[u][v]['cRicci'] = c_ricci(u, v)
-
-###############################################
-# 6. 3D Embedding: Pin Zero Occupancy at z=0
-###############################################
+# Build a triangulated mesh of the (x,y) positions.
+# (Note: node_xy is already computed in Step 6 below; here we precompute it for the Laplacian.)
 flat_pos = {
     "000": (0, 3),
     "001": (-2, 2),
@@ -148,25 +160,58 @@ flat_pos = {
     "110": (1, 1),
     "111": (0, 0)
 }
-
-node_positions_3D = {}
-for s in pf_states:
-    x, y = flat_pos[s]
-    z_val = occupancy[s] if occupancy[s]>1e-14 else 0.0
-    node_positions_3D[s] = (x, y, z_val)
-
-# Build triangulated mesh using (x, y) node positions
 node_xy = np.array([flat_pos[s] for s in pf_states])
-z_c_ricci = np.array([
-    sum([
-        G[u][v]['cRicci'] for (u, v) in G.edges() if u == s or v == s
-    ]) / max(1, sum([1 for (u, v) in G.edges() if u == s or v == s]))
-    for s in pf_states
-])
 tri = Delaunay(node_xy)
 triangles = tri.simplices
 
-# 3D Surface plot colored by C-Ricci curvature
+# Compute the cotangent Laplacian on the mesh.
+L_t = compute_cotangent_laplacian(node_xy, triangles)
+# Compute nodewise c-Ricci from Dirichlet energy:
+# Here, we take the Laplacian of the occupancy field and scale by lambda_const.
+c_ricci_vec = lambda_const * (L_t @ rho_vec)
+
+# For each state, store its c-Ricci.
+c_ricci_nodes = {pf_states[i]: c_ricci_vec[i] for i in range(len(pf_states))}
+
+# Now, assign a c-Ricci value to each edge in G as the average of its endpoints.
+for (u, v) in G.edges():
+    G[u][v]['cRicci'] = (c_ricci_nodes[u] + c_ricci_nodes[v]) / 2.0
+
+# Compute anisotropy field A(x) = discrete gradient of c-Ricci.
+# For each node, average the gradient (difference over distance) to its neighbors (using graph G).
+A_field = {}
+for s in pf_states:
+    neighbors = list(G.neighbors(s))
+    grad_sum = 0.0
+    count = 0
+    for nbr in neighbors:
+        # Euclidean distance between s and neighbor nbr
+        dist = np.linalg.norm(np.array(flat_pos[s]) - np.array(flat_pos[nbr]))
+        if dist > 1e-6:
+            grad_sum += abs(c_ricci_nodes[s] - c_ricci_nodes[nbr]) / dist
+            count += 1
+    A_field[s] = grad_sum / count if count > 0 else 0.0
+
+# For each edge, define a penalty factor that penalizes transitions in regions of high anisotropy.
+# The penalty factor is defined as exp(-average anisotropy on the edge).
+for (u, v) in G.edges():
+    penalty = np.exp(- (A_field[u] + A_field[v]) / 2.0)
+    G[u][v]['penalty'] = penalty
+
+###############################################
+# 6. 3D Embedding: Pin Zero Occupancy at z=0
+###############################################
+node_positions_3D = {}
+for s in pf_states:
+    x, y = flat_pos[s]
+    z_val = occupancy[s] if occupancy[s] > 1e-14 else 0.0
+    node_positions_3D[s] = (x, y, z_val)
+
+# 3D Surface plot of c-Ricci (using the nodewise c_ricci computed from the cotangent Laplacian)
+z_c_ricci = np.array([c_ricci_nodes[s] for s in pf_states])
+tri = Delaunay(node_xy)
+triangles = tri.simplices
+
 fig = plt.figure(figsize=(10, 8), dpi=300)
 ax = fig.add_subplot(111, projection='3d')
 triang = Triangulation(node_xy[:, 0], node_xy[:, 1], triangles)
@@ -176,35 +221,33 @@ surf = ax.plot_trisurf(
 ax.set_title("C-Ricci Curvature Surface (Oxi-Shape)")
 ax.set_xlabel("x")
 ax.set_ylabel("y")
-ax.set_zlabel("Ricci Height (z)")
+ax.set_zlabel("C-Ricci (z)")
 fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="C-Ricci")
 plt.savefig("oxishape_surface_cRicci.png", dpi=300, bbox_inches='tight')
 plt.show()
 
 # Store triangulation and z-values in solution object
-# ✅ Fix: initialize the solution dictionary here
 solution = {}
-
-# Store triangulation and z-values in solution object
-solution["cRicci_nodewise"] = dict(zip(pf_states, z_c_ricci))
+solution["cRicci_nodewise"] = c_ricci_nodes
 solution["triangulation"] = {
     "vertices": node_xy,
     "triangles": triangles.tolist(),
     "z_values": z_c_ricci.tolist()
 }
+# Also store anisotropy field for reference
+solution["anisotropy_field"] = A_field
 
-# Add final field equation print
-print("\nRicci(x) = α(x) ⋅ ρ(x) + β(x) ⋅ Q(x) - γ(x) ⋅ S(x) + δ(x) ⋅ E_Morse(x)")
+print("\nC-Ricci is computed as: c-Ricci(x) = λ * (cotangent Laplacian of ρ(x))")
+print("Anisotropy field A(x) = discrete gradient of c-Ricci(x) penalizes high-curvature (barred) transitions.")
 
 ###############################################
 # 7. Build the 24-Row Transition Table (Edges in Both Directions)
 ###############################################
 rows = []
-for (u,v) in G.edges():
-    # We'll record transitions u->v and v->u
+for (u, v) in G.edges():
+    # We'll record transitions u->v and v->u, including the anisotropy penalty.
     c_val = G[u][v]['cRicci']
-    # Collect relevant data for each direction
-    # direction 1: u->v
+    penalty = G[u][v]['penalty']
     rows.append({
         "from":   u,
         "to":     v,
@@ -215,9 +258,8 @@ for (u,v) in G.edges():
         "morse_from": morse_energy[u],
         "morse_to":   morse_energy[v],
         "cRicci_edge": c_val,
-        # We can store heat or entropy if desired, or let pipeline step 2 recalc them
+        "penalty": penalty
     })
-    # direction 2: v->u
     rows.append({
         "from":   v,
         "to":     u,
@@ -228,20 +270,21 @@ for (u,v) in G.edges():
         "morse_from": morse_energy[v],
         "morse_to":   morse_energy[u],
         "cRicci_edge": c_val,
+        "penalty": penalty
     })
 
 df_transitions = pd.DataFrame(rows)
-df_transitions.sort_values(by=["from","to"], inplace=True)
+df_transitions.sort_values(by=["from", "to"], inplace=True)
 
 ###############################################
 # 8. Save Everything (Pickle & CSV)
 ###############################################
-active_nodes = [s for s in pf_states if occupancy[s]>1e-14]
+active_nodes = [s for s in pf_states if occupancy[s] > 1e-14]
 G_active = G.subgraph(active_nodes).copy()
 connected = list(connected_components(G_active))
 betti_0 = len(connected)
 
-solution = {
+solution.update({
     "phi": phi,
     "phi_vector": phi_vec,
     "occupancy": occupancy,  # normalized so sum(rho)=1
@@ -252,11 +295,8 @@ solution = {
     "active_subgraph": G_active,
     "connected_components": connected,
     "betti_0": betti_0,
-    "cRicci": {(u, v): G[u][v]['cRicci'] for u, v in G.edges()},
-    "morse_energy": morse_energy,
-    "node_positions_3D": node_positions_3D,
     "transition_table": df_transitions
-}
+})
 
 with open("oxishape_solution_full.pkl", "wb") as f:
     pickle.dump(solution, f)
@@ -328,7 +368,7 @@ def plot_c_ricci_edges(title, filename):
     nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color='lightgray', ax=ax)
     nx.draw_networkx_labels(G, pos, labels={s: s for s in pf_states}, font_weight='bold', ax=ax)
     edges = list(G.edges())
-    c_values = [G[u][v]['cRicci'] for (u,v) in edges]
+    c_values = [G[u][v]['cRicci'] for (u, v) in edges]
     c_min, c_max = min(c_values), max(c_values)
     norm = plt.Normalize(vmin=c_min, vmax=c_max)
     cmap = plt.cm.plasma
@@ -352,7 +392,7 @@ for s in pf_states:
     print(f"  {s}: φ = {phi[s]:.4f}, ρ = {occupancy[s]:.4f}, E_morse = {morse_energy[s]:.4e}")
 print("\nCustom C-Ricci Edge Values:")
 for (u, v) in G.edges():
-    print(f"  Edge ({u}, {v}): cRicci = {G[u][v]['cRicci']:.4f}")
+    print(f"  Edge ({u}, {v}): cRicci = {G[u][v]['cRicci']:.4f}, penalty = {G[u][v]['penalty']:.4f}")
 
 print("\nLaplacian matrix:\n", L)
 print("\nSaved transition table in 'oxi_transitions_table.csv' with 24 rows (each edge in both directions).")
