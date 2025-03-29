@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python
 # coding: utf-8
 
@@ -155,7 +154,7 @@ if __name__ == "__main__":
     best_score, best_rho, best_paths, best_entropy = results[0]
 
     print(f"✔ Best Match Score: {best_score:.4f}")
-    print(f"✔ Final Occupancy:
-{pd.Series(best_rho[-1], index=pf_states)}")
+    print("✔ Final Occupancy:")
+    print(pd.Series(final_rho, index=pf_states))
     print(f"✔ ΔS = {best_entropy[-1] - best_entropy[0]:.4f}")
     print(f"✔ Trajectories recorded for {n_molecules} molecules across {steps} steps.")
