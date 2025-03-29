@@ -155,6 +155,6 @@ if __name__ == "__main__":
 
     print(f"✔ Best Match Score: {best_score:.4f}")
     print("✔ Final Occupancy:")
-    print(pd.Series(final_rho, index=pf_states))
+    print(pd.Series(best_rho[-1], index=pf_states))
     print(f"✔ ΔS = {best_entropy[-1] - best_entropy[0]:.4f}")
     print(f"✔ Trajectories recorded for {n_molecules} molecules across {steps} steps.")
