@@ -1,3 +1,7 @@
+
+#!/usr/bin/env python
+# coding: utf-8
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,9 +37,10 @@ flat_pos = {
 node_xy = np.array([flat_pos[s] for s in pf_states])
 tri = Delaunay(node_xy)
 triangles = tri.simplices
+state_idx = {s: i for i, s in enumerate(pf_states)}
 
 # ------------------------------
-# 2. Cotangent Laplacian and Ricci Flow
+# 2. Geometry and Curvature
 # ------------------------------
 def compute_cotangent_laplacian(node_xy, triangles):
     N = node_xy.shape[0]
@@ -63,92 +68,13 @@ def compute_c_ricci(rho_vec, lambda_const=1.0):
     return lambda_const * (L_t @ rho_vec)
 
 # ------------------------------
-# 3. φ-Field PDE Solver
+# 3. Entropy Calculation
 # ------------------------------
-def solve_phi_field(rho_vec, G, pf_states, kappa=1.0, max_iter=5000, tol=1e-3, damping=0.05):
-    N = len(pf_states)
-    A = np.zeros((N, N))
-    for i, s1 in enumerate(pf_states):
-        for j, s2 in enumerate(pf_states):
-            if G.has_edge(s1, s2):
-                A[i, j] = 1
-    D = np.diag(A.sum(axis=1))
-    L = D - A
-    phi_vec = np.zeros(N)
-    for _ in range(max_iter):
-        nonlin = 0.5 * kappa * rho_vec * np.exp(2 * phi_vec)
-        F = L @ phi_vec + nonlin
-        J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
-        delta_phi = np.linalg.solve(J, -F)
-        phi_vec += damping * delta_phi
-        if np.linalg.norm(delta_phi) < tol:
-            break
-    return {pf_states[i]: phi_vec[i] for i in range(N)}
+def compute_entropy(rho_vec):
+    return -np.sum([p * np.log(p + 1e-14) for p in rho_vec])
 
 # ------------------------------
-# 4. Geodesic Paths
-# ------------------------------
-def get_all_geodesics():
-    return [
-        ["000", "100", "101", "111"],
-        ["000", "100", "110", "111"],
-        ["000", "010", "110", "111"],
-        ["000", "010", "011", "111"],
-        ["000", "001", "101", "111"],
-        ["000", "001", "011", "111"]
-    ]
-
-# ------------------------------
-# 5. Monte Carlo Engine
-# ------------------------------
-def monte_carlo_evolve(start_rho, steps, n_molecules, lambda_penalty=1.0):
-    state_idx = {s: i for i, s in enumerate(pf_states)}
-    molecule_paths = []
-    rho_t = np.zeros((steps+1, len(pf_states)))
-    rho_t[0] = np.array([start_rho[s] for s in pf_states])
-    c_ricci_vec = compute_c_ricci(rho_t[0])
-
-    for mol in range(n_molecules):
-        x = np.random.choice(pf_states, p=rho_t[0])
-        path = [x]
-        for t in range(steps):
-            neighbors = list(G.neighbors(x))
-            probs = []
-            for nbr in neighbors:
-                i, j = state_idx[x], state_idx[nbr]
-                delta_r = c_ricci_vec[j] - c_ricci_vec[i]
-                penalty = np.exp(-lambda_penalty * delta_r)
-                probs.append(penalty)
-            probs = np.array(probs)
-            probs /= probs.sum()
-            x = np.random.choice(neighbors, p=probs)
-            path.append(x)
-            rho_t[t+1][state_idx[x]] += 1 / n_molecules
-        molecule_paths.append(path)
-    return rho_t, molecule_paths
-
-# ------------------------------
-# 6. Open-Box ML Function
-# ------------------------------
-def score_match(target_rho, final_rho):
-    diff = np.abs(np.array([target_rho[s] for s in pf_states]) - final_rho)
-    return 1 - np.mean(diff)
-
-def simulate_supervised(start_rho, end_rho, steps, n_molecules, trials=10):
-    best_score = -np.inf
-    best_paths = None
-    best_rho = None
-    for _ in range(trials):
-        rho_t, paths = monte_carlo_evolve(start_rho, steps, n_molecules)
-        score = score_match(end_rho, rho_t[-1])
-        if score > best_score:
-            best_score = score
-            best_paths = paths
-            best_rho = rho_t
-    return best_rho, best_paths, best_score
-
-# ------------------------------
-# 7. Define Start/End Shapes
+# 4. Shape Generator from k-priors
 # ------------------------------
 def generate_k_distribution(k_vals):
     rho = {s: 0.0 for s in pf_states}
@@ -164,23 +90,72 @@ def generate_k_distribution(k_vals):
     return rho
 
 # ------------------------------
-# 8. Example Run
+# 5. Monte Carlo Geodesic Engine
 # ------------------------------
-start_k = [0.25, 0.75, 0.0, 0.0]
-end_k   = [0.06, 0.53, 0.33, 0.10]
-start_rho = generate_k_distribution(start_k)
-end_rho   = generate_k_distribution(end_k)
+def monte_carlo_geo_evolve(start_rho, steps, n_molecules, lambda_penalty=1.0):
+    molecule_paths = []
+    rho_t = np.zeros((steps+1, len(pf_states)))
+    rho_t[0] = np.array([start_rho[s] for s in pf_states])
+    entropy_t = [compute_entropy(rho_t[0])]
+    energy_t = []
 
-phi_start = solve_phi_field(np.array([start_rho[s] for s in pf_states]), G, pf_states)
-phi_end   = solve_phi_field(np.array([end_rho[s] for s in pf_states]), G, pf_states)
+    for mol in range(n_molecules):
+        x = np.random.choice(pf_states, p=rho_t[0])
+        path = [x]
+        for t in range(steps):
+            c_ricci_vec = compute_c_ricci(rho_t[t])
+            neighbors = list(G.neighbors(x))
+            probs = []
+            delta_energies = []
+            for nbr in neighbors:
+                i, j = state_idx[x], state_idx[nbr]
+                delta_r = c_ricci_vec[j] - c_ricci_vec[i]
+                delta_energies.append(delta_r)
+                penalty = np.exp(-lambda_penalty * delta_r)
+                probs.append(penalty)
+            probs = np.array(probs)
+            probs /= probs.sum()
+            x = np.random.choice(neighbors, p=probs)
+            path.append(x)
+            rho_t[t+1][state_idx[x]] += 1 / n_molecules
+        molecule_paths.append(path)
+        entropy_t.append(compute_entropy(rho_t[min(t+1, steps)]))
+    return rho_t, molecule_paths, entropy_t
 
-rho_trajectory, molecule_paths, match_score = simulate_supervised(
-    start_rho=start_rho,
-    end_rho=end_rho,
-    steps=240,
-    n_molecules=100,
-    trials=50
-)
+# ------------------------------
+# 6. Open Box Scoring & ML Inference
+# ------------------------------
+def score_match(target_rho, final_rho):
+    diff = np.abs(np.array([target_rho[s] for s in pf_states]) - final_rho)
+    return 1 - np.mean(diff)
 
-print(f"\nFinal matching score vs. target shape: {match_score:.4f}")
+def simulate_geoflownet(start_rho, end_rho, steps, n_molecules, trials=10):
+    records = []
+    for i in range(trials):
+        rho_t, paths, entropy = monte_carlo_geo_evolve(start_rho, steps, n_molecules)
+        score = score_match(end_rho, rho_t[-1])
+        records.append((score, rho_t, paths, entropy))
+    records.sort(key=lambda x: -x[0])
+    return records
 
+# ------------------------------
+# 7. Run Example
+# ------------------------------
+if __name__ == "__main__":
+    start_k = [0.25, 0.75, 0.0, 0.0]
+    end_k   = [0.06, 0.53, 0.33, 0.10]
+    steps = 240
+    n_molecules = 100
+    trials = 20
+
+    start_rho = generate_k_distribution(start_k)
+    end_rho   = generate_k_distribution(end_k)
+
+    results = simulate_geoflownet(start_rho, end_rho, steps, n_molecules, trials)
+    best_score, best_rho, best_paths, best_entropy = results[0]
+
+    print(f"✔ Best Match Score: {best_score:.4f}")
+    print(f"✔ Final Occupancy:
+{pd.Series(best_rho[-1], index=pf_states)}")
+    print(f"✔ ΔS = {best_entropy[-1] - best_entropy[0]:.4f}")
+    print(f"✔ Trajectories recorded for {n_molecules} molecules across {steps} steps.")
