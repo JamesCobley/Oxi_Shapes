@@ -55,8 +55,145 @@ node_xy = np.array([flat_pos[s] for s in pf_states])
 tri = Delaunay(node_xy)
 triangles = tri.simplices
 
+###############################################
+# 2. Solve φ Field (Poisson-like PDE) on G
+###############################################
+N = len(pf_states)
+state_index = {s: i for i, s in enumerate(pf_states)}
+
+A = np.zeros((N, N))
+for i, s1 in enumerate(pf_states):
+    for j, s2 in enumerate(pf_states):
+        if G.has_edge(s1, s2):
+            A[i, j] = 1
+D = np.diag(A.sum(axis=1))
+L = D - A
+
+phi_vec = np.zeros(N)
+kappa = 1.0
+max_iter = 10000
+tol = 1e-3
+damping = 0.05
+
+for _ in range(max_iter):
+    nonlin = 0.5 * kappa * rho_vec * np.exp(2 * phi_vec)
+    F = L @ phi_vec + nonlin
+    J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
+    delta_phi = np.linalg.solve(J, -F)
+    # Pin nodes with zero occupancy (do not update)
+    for i, s in enumerate(pf_states):
+        if occupancy[s] <= 1e-14:
+            delta_phi[i] = 0.0
+    phi_vec += damping * delta_phi
+    if np.linalg.norm(delta_phi) < tol:
+        print(f"Converged after {_+1} iterations.")
+        break
+else:
+    print("Did not converge within iteration limit.")
+
+phi = {s: phi_vec[state_index[s]] for s in pf_states}
+
+###############################################
+# 3. Compute Enriched C-Ricci from Dirichlet Energy via Cotangent Laplacian
+###############################################
+# First, define a function to compute the cotangent Laplacian on the triangulated mesh.
+def compute_cotangent_laplacian(node_xy, triangles):
+    N = node_xy.shape[0]
+    W = np.zeros((N, N))
+    for tri in triangles:
+        i, j, k = tri
+        pts = node_xy[[i, j, k], :]
+        # Compute edge vectors
+        v0 = pts[1] - pts[0]
+        v1 = pts[2] - pts[0]
+        v2 = pts[2] - pts[1]
+        # Compute angles using dot products
+        angle_i = np.arccos(np.clip(np.dot(v0, v1) / (np.linalg.norm(v0) * np.linalg.norm(v1)), -1, 1))
+        angle_j = np.arccos(np.clip(np.dot(-v0, v2) / (np.linalg.norm(v0) * np.linalg.norm(v2)), -1, 1))
+        angle_k = np.arccos(np.clip(np.dot(-v1, -v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1, 1))
+        # Cotangent weights
+        cot_i = 1 / np.tan(angle_i) if np.tan(angle_i) != 0 else 0
+        cot_j = 1 / np.tan(angle_j) if np.tan(angle_j) != 0 else 0
+        cot_k = 1 / np.tan(angle_k) if np.tan(angle_k) != 0 else 0
+        # Accumulate weights for edges (j,k) opposite i, etc.
+        W[j, k] += cot_i
+        W[k, j] += cot_i
+        W[i, k] += cot_j
+        W[k, i] += cot_j
+        W[i, j] += cot_k
+        W[j, i] += cot_k
+    # Construct Laplacian: off-diagonals = -W, diagonals = sum(W_row)
+    L_t = -W
+    for i in range(N):
+        L_t[i, i] = np.sum(W[i, :])
+    return L_t
+
+# Constant that scales curvature (analogous to a gravitational constant)
+lambda_const = 1.0
+
+# Build a triangulated mesh of the (x,y) positions.
+# (Note: node_xy is already computed in Step 6 below; here we precompute it for the Laplacian.)
+flat_pos = {
+    "000": (0, 3),
+    "001": (-2, 2),
+    "010": (0, 2),
+    "100": (2, 2),
+    "011": (-1, 1),
+    "101": (0, 1),
+    "110": (1, 1),
+    "111": (0, 0)
+}
+node_xy = np.array([flat_pos[s] for s in pf_states])
+tri = Delaunay(node_xy)
+triangles = tri.simplices
+
+# Compute the cotangent Laplacian on the mesh.
+L_t = compute_cotangent_laplacian(node_xy, triangles)
+# Compute nodewise c-Ricci from Dirichlet energy:
+# Here, we take the Laplacian of the occupancy field and scale by lambda_const.
+c_ricci_vec = lambda_const * (L_t @ rho_vec)
+
+# For each state, store its c-Ricci.
+c_ricci_nodes = {pf_states[i]: c_ricci_vec[i] for i in range(len(pf_states))}
+
+# Now, assign a c-Ricci value to each edge in G as the average of its endpoints.
+for (u, v) in G.edges():
+    G[u][v]['cRicci'] = (c_ricci_nodes[u] + c_ricci_nodes[v]) / 2.0
+
+# Compute anisotropy field A(x) = discrete gradient of c-Ricci.
+# For each node, average the gradient (difference over distance) to its neighbors (using graph G).
+A_field = {}
+for s in pf_states:
+    neighbors = list(G.neighbors(s))
+    grad_sum = 0.0
+    count = 0
+    for nbr in neighbors:
+        # Euclidean distance between s and neighbor nbr
+        dist = np.linalg.norm(np.array(flat_pos[s]) - np.array(flat_pos[nbr]))
+        if dist > 1e-6:
+            grad_sum += abs(c_ricci_nodes[s] - c_ricci_nodes[nbr]) / dist
+            count += 1
+    A_field[s] = grad_sum / count if count > 0 else 0.0
+
+# For each edge, define a penalty factor that penalizes transitions in regions of high anisotropy.
+# The penalty factor is defined as exp(-average anisotropy on the edge).
+for (u, v) in G.edges():
+    penalty = np.exp(- (A_field[u] + A_field[v]) / 2.0)
+    G[u][v]['penalty'] = penalty
+
+node_positions_3D = {}
+for s in pf_states:
+    x, y = flat_pos[s]
+    z_val = occupancy[s] if occupancy[s] > 1e-14 else 0.0
+    node_positions_3D[s] = (x, y, z_val)
+
+# 3D Surface plot of c-Ricci (using the nodewise c_ricci computed from the cotangent Laplacian)
+z_c_ricci = np.array([c_ricci_nodes[s] for s in pf_states])
+tri = Delaunay(node_xy)
+triangles = tri.simplices
+
 ###############################################################################
-# 2. Sheaf Theory Stalk Initialization
+# 4. Sheaf Theory Stalk Initialization
 ###############################################################################
 def initialize_sheaf_stalks():
     # For each node (i-state), assign a local vector space
@@ -75,7 +212,7 @@ def sheaf_consistency(stalks):
     return inconsistencies
 
 ###############################################################################
-# 3. Neural ODE System for Ricci-Driven Shape Evolution
+# 5. Neural ODE System for Ricci-Driven Shape Evolution
 ###############################################################################
 class DifferentiableLambda(nn.Module):
     def __init__(self, init_val=1.0):
@@ -163,7 +300,7 @@ class OxiShapeODE(nn.Module):
         return inflow - outflow
 
 ###############################################################################
-# 4. Persistent Homology — Betti Number Tracker
+# 6. Persistent Homology — Betti Number Tracker
 ###############################################################################
 def extract_betti_numbers(rho_snapshot, threshold=0.1):
     active_indices = np.where(rho_snapshot > threshold)[0]
@@ -176,7 +313,7 @@ def extract_betti_numbers(rho_snapshot, threshold=0.1):
     return {'beta0': beta0, 'beta1': beta1}
 
 ###############################################################################
-# 5. Data Generation (with Energy Classifier)
+# 7. Data Generation (with Energy Classifier)
 ###############################################################################
 
 def compute_ricci_scalar(rho, L_t):
@@ -215,7 +352,7 @@ def create_energy_classified_dataset(num_samples=1000, L_t=None):
     return np.array(X), np.array(Y), np.array(labels)
 
 ###############################################################################
-# 6. Neural Network for Learning
+# 8. Neural Network for Learning
 ###############################################################################
 class OxiNet(nn.Module):
     def __init__(self, input_dim=8, hidden_dim=32, output_dim=8):
@@ -232,7 +369,7 @@ class OxiNet(nn.Module):
         return torch.softmax(x, dim=1)
 
 ###############################################################################
-# 7. Train and Evaluate
+# 9. Train and Evaluate
 ###############################################################################
 def train_model_with_constraints(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=1.0, lambda_vol=1.0):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -271,7 +408,7 @@ def train_model_with_constraints(model, X_train, Y_train, X_val, Y_val, epochs=1
             print(f"Epoch {epoch} | Total Loss: {total_loss.item():.6f} | Main: {main_loss.item():.6f} | Val: {val_loss.item():.6f}")
 
 ###############################################################################
-# 8. Geodesic Paths
+# 10. Geodesic Paths
 ###############################################################################
 geodesic_paths = [
     ["000", "100", "101", "111"],
@@ -283,7 +420,7 @@ geodesic_paths = [
 ]
 
 ###############################################################################
-# 9. Main Execution (with Save + Geodesics)
+# 11. Main Execution (with Save + Geodesics)
 ###############################################################################
 if __name__ == "__main__":
     print("Generating dataset using ODE-based evolution...")
@@ -328,4 +465,3 @@ if __name__ == "__main__":
 
         betti = extract_betti_numbers(pred_val[idx], threshold=0.05)
         print(f"Betti Numbers → β₀: {betti['beta0']}  |  β₁: {betti['beta1']}")
- 
