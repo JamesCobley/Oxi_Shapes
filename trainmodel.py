@@ -23,7 +23,6 @@ Oxi-Shapes + Supervised ML Pipeline with Persistent Homology (Betti Numbers)
 This script combines the Oxi‑Shapes geometric evolution with a supervised machine
 learning model and persistent homology analysis.
 """
-
 !pip install torchdiffeq ripser persim
 
 import numpy as np
@@ -65,7 +64,26 @@ tri = Delaunay(node_xy)
 triangles = tri.simplices
 
 ###############################################################################
-# 2. Neural ODE System for Ricci-Driven Shape Evolution
+# 2. Sheaf Theory Stalk Initialization
+###############################################################################
+def initialize_sheaf_stalks():
+    # For each node (i-state), assign a local vector space
+    stalks = {}
+    for s in pf_states:
+        stalks[s] = np.array(flat_pos[s])  # Using position as toy stalk vector
+    return stalks
+
+def sheaf_consistency(stalks):
+    # Check local consistency along edges
+    inconsistencies = []
+    for u, v in allowed_edges:
+        diff = np.linalg.norm(stalks[u] - stalks[v])
+        if diff > 2.5:  # Arbitrary cutoff for inconsistency
+            inconsistencies.append((u, v, diff))
+    return inconsistencies
+
+###############################################################################
+# 3. Neural ODE System for Ricci-Driven Shape Evolution
 ###############################################################################
 class DifferentiableLambda(nn.Module):
     def __init__(self, init_val=1.0):
@@ -139,7 +157,7 @@ class OxiShapeODE(nn.Module):
         return inflow - outflow
 
 ###############################################################################
-# 3. Betti Number Tracker (Persistent Homology)
+# 4. Persistent Homology — Betti Number Tracker
 ###############################################################################
 def extract_betti_numbers(rho_snapshot, threshold=0.1):
     active_indices = np.where(rho_snapshot > threshold)[0]
