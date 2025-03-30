@@ -14,7 +14,17 @@ learning model. It works in the following steps:
   5. Define a PyTorch neural network that learns to predict the final occupancy given the initial occupancy.
   6. Train and evaluate the model.
 """
-!pip install torchdiffeq
+#!/usr/bin/env python
+# coding: utf-8
+
+"""
+Oxi-Shapes + Supervised ML Pipeline with Persistent Homology (Betti Numbers)
+
+This script combines the Oxi‑Shapes geometric evolution with a supervised machine
+learning model and persistent homology analysis.
+"""
+
+!pip install torchdiffeq ripser persim
 
 import numpy as np
 import networkx as nx
@@ -23,8 +33,10 @@ from scipy.spatial import Delaunay
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchdiffeq import odeint  # optional if you want a Neural ODE solver; here we use Euler updates for simulation
+from torchdiffeq import odeint
 import pandas as pd
+from ripser import ripser
+from persim import plot_diagrams
 
 ###############################################################################
 # 1. Define the Discrete State Space (R=3) & Its Embedding
@@ -127,7 +139,20 @@ class OxiShapeODE(nn.Module):
         return inflow - outflow
 
 ###############################################################################
-# 3. Data Generation
+# 3. Betti Number Tracker (Persistent Homology)
+###############################################################################
+def extract_betti_numbers(rho_snapshot, threshold=0.1):
+    active_indices = np.where(rho_snapshot > threshold)[0]
+    points = node_xy[active_indices]
+    if len(points) < 2:
+        return {'beta0': len(points), 'beta1': 0}
+    diagrams = ripser(points, maxdim=1)['dgms']
+    beta0 = len([pt for pt in diagrams[0] if pt[1] == np.inf])
+    beta1 = len(diagrams[1])
+    return {'beta0': beta0, 'beta1': beta1}
+
+###############################################################################
+# 4. Data Generation
 ###############################################################################
 def random_rho_init(num_samples=1000):
     data = []
@@ -138,21 +163,20 @@ def random_rho_init(num_samples=1000):
         data.append(rho_dict)
     return data
 
-def create_dataset_ODE(num_samples=1000, t_span=torch.linspace(0, 1, 100)):
+def create_dataset_ODE(num_samples=1000, t_span=torch.linspace(0.0, 1.0, 80, dtype=torch.float32)):
     initial_rhos = random_rho_init(num_samples)
     X, Y = [], []
-    dynamics = OxiShapeODE(node_xy=node_xy, triangles=triangles, G=G)
-
+    ode_model = OxiShapeODE(node_xy=node_xy, triangles=triangles, G=G)
     for rho_init_dict in initial_rhos:
         rho_0 = torch.tensor([rho_init_dict[s] for s in pf_states], dtype=torch.float32)
-        sol = odeint(dynamics, rho_0, t_span, method='dopri5')
+        sol = odeint(ode_model, rho_0, t_span, method='dopri5')
         rho_final = sol[-1]
         X.append(rho_0.detach().numpy())
         Y.append(rho_final.detach().numpy())
     return np.array(X), np.array(Y)
 
 ###############################################################################
-# 4. Neural Network for Learning
+# 5. Neural Network for Learning
 ###############################################################################
 class OxiNet(nn.Module):
     def __init__(self, input_dim=8, hidden_dim=32, output_dim=8):
@@ -169,7 +193,7 @@ class OxiNet(nn.Module):
         return torch.softmax(x, dim=1)
 
 ###############################################################################
-# 5. Train and Evaluate
+# 6. Train and Evaluate
 ###############################################################################
 def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3):
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -205,56 +229,32 @@ def evaluate_model(model, X_test, Y_test):
     return pred_test.numpy(), test_loss
 
 ###############################################################################
-# 6. Main
-###############################################################################
-###############################################################################
-# 7. Main Execution: Generate Data, Train, Evaluate (with ODE Solver)
+# 7. Main Execution
 ###############################################################################
 if __name__ == "__main__":
     print("Generating dataset using ODE-based evolution...")
-
-    def create_dataset_ODE(num_samples=1000, t_span=torch.linspace(0.0, 1.0, 80, dtype=torch.float32)):
-        assert t_span[1] > t_span[0], "Time span must have non-zero dt!"
-        initial_rhos = random_rho_init(num_samples)
-        X, Y = [], []
-
-        ode_model = OxiShapeODE(node_xy=node_xy, triangles=triangles, G=G)
-        for rho_init_dict in initial_rhos:
-            rho_0 = torch.tensor([rho_init_dict[s] for s in pf_states], dtype=torch.float32)
-            sol = odeint(ode_model, rho_0, t_span, method='dopri5')
-            rho_final = sol[-1]
-            X.append(rho_0.detach().numpy())
-            Y.append(rho_final.detach().numpy())
-        return np.array(X), np.array(Y)
-
-    # Generate the ODE-evolved dataset
     t_span = torch.linspace(0.0, 1.0, 80, dtype=torch.float32)
     X, Y = create_dataset_ODE(num_samples=2000, t_span=t_span)
-
-    # Shuffle and split
     perm = np.random.permutation(len(X))
     X, Y = X[perm], Y[perm]
     split = int(0.8 * len(X))
     X_train, Y_train = X[:split], Y[:split]
     X_val, Y_val = X[split:], Y[split:]
 
-    # Build the neural network model
-    print("Building and training the neural network...")
     model = OxiNet(input_dim=8, hidden_dim=32, output_dim=8)
     train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3)
 
-    # Evaluate on the validation set
     print("Evaluating on validation data...")
     pred_val, val_loss = evaluate_model(model, X_val, Y_val)
     print(f"Validation Loss: {val_loss:.6f}")
 
-    # Display a few sample predictions
-    idx_sample = np.random.choice(len(X_val), 3, replace=False)
-    for idx in idx_sample:
+    print("Tracking Betti number evolution in a few samples...")
+    for idx in np.random.choice(len(X_val), 3, replace=False):
         init_occ = X_val[idx]
-        true_final = Y_val[idx]
-        pred_final = pred_val[idx]
         print("\n--- Sample ---")
         print("Initial occupancy:", np.round(init_occ, 3))
-        print("True final occupancy:", np.round(true_final, 3))
-        print("Predicted final occupancy:", np.round(pred_final, 3))
+        print("True final occupancy:", np.round(Y_val[idx], 3))
+        print("Predicted final occupancy:", np.round(pred_val[idx], 3))
+
+        betti = extract_betti_numbers(pred_val[idx], threshold=0.05)
+        print(f"Betti Numbers → β₀: {betti['beta0']}  |  β₁: {betti['beta1']}")
