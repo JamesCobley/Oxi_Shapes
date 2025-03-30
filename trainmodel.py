@@ -176,31 +176,49 @@ def extract_betti_numbers(rho_snapshot, threshold=0.1):
     return {'beta0': beta0, 'beta1': beta1}
 
 ###############################################################################
-# 4. Data Generation
+# 5. Data Generation
 ###############################################################################
-def random_rho_init(num_samples=1000):
-    data = []
+###############################################################################
+# 4. Data Generation (with Energy Classifier)
+###############################################################################
+
+def compute_ricci_scalar(rho, L_t):
+    return np.dot(L_t, rho)  # Ricci from discrete Laplacian
+
+def classify_energy(ricci_scalar):
+    curvature_magnitude = np.linalg.norm(ricci_scalar)
+    if curvature_magnitude < 0.5:
+        return 0  # low
+    elif curvature_magnitude < 1.5:
+        return 1  # moderate
+    else:
+        return 2  # high
+
+def create_energy_classified_dataset(num_samples=1000, L_t=None):
+    X, Y, labels = [], [], []
     for _ in range(num_samples):
         vec = np.random.rand(8)
         vec /= vec.sum()
-        rho_dict = {s: vec[i] for i, s in enumerate(pf_states)}
-        data.append(rho_dict)
-    return data
+        rho_start = vec
+        # Simulated dynamics: small drift
+        rho_end = rho_start + 0.05 * (np.random.rand(8) - 0.5)
+        rho_end = np.clip(rho_end, 0, None)
+        rho_end /= rho_end.sum()
 
-def create_dataset_ODE(num_samples=1000, t_span=torch.linspace(0.0, 1.0, 80, dtype=torch.float32)):
-    initial_rhos = random_rho_init(num_samples)
-    X, Y = [], []
-    ode_model = OxiShapeODE(node_xy=node_xy, triangles=triangles, G=G)
-    for rho_init_dict in initial_rhos:
-        rho_0 = torch.tensor([rho_init_dict[s] for s in pf_states], dtype=torch.float32)
-        sol = odeint(ode_model, rho_0, t_span, method='dopri5')
-        rho_final = sol[-1]
-        X.append(rho_0.detach().numpy())
-        Y.append(rho_final.detach().numpy())
-    return np.array(X), np.array(Y)
+        # Energy label using Ricci scalar
+        if L_t is not None:
+            ricci = compute_ricci_scalar(rho_end, L_t)
+        else:
+            ricci = rho_end - rho_start  # fallback approximation
+        label = classify_energy(ricci)
+
+        X.append(rho_start)
+        Y.append(rho_end)
+        labels.append(label)
+    return np.array(X), np.array(Y), np.array(labels)
 
 ###############################################################################
-# 5. Neural Network for Learning
+# 6. Neural Network for Learning
 ###############################################################################
 class OxiNet(nn.Module):
     def __init__(self, input_dim=8, hidden_dim=32, output_dim=8):
@@ -217,7 +235,7 @@ class OxiNet(nn.Module):
         return torch.softmax(x, dim=1)
 
 ###############################################################################
-# 6. Train and Evaluate
+# 7. Train and Evaluate
 ###############################################################################
 def train_model_with_constraints(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=1.0, lambda_vol=1.0):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -256,7 +274,7 @@ def train_model_with_constraints(model, X_train, Y_train, X_val, Y_val, epochs=1
             print(f"Epoch {epoch} | Total Loss: {total_loss.item():.6f} | Main: {main_loss.item():.6f} | Val: {val_loss.item():.6f}")
 
 ###############################################################################
-# 7. Main Execution
+# 9. Main Execution
 ###############################################################################
 if __name__ == "__main__":
     print("Generating dataset using ODE-based evolution...")
