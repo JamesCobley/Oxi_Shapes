@@ -219,9 +219,9 @@ class OxiNet(nn.Module):
 ###############################################################################
 # 6. Train and Evaluate
 ###############################################################################
-def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+def train_model_with_constraints(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=1.0, lambda_vol=1.0):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    mse_loss = nn.MSELoss()
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32)
     X_val_t = torch.tensor(X_val, dtype=torch.float32)
@@ -231,26 +231,29 @@ def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3):
         model.train()
         optimizer.zero_grad()
         pred = model(X_train_t)
-        loss = criterion(pred, Y_train_t)
-        loss.backward()
+
+        # Core loss
+        main_loss = mse_loss(pred, Y_train_t)
+
+        # Volume constraint
+        vol_constraint = torch.mean((torch.sum(pred, dim=1) - torch.sum(Y_train_t, dim=1)) ** 2)
+
+        # Topology constraint
+        support_pred = (pred > 0.05).float()
+        support_true = (Y_train_t > 0.05).float()
+        topo_constraint = torch.mean((support_pred - support_true) ** 2)
+
+        # Total loss
+        total_loss = main_loss + lambda_vol * vol_constraint + lambda_topo * topo_constraint
+        total_loss.backward()
         optimizer.step()
 
-        model.eval()
-        with torch.no_grad():
-            pred_val = model(X_val_t)
-            val_loss = criterion(pred_val, Y_val_t)
         if epoch % 10 == 0:
-            print(f"Epoch {epoch}: Train Loss={loss.item():.6f}, Val Loss={val_loss.item():.6f}")
-
-def evaluate_model(model, X_test, Y_test):
-    model.eval()
-    X_test_t = torch.tensor(X_test, dtype=torch.float32)
-    Y_test_t = torch.tensor(Y_test, dtype=torch.float32)
-    with torch.no_grad():
-        pred_test = model(X_test_t)
-    criterion = nn.MSELoss()
-    test_loss = criterion(pred_test, Y_test_t).item()
-    return pred_test.numpy(), test_loss
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_val_t)
+                val_loss = mse_loss(val_pred, Y_val_t)
+            print(f"Epoch {epoch} | Total Loss: {total_loss.item():.6f} | Main: {main_loss.item():.6f} | Val: {val_loss.item():.6f}")
 
 ###############################################################################
 # 7. Main Execution
