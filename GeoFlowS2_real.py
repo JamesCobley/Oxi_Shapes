@@ -62,13 +62,17 @@ def shannon_entropy(occupancy):
     p = occupancy[occupancy > 0]
     return -np.sum(p * np.log2(p))
 
-def lyapunov_exponent(time_series):
+def lyapunov_exponent_kbins(rho_series):
     """
-    Estimate the Lyapunov exponent from a time series of percent oxidation.
-    time_series: numpy array of shape (T,), percent oxidation over T time steps.
+    Computes Lyapunov exponent from the k-bin weighted average (mean oxidation level).
     """
-    diffs = np.abs(np.diff(time_series))
-    diffs[diffs==0] = 1e-12
+    k_series = []
+    for rho in rho_series:
+        k = sum((s.count('1') * rho[i]) for i, s in enumerate(pf_states)) / 3
+        k_series.append(k)
+    k_series = np.array(k_series)
+    diffs = np.abs(np.diff(k_series))
+    diffs[diffs == 0] = 1e-12
     log_diffs = np.log(diffs)
     t = np.arange(len(log_diffs))
     A = np.vstack([t, np.ones(len(t))]).T
@@ -119,8 +123,8 @@ print("Predicted Shannon Entropy:", np.round(shannon_entropy(rho_final_emp_np), 
 # --- Generate full time series to estimate the Lyapunov exponent.
 rho_time_series = evolve_time_series(rho0_emp, t_span)
 percent_series = np.array([percent_oxidation(r) for r in rho_time_series])
-lyap_exp = lyapunov_exponent(percent_series)
-print("Lyapunov Exponent (from PDE time series):", np.round(lyap_exp, 6))
+lyap_exp_k = lyapunov_exponent_kbins(rho_time_series)
+print("Lyapunov Exponent (k-bin trajectory):", np.round(lyap_exp_k, 6))
 
 # --- Poincaré Recurrence Plot of Percent Oxidation
 def poincare_recurrence(series, threshold=1.0):
@@ -193,7 +197,7 @@ for idx, traj in enumerate(top5_trajectories):
     entropy_val = shannon_entropy(final_occ)
     # For Lyapunov, compute from percent oxidation time series along the trajectory.
     perc_series_traj = np.array([percent_oxidation(r) for r in traj])
-    lyap_val = lyapunov_exponent(perc_series_traj)
+    lyap_val = lyapunov_exponent_kbins(traj)
     print(f"\nTop Prediction {idx+1}:")
     print("Final occupancy:", np.round(final_occ, 3))
     print("Percent oxidation:", np.round(perc_ox, 2))
