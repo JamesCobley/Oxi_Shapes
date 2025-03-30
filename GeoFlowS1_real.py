@@ -2,25 +2,31 @@
 # coding: utf-8
 
 """
-Oxi-Shapes + Supervised ML Pipeline with Neural ODE PDE Solver,
-Sheaf Consistency, and a Differentiable Lambda Parameter
+Oxi-Shapes + Supervised ML Pipeline with External Forcing
 
-This script performs the following steps:
-  1. Defines the discrete state space (the binomial diamond for R=3) and its 2D embedding.
-  2. Initializes the occupancy distribution and solves for the φ field (via a Poisson-like PDE).
-  3. Computes the enriched c-Ricci (via a cotangent Laplacian) and anisotropy.
+This script performs the following:
+  1. Defines the discrete state space (binomial diamond for R=3) and its 2D embedding.
+  2. Initializes occupancy and solves for the φ field (via a Poisson-like PDE).
+  3. Computes enriched c-Ricci (via a cotangent Laplacian) and anisotropy.
   4. Initializes sheaf stalks and checks consistency.
-  5. Implements a differentiable ODE (via torchdiffeq.odeint) that evolves the occupancy distribution ρ(x)
-     according to the Einstein-like Oxi-Shapes field equation. The scaling constant for curvature is now trainable
-     via a DifferentiableLambda module.
-  6. Generates a dataset of (initial occupancy → final occupancy) pairs using the PDE solver.
-  7. Defines and trains a PyTorch neural network (OxiFlowNet) to predict final occupancy from the initial occupancy.
-  8. Evaluates and saves the trained model.
+  5. Implements a differentiable ODE using torchdiffeq.odeint that evolves the occupancy ρ(x)
+     according to the Einstein-like Oxi-Shapes field equation. Here the free-energy difference
+     is given by:
+         Δf(i→j) = ΔE(i→j)*exp[ρ(i)*Δx] - R(i)*T(i,j) + ΔS + γ*(P_current - P_target)
+     and the transition probability is:
+         p_ij = exp(-Δf(i→j)) · exp(-A(j))
+     Thus, the external forcing (with hyperparameter γ and target percent oxidation)
+     drives the evolution away from trivial uniformity.
+  6. Generates a dataset of (initial occupancy → final occupancy) pairs using the PDE solver,
+     with each sample assigned a random target oxidation (in 5% bins from 0% to 100%).
+  7. Defines and trains a PyTorch neural network (OxiFlowNet) to predict the final occupancy
+     from the initial occupancy.
+  8. Evaluates the trained model and reports key metrics.
   
 Dependencies: torchdiffeq, ripser, persim
 """
 
-# Install necessary packages (if running in a notebook)
+# Install necessary packages (if not already installed)
 !pip install torchdiffeq ripser persim
 
 import numpy as np
@@ -35,6 +41,7 @@ import pandas as pd
 from ripser import ripser
 from persim import plot_diagrams
 
+# --- Device Setup ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
@@ -44,14 +51,14 @@ print("Using device:", device)
 class DifferentiableLambda(nn.Module):
     def __init__(self, init_val=1.0):
         super().__init__()
-        self.log_lambda = nn.Parameter(torch.tensor(np.log(init_val), dtype=torch.float32))
+        self.log_lambda = nn.Parameter(torch.tensor(np.log(init_val), dtype=torch.float32, device=device))
     def forward(self):
         return torch.exp(self.log_lambda)
 
-# Instantiate a global differentiable lambda parameter
-lambda_net = DifferentiableLambda(init_val=1.0)
+# Instantiate a global differentiable lambda.
+lambda_net = DifferentiableLambda(init_val=1.0).to(device)
 
-# Global RT constant
+# Global RT constant.
 RT = 1.0
 
 ###############################################################################
@@ -67,7 +74,6 @@ allowed_edges = [
     ("101", "111"),
     ("110", "111"),
 ]
-
 G = nx.Graph()
 G.add_nodes_from(pf_states)
 G.add_edges_from(allowed_edges)
@@ -89,7 +95,12 @@ node_xy = np.array([flat_pos[s] for s in pf_states])
 tri = Delaunay(node_xy)
 triangles = tri.simplices
 
-# Visualize the discrete state space
+# Precompute neighbor indices to speed up ODE loop.
+neighbor_indices = {s: [state_index[nbr] for nbr in G.neighbors(s)] for s in pf_states}
+# Precompute torch tensor for flat positions.
+flat_pos_tensor = torch.tensor(node_xy, dtype=torch.float32, device=device)
+
+# Visualize the state space.
 plt.figure(figsize=(6,6))
 nx.draw(G, pos=flat_pos, with_labels=True, node_color='skyblue', node_size=1000, font_size=12, edge_color='gray')
 plt.title("Discrete Proteoform State Space (R=3)")
@@ -123,7 +134,6 @@ for iter in range(max_iter):
     F = L @ phi_vec + nonlin
     J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
     delta_phi = np.linalg.solve(J, -F)
-    # Pin nodes with near-zero occupancy using the occupancy dictionary.
     for i, s in enumerate(pf_states):
         if occupancy[s] <= 1e-14:
             delta_phi[i] = 0.0
@@ -148,32 +158,34 @@ def compute_cotangent_laplacian(node_xy, triangles):
         v0 = pts[1] - pts[0]
         v1 = pts[2] - pts[0]
         v2 = pts[2] - pts[1]
-        angle_i = np.arccos(np.clip(np.dot(v0, v1)/(np.linalg.norm(v0)*np.linalg.norm(v1)), -1, 1))
-        angle_j = np.arccos(np.clip(np.dot(-v0, v2)/(np.linalg.norm(v0)*np.linalg.norm(v2)), -1, 1))
-        angle_k = np.arccos(np.clip(np.dot(-v1, -v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)), -1, 1))
+        angle_i = np.arccos(np.clip(np.dot(v0, v1) / (np.linalg.norm(v0)*np.linalg.norm(v1)), -1, 1))
+        angle_j = np.arccos(np.clip(np.dot(-v0, v2) / (np.linalg.norm(v0)*np.linalg.norm(v2)), -1, 1))
+        angle_k = np.arccos(np.clip(np.dot(-v1, -v2) / (np.linalg.norm(v1)*np.linalg.norm(v2)), -1, 1))
         cot_i = 1/np.tan(angle_i) if np.tan(angle_i)!=0 else 0
         cot_j = 1/np.tan(angle_j) if np.tan(angle_j)!=0 else 0
         cot_k = 1/np.tan(angle_k) if np.tan(angle_k)!=0 else 0
         for (a, b), cval in zip([(j,k), (i,k), (i,j)], [cot_i, cot_j, cot_k]):
-            W[a,b] += cval
-            W[b,a] += cval
+            W[a, b] += cval
+            W[b, a] += cval
     L_t = -W
     for i in range(N):
-        L_t[i,i] = np.sum(W[i, :])
+        L_t[i,i] = np.sum(W[i,:])
     return L_t
 
-# Precompute the cotangent Laplacian (using NumPy) and convert to torch.
+# Precompute cotangent Laplacian in NumPy, then convert to torch.
 L_np = compute_cotangent_laplacian(node_xy, triangles)
-L_torch = torch.tensor(L_np, dtype=torch.float32)
-lambda_val = lambda_net().detach().cpu().numpy()  # Get current lambda value as a fixed scalar for this computation
-c_ricci_vec = lambda_val * (L_np @ rho_vec)
+L_torch = torch.tensor(L_np, dtype=torch.float32, device=device)
+
+# For visualization, we use a fixed lambda value (from the differentiable lambda).
+lambda_value = lambda_net().detach().cpu().numpy()
+c_ricci_vec = lambda_value * (L_np @ rho_vec)
 c_ricci_nodes = {pf_states[i]: c_ricci_vec[i] for i in range(num_states)}
 
-# Assign edgewise c-Ricci as the average of endpoint values.
+# Assign edgewise c-Ricci (average of endpoints).
 for (u, v) in G.edges():
     G[u][v]['cRicci'] = (c_ricci_nodes[u] + c_ricci_nodes[v]) / 2.0
 
-# Compute anisotropy field A(x): for each node, average the gradient over its neighbors.
+# Compute anisotropy field A(x) for each node.
 A_field = {}
 for s in pf_states:
     nbrs = list(G.neighbors(s))
@@ -186,7 +198,7 @@ for s in pf_states:
             count += 1
     A_field[s] = grad_sum / count if count > 0 else 0.0
 
-# For each edge, assign a penalty factor based on anisotropy.
+# For each edge, assign a penalty factor.
 for (u, v) in G.edges():
     penalty = np.exp(- (A_field[u] + A_field[v]) / 2.0)
     G[u][v]['penalty'] = penalty
@@ -216,78 +228,117 @@ else:
     print("Sheaf stalks are consistent.")
 
 ###############################################################################
-# 5. Neural ODE Function for Occupancy Evolution (Differentiable PDE Solver)
+# 5. Neural ODE Function with External Forcing for Dynamic Probability
 ###############################################################################
-def oxi_shapes_ode(t, rho):
+def oxi_shapes_ode_with_target(t, rho, target_oxidation, gamma=0.1):
     """
-    ODE function for evolving occupancy ρ (tensor of shape (num_states,)).
-    Uses the differentiable lambda parameter.
-    """
-    # Compute c-Ricci using the trainable lambda parameter.
-    c_ricci = lambda_net() * (L_torch @ rho)
+    ODE function for evolving occupancy ρ (tensor shape (num_states,))
+    with external forcing to drive the system toward a target percent oxidation.
     
-    # Compute anisotropy field A
-    A = torch.zeros(num_states)
+    The free-energy difference is computed as:
+      Δf(i→j) = ΔE(i→j)*exp[ρ(i)*Δx] - cRicci(i)*T(i,j) + ΔS + gamma*(P_current - P_target)
+    
+    And the transition probability:
+      p_ij = exp(-Δf(i→j)) * exp(-A(j))
+    
+    Here, we use:
+      - ΔE(i→j)= baseline_DeltaE (constant),
+      - Δx = 1,
+      - T(i,j)=1 for allowed transitions,
+      - ΔS = 0,
+      - P_current = current percent oxidation,
+      - P_target = target_oxidation (external parameter),
+      - gamma scales the forcing.
+    """
+    rho = rho.to(device)
+   def oxi_shapes_ode(t, rho):
+    """
+    Monte Carlo-inspired redox engine using C-Ricci and entropy-based ΔS.
+    """
+    rho = rho.to(device)
+    c_ricci = lambda_net() * (L_torch @ rho)
+
+    # Anisotropy field A(x)
+    A = torch.zeros(num_states, device=device)
     for i, s in enumerate(pf_states):
-        nbrs = list(G.neighbors(s))
+        nbrs = neighbor_indices[s]
         if len(nbrs) == 0:
             A[i] = 0.0
             continue
-        grad_sum = 0.0
-        for nbr in nbrs:
-            j = state_index[nbr]
-            pos_i = torch.tensor(flat_pos[s], dtype=torch.float32)
-            pos_j = torch.tensor(flat_pos[nbr], dtype=torch.float32)
-            dist = torch.norm(pos_i - pos_j)
+        grad_vals = []
+        for j in nbrs:
+            dist = torch.norm(flat_pos_tensor[i] - flat_pos_tensor[j])
             if dist > 1e-6:
-                grad_sum += torch.abs(c_ricci[i] - c_ricci[j]) / dist
-        A[i] = grad_sum / len(nbrs)
-    
-    # Build inflow and outflow terms.
-    inflow = torch.zeros_like(rho)
-    outflow = torch.zeros_like(rho)
-    for i, s_i in enumerate(pf_states):
-        for nbr in G.neighbors(s_i):
-            j = state_index[nbr]
+                grad_vals.append(torch.abs(c_ricci[i] - c_ricci[j]) / dist)
+        A[i] = sum(grad_vals) / len(grad_vals) if grad_vals else 0.0
+
+    # Degeneracy based on k (number of 1s)
+    degeneracy = torch.tensor(
+        [1, 3, 3, 1, 3, 3, 3, 1], dtype=torch.float32, device=device
+    )  # [000,001,010,100,011,101,110,111] → degeneracies
+
+    # Constants
+    baseline_DeltaE = 1.0
+    Delta_x = 1.0
+    RT = 1.0
+
+    inflow = torch.zeros_like(rho, device=device)
+    outflow = torch.zeros_like(rho, device=device)
+
+    for i, s in enumerate(pf_states):
+        for j in neighbor_indices[s]:
             occ_i = rho[i]
-            occ_j = rho[j]
-            delta_E = c_ricci[j] - c_ricci[i]
-            entropy_term = 0.0
-            if occ_i > 1e-12 and occ_j > 1e-12:
-                entropy_term = torch.log(occ_j + 1e-12) - torch.log(occ_i + 1e-12)
-            delta_f = (delta_E + 0.5 * entropy_term - A[j]) / RT
-            p_ij = torch.exp(-delta_f)
+
+            # --- ΔS computation ---
+            mass_heat = 0.1 * rho[i]
+            reaction_heat = 0.01 * baseline_DeltaE
+            conformational_cost = torch.abs(c_ricci[j])
+            degeneracy_penalty = 1.0 / degeneracy[j]
+            delta_S = mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
+
+            # --- Δf computation ---
+            delta_f = (
+                baseline_DeltaE * torch.exp(rho[i] * Delta_x)
+                - c_ricci[i]
+                + delta_S
+            ) / RT
+
+            # --- Transition probability ---
+            p_ij = torch.exp(-delta_f) * torch.exp(-A[j])
+
             inflow[j] += occ_i * p_ij
             outflow[i] += occ_i * p_ij
+
     return inflow - outflow
 
-def evolve_oxi_shapes_pde(rho0, t_span):
-    """
-    Evolve initial occupancy rho0 (tensor of shape (num_states,))
-    over time t_span using torchdiffeq.odeint.
-    Returns the final occupancy (normalized).
-    """
+def evolve_oxi_shapes_pde_target(rho0, t_span, target_oxidation, gamma=0.1):
+    rho0 = rho0.to(device)
     rho0 = rho0 / rho0.sum()
-    rho_t = odeint(oxi_shapes_ode, rho0, t_span)
+    ode_func = lambda t, rho: oxi_shapes_ode_with_target(t, rho, target_oxidation, gamma)
+    rho_t = odeint(ode_func, rho0, t_span)
     final_rho = rho_t[-1]
     final_rho = final_rho / final_rho.sum()
     return final_rho
 
 ###############################################################################
-# 6. Data Generation: Create (initial -> final) Occupancy Pairs via PDE Solver
+# 6. Data Generation: Create (initial -> final) Occupancy Pairs with External Forcing
 ###############################################################################
-def create_dataset_ODE(num_samples=1000, t_span=None):
+def create_dataset_ODE_target(num_samples=1000, t_span=None):
     if t_span is None:
-        t_span = torch.linspace(0.0, 1.0, 80, dtype=torch.float32, device=device)
-    X, Y = [], []
+        t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
+    X, Y, targets = [], [], []
+    # Possible target percent oxidation values in 5% bins.
+    possible_targets = np.arange(0, 100, 5)
     for _ in range(num_samples):
         vec = np.random.rand(num_states)
         vec /= vec.sum()
         rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
-        final_rho = evolve_oxi_shapes_pde(rho0, t_span)
-        X.append(rho0.detach().numpy())
-        Y.append(final_rho.detach().numpy())
-    return np.array(X), np.array(Y)
+        target_ox = float(np.random.choice(possible_targets))
+        final_rho = evolve_oxi_shapes_pde_target(rho0, t_span, target_ox, gamma=0.1)
+        X.append(rho0.detach().cpu().numpy())
+        Y.append(final_rho.detach().cpu().numpy())
+        targets.append(target_ox)
+    return np.array(X), np.array(Y), np.array(targets)
 
 ###############################################################################
 # 7. Neural Network for Learning (OxiFlowNet)
@@ -312,10 +363,10 @@ class OxiNet(nn.Module):
 def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
-    X_train_t = torch.tensor(X_train, dtype=torch.float32)
-    Y_train_t = torch.tensor(Y_train, dtype=torch.float32)
-    X_val_t = torch.tensor(X_val, dtype=torch.float32)
-    Y_val_t = torch.tensor(Y_val, dtype=torch.float32)
+    X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
+    Y_train_t = torch.tensor(Y_train, dtype=torch.float32, device=device)
+    X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
+    Y_val_t = torch.tensor(Y_val, dtype=torch.float32, device=device)
     
     for epoch in range(1, epochs+1):
         model.train()
@@ -338,36 +389,36 @@ def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lamb
 
 def evaluate_model(model, X_test, Y_test):
     model.eval()
-    X_test_t = torch.tensor(X_test, dtype=torch.float32)
-    Y_test_t = torch.tensor(Y_test, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
+    Y_test_t = torch.tensor(Y_test, dtype=torch.float32, device=device)
     with torch.no_grad():
         pred_test = model(X_test_t)
     mse_loss = nn.MSELoss()
     test_loss = mse_loss(pred_test, Y_test_t).item()
-    return pred_test.numpy(), test_loss
+    return pred_test.detach().cpu().numpy(), test_loss
 
 ###############################################################################
 # 9. Main Execution: Data Generation, Training, and Evaluation
 ###############################################################################
 if __name__ == "__main__":
-    print("Generating dataset using PDE-based evolution (Neural ODE)...")
-    t_span = torch.linspace(0.0, 1.0, 80, dtype=torch.float32)
-    X, Y = create_dataset_ODE(num_samples=2000, t_span=t_span)
+    print("Generating dataset using PDE-based evolution with external forcing...")
+    t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
+    X, Y, targets = create_dataset_ODE_target(num_samples=2000, t_span=t_span)
     perm = np.random.permutation(len(X))
-    X, Y = X[perm], Y[perm]
+    X, Y, targets = X[perm], Y[perm], targets[perm]
     split = int(0.8 * len(X))
     X_train, Y_train = X[:split], Y[:split]
     X_val, Y_val = X[split:], Y[split:]
     
     print("Building and training the neural network (OxiFlowNet)...")
-    model = OxiNet(input_dim=8, hidden_dim=32, output_dim=8)
+    model = OxiNet(input_dim=8, hidden_dim=32, output_dim=8).to(device)
     train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5)
     
     print("\nEvaluating on validation data...")
     pred_val, val_loss = evaluate_model(model, X_val, Y_val)
     print(f"Validation Loss: {val_loss:.6f}")
     
-    # Save the trained model and metadata for later use in Pipeline Step 2.
+    # Save the trained model and metadata for later use.
     torch.save({
         'model_state_dict': model.state_dict(),
         'pf_states': pf_states,
