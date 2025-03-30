@@ -176,10 +176,7 @@ def extract_betti_numbers(rho_snapshot, threshold=0.1):
     return {'beta0': beta0, 'beta1': beta1}
 
 ###############################################################################
-# 5. Data Generation
-###############################################################################
-###############################################################################
-# 4. Data Generation (with Energy Classifier)
+# 5. Data Generation (with Energy Classifier)
 ###############################################################################
 
 def compute_ricci_scalar(rho, L_t):
@@ -274,7 +271,19 @@ def train_model_with_constraints(model, X_train, Y_train, X_val, Y_val, epochs=1
             print(f"Epoch {epoch} | Total Loss: {total_loss.item():.6f} | Main: {main_loss.item():.6f} | Val: {val_loss.item():.6f}")
 
 ###############################################################################
-# 9. Main Execution
+# 8. Geodesic Paths
+###############################################################################
+geodesic_paths = [
+    ["000", "100", "101", "111"],
+    ["000", "100", "110", "111"],
+    ["000", "010", "110", "111"],
+    ["000", "010", "011", "111"],
+    ["000", "001", "101", "111"],
+    ["000", "001", "011", "111"],
+]
+
+###############################################################################
+# 9. Main Execution (with Save + Geodesics)
 ###############################################################################
 if __name__ == "__main__":
     print("Generating dataset using ODE-based evolution...")
@@ -286,14 +295,30 @@ if __name__ == "__main__":
     X_train, Y_train = X[:split], Y[:split]
     X_val, Y_val = X[split:], Y[split:]
 
+    # Initialize model
     model = OxiNet(input_dim=8, hidden_dim=32, output_dim=8)
-    train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3)
+    
+    # Train with constraints
+    train_model_with_constraints(
+        model, X_train, Y_train, X_val, Y_val,
+        epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5
+    )
 
-    print("Evaluating on validation data...")
+    print("\nEvaluating on validation data...")
     pred_val, val_loss = evaluate_model(model, X_val, Y_val)
     print(f"Validation Loss: {val_loss:.6f}")
 
-    print("Tracking Betti number evolution in a few samples...")
+    # Save model and metadata
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'geodesic_paths': geodesic_paths,
+        'input_dim': 8,
+        'hidden_dim': 32,
+        'output_dim': 8
+    }, "oxinet_model.pt")
+    print("✅ Trained model saved to: oxinet_model.pt")
+
+    print("\nTracking Betti number evolution in a few samples...")
     for idx in np.random.choice(len(X_val), 3, replace=False):
         init_occ = X_val[idx]
         print("\n--- Sample ---")
@@ -303,3 +328,4 @@ if __name__ == "__main__":
 
         betti = extract_betti_numbers(pred_val[idx], threshold=0.05)
         print(f"Betti Numbers → β₀: {betti['beta0']}  |  β₁: {betti['beta1']}")
+ 
