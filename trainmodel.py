@@ -44,127 +44,90 @@ G.add_nodes_from(pf_states)
 G.add_edges_from(allowed_edges)
 state_index = {s: i for i, s in enumerate(pf_states)}
 
-# 2D embedding (flat diamond)
 flat_pos = {
-    "000": (0, 3),
-    "001": (-2, 2),
-    "010": (0, 2),
-    "100": (2, 2),
-    "011": (-1, 1),
-    "101": (0, 1),
-    "110": (1, 1),
-    "111": (0, 0)
+    "000": (0, 3), "001": (-2, 2), "010": (0, 2), "100": (2, 2),
+    "011": (-1, 1), "101": (0, 1), "110": (1, 1), "111": (0, 0)
 }
 node_xy = np.array([flat_pos[s] for s in pf_states])
 tri = Delaunay(node_xy)
 triangles = tri.simplices
 
-# Optional: visualize the state space
-plt.figure(figsize=(6,6))
-nx.draw(G, pos=flat_pos, with_labels=True, node_color='skyblue', node_size=1000, font_size=12, edge_color='gray')
-plt.title("Discrete Proteoform State Space (R=3)")
-plt.show()
-
 ###############################################################################
-# 2. Geometry Functions: Cotangent Laplacian, c-Ricci, and Anisotropy
+# 2. Neural ODE System for Ricci-Driven Shape Evolution
 ###############################################################################
-def compute_cotangent_laplacian(node_xy, triangles):
-    N = node_xy.shape[0]
-    W = np.zeros((N, N))
-    for tri_idx in triangles:
-        i, j, k = tri_idx
-        pts = node_xy[[i, j, k], :]
-        v0 = pts[1] - pts[0]
-        v1 = pts[2] - pts[0]
-        v2 = pts[2] - pts[1]
-        angle_i = np.arccos(np.clip(np.dot(v0, v1)/(np.linalg.norm(v0)*np.linalg.norm(v1)), -1, 1))
-        angle_j = np.arccos(np.clip(np.dot(-v0, v2)/(np.linalg.norm(v0)*np.linalg.norm(v2)), -1, 1))
-        angle_k = np.arccos(np.clip(np.dot(-v1, -v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)), -1, 1))
-        cot_i = 1.0/np.tan(angle_i) if np.tan(angle_i)!=0 else 0
-        cot_j = 1.0/np.tan(angle_j) if np.tan(angle_j)!=0 else 0
-        cot_k = 1.0/np.tan(angle_k) if np.tan(angle_k)!=0 else 0
-        for (a, b), cval in zip([(j, k), (i, k), (i, j)], [cot_i, cot_j, cot_k]):
-            W[a, b] += cval
-            W[b, a] += cval
-    L_t = -W
-    for i in range(N):
-        L_t[i, i] = np.sum(W[i, :])
-    return L_t
+class DifferentiableLambda(nn.Module):
+    def __init__(self, init_val=1.0):
+        super().__init__()
+        self.log_lambda = nn.Parameter(torch.tensor(np.log(init_val), dtype=torch.float32))
 
-def compute_c_ricci(rho_vec, lambda_const=1.0):
-    L_t = compute_cotangent_laplacian(node_xy, triangles)
-    return lambda_const * (L_t @ rho_vec)
+    def forward(self):
+        return torch.exp(self.log_lambda)
 
-def compute_anisotropy(c_ricci_vec):
-    A = np.zeros(len(pf_states))
-    for i, s in enumerate(pf_states):
-        nbrs = list(G.neighbors(s))
-        if len(nbrs)==0:
-            A[i] = 0.0
-            continue
-        grad_sum = 0.0
-        for nbr in nbrs:
-            j = state_index[nbr]
-            dist = np.linalg.norm(node_xy[i] - node_xy[j])
-            if dist>1e-8:
-                grad_sum += abs(c_ricci_vec[i] - c_ricci_vec[j]) / dist
-        A[i] = grad_sum / len(nbrs)
-    return A
+class OxiShapeODE(nn.Module):
+    def __init__(self, node_xy, triangles, G, RT=1.0):
+        super().__init__()
+        self.node_xy = node_xy
+        self.triangles = triangles
+        self.G = G
+        self.RT = RT
+        self.state_index = {s: i for i, s in enumerate(pf_states)}
+        self.lambda_net = DifferentiableLambda(init_val=1.0)
 
-###############################################################################
-# 3. ODE-like Evolution: Euler Time-Stepping of Occupancy ρ(x)
-###############################################################################
-def evolve_oxi_shapes(rho_init, dt=0.01, steps=50, lambda_const=1.0, RT=1.0):
-    """
-    Evolve occupancy ρ(x) according to an Euler update based on the field equation:
-      dρ(x_j)/dt = sum_{x_i in N(x_j)} [ρ(x_i)*exp(-Δf(i->j))] 
-                   - ρ(x_j)*sum_{x_k in N(x_j)} [exp(-Δf(j->k))]
-    where Δf is computed from differences in c-Ricci and anisotropy.
-    """
-    pf_list = list(rho_init.keys())
-    N = len(pf_list)
-    idx_map = {s: i for i, s in enumerate(pf_list)}
-    rho_vec = np.array([rho_init[s] for s in pf_list], dtype=float)
-    rho_vec /= rho_vec.sum()  # Ensure normalization
+    def compute_cotangent_laplacian(self):
+        N = self.node_xy.shape[0]
+        W = np.zeros((N, N))
+        for tri in self.triangles:
+            i, j, k = tri
+            pts = self.node_xy[[i, j, k], :]
+            v0, v1, v2 = pts[1] - pts[0], pts[2] - pts[0], pts[2] - pts[1]
+            angles = [
+                np.arccos(np.clip(np.dot(v0, v1)/(np.linalg.norm(v0)*np.linalg.norm(v1)), -1, 1)),
+                np.arccos(np.clip(np.dot(-v0, v2)/(np.linalg.norm(v0)*np.linalg.norm(v2)), -1, 1)),
+                np.arccos(np.clip(np.dot(-v1, -v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)), -1, 1))
+            ]
+            cots = [1/np.tan(a) if np.tan(a) != 0 else 0 for a in angles]
+            for (a, b), c in zip([(j,k),(i,k),(i,j)], cots):
+                W[a,b] += c
+                W[b,a] += c
+        L_t = -W
+        for i in range(N):
+            L_t[i,i] = np.sum(W[i,:])
+        return torch.tensor(L_t, dtype=torch.float32)
 
-    # Record history if needed
-    rho_history = []
-    c_ricci_history = []
-
-    for t in range(steps):
-        rho_history.append(rho_vec.copy())
-        c_ricci_vec = compute_c_ricci(rho_vec, lambda_const=lambda_const)
-        c_ricci_history.append(c_ricci_vec.copy())
-        A_field = compute_anisotropy(c_ricci_vec)
-        inflow = np.zeros(N)
-        outflow = np.zeros(N)
-        for i, s_i in enumerate(pf_list):
-            nbrs = list(G.neighbors(s_i))
+    def compute_anisotropy(self, c_ricci):
+        A = torch.zeros(len(pf_states))
+        for i, s in enumerate(pf_states):
+            nbrs = list(self.G.neighbors(s))
+            grad_sum = 0.0
             for nbr in nbrs:
-                j = idx_map[nbr]
-                # Free energy difference computed as in our field eq (simplified)
-                occ_i = rho_vec[i]
-                occ_j = rho_vec[j]
-                delta_E = c_ricci_vec[j] - c_ricci_vec[i]
-                entropy_term = 0
-                if occ_i>1e-12 and occ_j>1e-12:
-                    entropy_term = np.log(occ_j) - np.log(occ_i)
-                # Δf includes an anisotropy penalty from neighbor j
-                delta_f = delta_E + 0.5*entropy_term - A_field[j]
-                delta_f /= RT
-                p_ij = np.exp(-delta_f)
-                inflow[j] += rho_vec[i] * p_ij
-                outflow[i] += rho_vec[i] * p_ij
-        new_rho = rho_vec + dt*(inflow - outflow)
-        new_rho = np.maximum(new_rho, 0.0)
-        new_rho /= new_rho.sum() if new_rho.sum() > 1e-12 else 1.0
-        rho_vec = new_rho
+                j = self.state_index[nbr]
+                dist = torch.norm(torch.tensor(self.node_xy[i] - self.node_xy[j], dtype=torch.float32))
+                if dist > 1e-8:
+                    grad_sum += torch.abs(c_ricci[i] - c_ricci[j]) / dist
+            A[i] = grad_sum / len(nbrs) if nbrs else 0.0
+        return A
 
-    final_rho = {pf_list[i]: rho_vec[i] for i in range(N)}
-    return final_rho, np.array(rho_history), np.array(c_ricci_history)
+    def forward(self, t, rho):
+        L_t = self.compute_cotangent_laplacian()
+        lambda_val = self.lambda_net()
+        c_ricci = lambda_val * torch.matmul(L_t, rho)
+        A_field = self.compute_anisotropy(c_ricci)
+        inflow = torch.zeros_like(rho)
+        outflow = torch.zeros_like(rho)
+        for i, s_i in enumerate(pf_states):
+            nbrs = list(self.G.neighbors(s_i))
+            for nbr in nbrs:
+                j = self.state_index[nbr]
+                delta_E = c_ricci[j] - c_ricci[i]
+                S_term = torch.log(rho[j] + 1e-12) - torch.log(rho[i] + 1e-12)
+                delta_f = delta_E + 0.5*S_term - A_field[j]
+                p_ij = torch.exp(-delta_f / self.RT)
+                inflow[j] += rho[i] * p_ij
+                outflow[i] += rho[i] * p_ij
+        return inflow - outflow
 
 ###############################################################################
-# 4. Data Generation: Create Dataset of (Initial -> Final) Occupancy Pairs
+# 3. Data Generation
 ###############################################################################
 def random_rho_init(num_samples=1000):
     data = []
@@ -175,22 +138,21 @@ def random_rho_init(num_samples=1000):
         data.append(rho_dict)
     return data
 
-def create_dataset(num_samples=1000, dt=0.01, steps=50, lambda_const=1.0, RT=1.0):
+def create_dataset_ODE(num_samples=1000, t_span=torch.linspace(0, 1, 100)):
     initial_rhos = random_rho_init(num_samples)
     X, Y = [], []
-    for rho_init in initial_rhos:
-        final_rho, _, _ = evolve_oxi_shapes(rho_init, dt=dt, steps=steps,
-                                            lambda_const=lambda_const, RT=RT)
-        init_vec = np.array([rho_init[s] for s in pf_states], dtype=float)
-        final_vec = np.array([final_rho[s] for s in pf_states], dtype=float)
-        X.append(init_vec)
-        Y.append(final_vec)
-    X = np.array(X)
-    Y = np.array(Y)
-    return X, Y
+    dynamics = OxiShapeODE(node_xy=node_xy, triangles=triangles, G=G)
+
+    for rho_init_dict in initial_rhos:
+        rho_0 = torch.tensor([rho_init_dict[s] for s in pf_states], dtype=torch.float32)
+        sol = odeint(dynamics, rho_0, t_span, method='dopri5')
+        rho_final = sol[-1]
+        X.append(rho_0.detach().numpy())
+        Y.append(rho_final.detach().numpy())
+    return np.array(X), np.array(Y)
 
 ###############################################################################
-# 5. Define the Neural Network Model in PyTorch
+# 4. Neural Network for Learning
 ###############################################################################
 class OxiNet(nn.Module):
     def __init__(self, input_dim=8, hidden_dim=32, output_dim=8):
@@ -199,28 +161,24 @@ class OxiNet(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, output_dim)
         self.relu = nn.ReLU()
-    
+
     def forward(self, x):
-        # Forward pass through the network
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
         x = self.fc3(x)
-        # Use softmax to ensure output is a probability distribution (sums to 1)
-        x = torch.softmax(x, dim=1)
-        return x
+        return torch.softmax(x, dim=1)
 
 ###############################################################################
-# 6. Training and Evaluation Functions
+# 5. Train and Evaluate
 ###############################################################################
 def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
-    
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32)
     X_val_t = torch.tensor(X_val, dtype=torch.float32)
     Y_val_t = torch.tensor(Y_val, dtype=torch.float32)
-    
+
     for epoch in range(1, epochs+1):
         model.train()
         optimizer.zero_grad()
@@ -228,13 +186,13 @@ def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3):
         loss = criterion(pred, Y_train_t)
         loss.backward()
         optimizer.step()
-        
+
         model.eval()
         with torch.no_grad():
             pred_val = model(X_val_t)
             val_loss = criterion(pred_val, Y_val_t)
         if epoch % 10 == 0:
-            print(f"Epoch {epoch}/{epochs}: Train Loss={loss.item():.6f}, Val Loss={val_loss.item():.6f}")
+            print(f"Epoch {epoch}: Train Loss={loss.item():.6f}, Val Loss={val_loss.item():.6f}")
 
 def evaluate_model(model, X_test, Y_test):
     model.eval()
@@ -247,29 +205,49 @@ def evaluate_model(model, X_test, Y_test):
     return pred_test.numpy(), test_loss
 
 ###############################################################################
-# 7. Main Execution: Generate Data, Train, Evaluate
+# 6. Main
+###############################################################################
+###############################################################################
+# 7. Main Execution: Generate Data, Train, Evaluate (with ODE Solver)
 ###############################################################################
 if __name__ == "__main__":
-    # Generate dataset: mapping initial occupancy -> final occupancy after evolution
-    print("Generating dataset...")
-    X, Y = create_dataset(num_samples=2000, dt=0.01, steps=80, lambda_const=1.0, RT=1.0)
-    # Shuffle and split into training and validation sets (80/20 split)
+    print("Generating dataset using ODE-based evolution...")
+
+    def create_dataset_ODE(num_samples=1000, t_span=torch.linspace(0.0, 1.0, 80, dtype=torch.float32)):
+        assert t_span[1] > t_span[0], "Time span must have non-zero dt!"
+        initial_rhos = random_rho_init(num_samples)
+        X, Y = [], []
+
+        ode_model = OxiShapeODE(node_xy=node_xy, triangles=triangles, G=G)
+        for rho_init_dict in initial_rhos:
+            rho_0 = torch.tensor([rho_init_dict[s] for s in pf_states], dtype=torch.float32)
+            sol = odeint(ode_model, rho_0, t_span, method='dopri5')
+            rho_final = sol[-1]
+            X.append(rho_0.detach().numpy())
+            Y.append(rho_final.detach().numpy())
+        return np.array(X), np.array(Y)
+
+    # Generate the ODE-evolved dataset
+    t_span = torch.linspace(0.0, 1.0, 80, dtype=torch.float32)
+    X, Y = create_dataset_ODE(num_samples=2000, t_span=t_span)
+
+    # Shuffle and split
     perm = np.random.permutation(len(X))
     X, Y = X[perm], Y[perm]
     split = int(0.8 * len(X))
     X_train, Y_train = X[:split], Y[:split]
     X_val, Y_val = X[split:], Y[split:]
-    
+
     # Build the neural network model
     print("Building and training the neural network...")
     model = OxiNet(input_dim=8, hidden_dim=32, output_dim=8)
     train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3)
-    
+
     # Evaluate on the validation set
     print("Evaluating on validation data...")
     pred_val, val_loss = evaluate_model(model, X_val, Y_val)
     print(f"Validation Loss: {val_loss:.6f}")
-    
+
     # Display a few sample predictions
     idx_sample = np.random.choice(len(X_val), 3, replace=False)
     for idx in idx_sample:
