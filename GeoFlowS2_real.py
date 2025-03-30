@@ -80,16 +80,16 @@ def lyapunov_exponent_kbins(rho_series):
     return slope
 
 # --- Helper: Evolve occupancy to obtain full time series
-def evolve_time_series(rho0, t_span):
+def evolve_time_series(rho0, t_span, target_oxidation, gamma=0.1):
     """
-    Use odeint to evolve the occupancy over t_span.
-    Returns a numpy array of shape (T, num_states) with the occupancy at each time step.
+    Evolve the occupancy over t_span using the same dynamics as evolve_oxi_shapes_pde_target.
+    Returns a numpy array of shape (T, num_states).
     """
-    rho_t = odeint(oxi_shapes_ode, rho0, t_span)
-    rho_series = []
-    for r in rho_t:
-        r_norm = r / r.sum()
-        rho_series.append(r_norm.detach().cpu().numpy())
+    rho0 = rho0.to(device)
+    rho0 = rho0 / rho0.sum()
+    ode_func = lambda t, rho: oxi_shapes_ode_with_target(t, rho, target_oxidation, gamma)
+    rho_t = odeint(ode_func, rho0, t_span)
+    rho_series = [r.detach().cpu().numpy() / r.sum().item() for r in rho_t]
     return np.array(rho_series)
 
 # --- Empirical priors (from experimental data)
@@ -103,8 +103,6 @@ rho_target_full = kpriors_to_istate(empirical_end_k)
 
 print("Empirical Start k-priors:", empirical_start_k)
 print("Empirical End k-priors:", empirical_end_k)
-print("Empirical Start occupancy (full):", np.round(rho_start_full, 3))
-print("Empirical Target occupancy (full):", np.round(rho_target_full, 3))
 print("Empirical Percent Oxidation (Start):", percent_oxidation(rho_start_full))
 print("Empirical Percent Oxidation (Target):", percent_oxidation(rho_target_full))
 print("Empirical Shannon Entropy (Start):", np.round(shannon_entropy(rho_start_full), 3))
@@ -113,7 +111,8 @@ print("Empirical Shannon Entropy (Target):", np.round(shannon_entropy(rho_target
 # --- Evolve the PDE from the empirical start occupancy
 t_span = torch.linspace(0.0, 1.0, 240, dtype=torch.float32)
 rho0_emp = torch.tensor(rho_start_full, dtype=torch.float32)
-rho_final_emp = evolve_oxi_shapes_pde(rho0_emp, t_span)
+target_oxid = percent_oxidation(np.array(rho_target_full))  # Convert to NumPy here
+rho_final_emp = evolve_oxi_shapes_pde_target(rho0_emp, t_span, target_oxidation=target_oxid)
 rho_final_emp_np = rho_final_emp.detach().cpu().numpy()
 
 print("\nPDE predicted final occupancy:", np.round(rho_final_emp_np, 3))
@@ -121,7 +120,7 @@ print("Predicted Percent Oxidation:", percent_oxidation(rho_final_emp_np))
 print("Predicted Shannon Entropy:", np.round(shannon_entropy(rho_final_emp_np), 3))
 
 # --- Generate full time series to estimate the Lyapunov exponent.
-rho_time_series = evolve_time_series(rho0_emp, t_span)
+rho_time_series = evolve_time_series(rho0_emp, t_span, target_oxidation=target_oxid)
 percent_series = np.array([percent_oxidation(r) for r in rho_time_series])
 lyap_exp_k = lyapunov_exponent_kbins(rho_time_series)
 print("Lyapunov Exponent (k-bin trajectory):", np.round(lyap_exp_k, 6))
@@ -169,7 +168,7 @@ model.load_state_dict(model_data['model_state_dict'])
 model.eval()
 
 # Define a function to simulate a trajectory using the ML model.
-def predict_i_states(model, initial_occ, steps=80):
+def predict_i_states(model, initial_occ, steps=240):
     trajectory = [initial_occ.copy()]
     current_occ = initial_occ.copy()
     for _ in range(steps):
@@ -182,7 +181,7 @@ def predict_i_states(model, initial_occ, steps=80):
 
 # Simulate trajectories for many molecules (here, using the same empirical start)
 num_molecules = 100
-trajectories = [predict_i_states(model, rho_start_full, steps=80) for _ in range(num_molecules)]
+trajectories = [predict_i_states(model, rho_start_full, steps=240) for _ in range(num_molecules)]
 
 # For analysis, we score predictions by confidence (max probability in final occupancy).
 final_preds = np.array([traj[-1] for traj in trajectories])
