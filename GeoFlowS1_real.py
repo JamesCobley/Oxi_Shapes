@@ -35,6 +35,9 @@ import pandas as pd
 from ripser import ripser
 from persim import plot_diagrams
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
 ###############################################################################
 # Differentiable Lambda: Trainable scaling for c-Ricci
 ###############################################################################
@@ -52,7 +55,7 @@ lambda_net = DifferentiableLambda(init_val=1.0)
 RT = 1.0
 
 ###############################################################################
-# Define the Discrete State Space (R=3) & Its Embedding
+# 1. Define the Discrete State Space (R=3) & Its Embedding
 ###############################################################################
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 allowed_edges = [
@@ -93,7 +96,7 @@ plt.title("Discrete Proteoform State Space (R=3)")
 plt.show()
 
 ###############################################################################
-# Initialize Occupancy and Solve φ Field (Poisson-like PDE)
+# 2. Initialize Occupancy and Solve φ Field (Poisson-like PDE)
 ###############################################################################
 # Initialize occupancy randomly.
 rho_vec = np.random.rand(num_states)
@@ -134,7 +137,7 @@ else:
 phi = {s: phi_vec[state_index[s]] for s in pf_states}
 
 ###############################################################################
-# Compute Enriched C-Ricci and Anisotropy
+# 3. Compute Enriched C-Ricci and Anisotropy
 ###############################################################################
 def compute_cotangent_laplacian(node_xy, triangles):
     N = node_xy.shape[0]
@@ -189,7 +192,7 @@ for (u, v) in G.edges():
     G[u][v]['penalty'] = penalty
 
 ###############################################################################
-# Sheaf Theory: Stalk Initialization & Consistency Check
+# 4. Sheaf Theory: Stalk Initialization & Consistency Check
 ###############################################################################
 def initialize_sheaf_stalks():
     stalks = {}
@@ -213,7 +216,7 @@ else:
     print("Sheaf stalks are consistent.")
 
 ###############################################################################
-# Neural ODE Function for Occupancy Evolution (Differentiable PDE Solver)
+# 5. Neural ODE Function for Occupancy Evolution (Differentiable PDE Solver)
 ###############################################################################
 def oxi_shapes_ode(t, rho):
     """
@@ -271,16 +274,16 @@ def evolve_oxi_shapes_pde(rho0, t_span):
     return final_rho
 
 ###############################################################################
-# Data Generation: Create (initial -> final) Occupancy Pairs via PDE Solver
+# 6. Data Generation: Create (initial -> final) Occupancy Pairs via PDE Solver
 ###############################################################################
 def create_dataset_ODE(num_samples=1000, t_span=None):
     if t_span is None:
-        t_span = torch.linspace(0.0, 1.0, 80, dtype=torch.float32)
+        t_span = torch.linspace(0.0, 1.0, 80, dtype=torch.float32, device=device)
     X, Y = [], []
     for _ in range(num_samples):
         vec = np.random.rand(num_states)
         vec /= vec.sum()
-        rho0 = torch.tensor(vec, dtype=torch.float32)
+        rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
         final_rho = evolve_oxi_shapes_pde(rho0, t_span)
         X.append(rho0.detach().numpy())
         Y.append(final_rho.detach().numpy())
@@ -304,7 +307,7 @@ class OxiNet(nn.Module):
         return torch.softmax(x, dim=1)
 
 ###############################################################################
-# Training and Evaluation Functions
+# 8. Training and Evaluation Functions
 ###############################################################################
 def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5):
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -344,7 +347,7 @@ def evaluate_model(model, X_test, Y_test):
     return pred_test.numpy(), test_loss
 
 ###############################################################################
-# Main Execution: Data Generation, Training, and Evaluation
+# 9. Main Execution: Data Generation, Training, and Evaluation
 ###############################################################################
 if __name__ == "__main__":
     print("Generating dataset using PDE-based evolution (Neural ODE)...")
