@@ -137,6 +137,16 @@ class OxiShapeODE(nn.Module):
             A[i] = grad_sum / len(nbrs) if nbrs else 0.0
         return A
 
+    def compute_entropy_contributions(self, rho, c_ricci):
+        # ΔS_total = ΔS_mass + ΔS_curvature + ΔS_degeneracy
+        # Mass diffusion entropy
+        rho_entropy = -torch.sum(rho * torch.log(rho + 1e-12))
+        # Curvature-weighted redox effort (less entropy when curvature is high)
+        curvature_penalty = torch.sum(c_ricci**2)
+        # Degeneracy from available non-zero i-states
+        degeneracy = torch.sum((rho > 0.01).float())
+        return rho_entropy, curvature_penalty, degeneracy
+
     def forward(self, t, rho):
         L_t = self.compute_cotangent_laplacian()
         lambda_val = self.lambda_net()
@@ -155,6 +165,8 @@ class OxiShapeODE(nn.Module):
                 inflow[j] += rho[i] * p_ij
                 outflow[i] += rho[i] * p_ij
         return inflow - outflow
+
+# Note: The entropy components from `compute_entropy_contributions()` can be called externally during ODE rollout or logging.
 
 ###############################################################################
 # 4. Persistent Homology — Betti Number Tracker
