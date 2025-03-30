@@ -129,11 +129,13 @@ class OxiShapeODE(nn.Module):
             A[i] = grad_sum / len(nbrs) if nbrs else 0.0
         return A
 
-    def compute_entropy_contributions(self, rho, c_ricci):
-        # ΔS = ΔS_mass + ΔS_conf + ΔS_degen (heuristic terms)
-        S_mass = -torch.sum(rho * torch.log(rho + 1e-12))
-        S_conf = torch.sum(c_ricci**2)  # Higher curvature ~ lower conformational flexibility
-        S_degen = torch.std(rho)  # Heuristic for degeneracy
+    def compute_entropy_terms(self, rho):
+        S_mass = torch.sum(-rho * torch.log(rho + 1e-12))
+        S_degen = torch.tensor(np.log(len(rho)))
+        # Placeholder for conformational entropy using curvature norm
+        L_t = self.compute_cotangent_laplacian()
+        c_ricci = torch.matmul(L_t, rho)
+        S_conf = torch.sum(torch.abs(c_ricci))
         return S_mass, S_conf, S_degen
 
     def forward(self, t, rho):
@@ -141,6 +143,7 @@ class OxiShapeODE(nn.Module):
         lambda_val = self.lambda_net()
         c_ricci = lambda_val * torch.matmul(L_t, rho)
         A_field = self.compute_anisotropy(c_ricci)
+
         inflow = torch.zeros_like(rho)
         outflow = torch.zeros_like(rho)
         for i, s_i in enumerate(pf_states):
@@ -149,11 +152,15 @@ class OxiShapeODE(nn.Module):
                 j = self.state_index[nbr]
                 delta_E = c_ricci[j] - c_ricci[i]
                 S_term = torch.log(rho[j] + 1e-12) - torch.log(rho[i] + 1e-12)
-                delta_f = delta_E + 0.5*S_term - A_field[j]
+                delta_f = delta_E + 0.5 * S_term - A_field[j]
                 p_ij = torch.exp(-delta_f / self.RT)
                 inflow[j] += rho[i] * p_ij
                 outflow[i] += rho[i] * p_ij
-        return inflow - outflow  # shape updates under constraint
+
+        # Log entropy components (for optional use downstream)
+        self.S_mass, self.S_conf, self.S_degen = self.compute_entropy_terms(rho)
+
+        return inflow - outflow
 
 ###############################################################################
 # 4. Persistent Homology — Betti Number Tracker
