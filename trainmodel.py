@@ -14,15 +14,7 @@ learning model. It works in the following steps:
   5. Define a PyTorch neural network that learns to predict the final occupancy given the initial occupancy.
   6. Train and evaluate the model.
 """
-#!/usr/bin/env python
-# coding: utf-8
 
-"""
-Oxi-Shapes + Supervised ML Pipeline with Persistent Homology (Betti Numbers)
-
-This script combines the Oxi‑Shapes geometric evolution with a supervised machine
-learning model and persistent homology analysis.
-"""
 !pip install torchdiffeq ripser persim
 
 import numpy as np
