@@ -228,7 +228,7 @@ else:
     print("Sheaf stalks are consistent.")
 
 ###############################################################################
-# Neural ODE Function with External Forcing for Dynamic Probability
+# Neural ODE Function 
 ###############################################################################
 
 def oxi_shapes_ode(t, rho):
