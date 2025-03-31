@@ -327,23 +327,58 @@ def evolve_oxi_shapes_pde_target(rho0, t_span, target_oxidation, gamma=0.1):
     return final_rho
 
 ###############################################################################
-# 6. Data Generation: Create (initial -> final) Occupancy Pairs with External Forcing
+# 6. Data Generation (Systematic Oxi-Shape Sampling)
 ###############################################################################
-def create_dataset_ODE_target(num_samples=1000, t_span=None):
+def generate_systematic_initials():
+    initials = []
+    # (1) Single i-state occupancy
+    for i in range(8):
+        vec = np.zeros(8)
+        vec[i] = 1.0
+        initials.append(vec)
+
+    # (2) Flat occupancy
+    initials.append(np.full(8, 1.0 / 8))
+
+    # (3) Curved within k=1 (e.g., 010 peak)
+    curved_k1 = np.array([0.0, 0.15, 0.7, 0.15, 0.0, 0.0, 0.0, 0.0])
+    initials.append(curved_k1 / curved_k1.sum())
+
+    # (4) Curved within k=2 (e.g., 101 peak)
+    curved_k2 = np.array([0.0, 0.0, 0.0, 0.0, 0.15, 0.7, 0.15, 0.0])
+    initials.append(curved_k2 / curved_k2.sum())
+
+    # (5) Flat in k=0 & k=1, peaked in k=2
+    hybrid = np.array([0.05, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.05])
+    initials.append(hybrid / hybrid.sum())
+
+    # (6) Bell shape across k
+    bell = np.array([0.05, 0.1, 0.1, 0.1, 0.15, 0.15, 0.15, 0.2])
+    initials.append(bell / bell.sum())
+
+    # (7) Geometric gradient (left to right in flat_pos)
+    gradient = np.linspace(0.1, 0.9, 8)
+    initials.append(gradient / gradient.sum())
+
+    return initials
+
+def create_dataset_ODE_target(num_samples=None, t_span=None):
     if t_span is None:
         t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
     X, Y, targets = [], [], []
-    # Possible target percent oxidation values in 5% bins.
+    
+    initials = generate_systematic_initials()
     possible_targets = np.arange(0, 100, 5)
-    for _ in range(num_samples):
-        vec = np.random.rand(num_states)
-        vec /= vec.sum()
-        rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
-        target_ox = float(np.random.choice(possible_targets))
-        final_rho = evolve_oxi_shapes_pde_target(rho0, t_span, target_ox, gamma=0.1)
-        X.append(rho0.detach().cpu().numpy())
-        Y.append(final_rho.detach().cpu().numpy())
-        targets.append(target_ox)
+
+    for vec in initials:
+        for _ in range(5):  # replicate each shape to allow evolution with different targets
+            rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
+            target_ox = float(np.random.choice(possible_targets))
+            final_rho = evolve_oxi_shapes_pde_target(rho0, t_span, target_ox, gamma=0.0)  # note: gamma=0.0
+            X.append(rho0.detach().cpu().numpy())
+            Y.append(final_rho.detach().cpu().numpy())
+            targets.append(target_ox)
+
     return np.array(X), np.array(Y), np.array(targets)
 
 ###############################################################################
@@ -407,32 +442,30 @@ def evaluate_model(model, X_test, Y_test):
 # 9. Main Execution: Data Generation, Training, and Evaluation
 ###############################################################################
 if __name__ == "__main__":
-    print("Generating dataset using PDE-based evolution with external forcing...")
+    print("Generating dataset using systematic Oxi-Shape sampling...")
     t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
-    X, Y, targets = create_dataset_ODE_target(num_samples=2000, t_span=t_span)
+    X, Y, targets = create_dataset_ODE_target(t_span=t_span)
     perm = np.random.permutation(len(X))
     X, Y, targets = X[perm], Y[perm], targets[perm]
     split = int(0.8 * len(X))
     X_train, Y_train = X[:split], Y[:split]
     X_val, Y_val = X[split:], Y[split:]
-    
+
     print("Building and training the neural network (OxiFlowNet)...")
     model = OxiNet(input_dim=8, hidden_dim=32, output_dim=8).to(device)
     train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5)
-    
+
     print("\nEvaluating on validation data...")
     pred_val, val_loss = evaluate_model(model, X_val, Y_val)
     print(f"Validation Loss: {val_loss:.6f}")
-    
-    # Save the trained model and metadata for later use.
+
     torch.save({
         'model_state_dict': model.state_dict(),
         'pf_states': pf_states,
         'flat_pos': flat_pos
     }, "oxinet_model.pt")
     print("✅ Trained model saved to 'oxinet_model.pt'")
-    
-    # Display a few sample predictions.
+
     for idx in np.random.choice(len(X_val), 3, replace=False):
         init_occ = X_val[idx]
         true_final = Y_val[idx]
