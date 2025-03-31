@@ -209,111 +209,130 @@ else:
     print("Sheaf stalks are consistent.")
 
 ###############################################################################
-# Neural ODE Function 
+# Global Parameters
 ###############################################################################
 
-def oxi_shapes_ode_digital(t, rho):
-    """
-    Digital molecule-level ODE with entropy, energy, and C-Ricci effects.
-    Each molecule (0.01 unit) may probabilistically move, but only as a whole.
-    Geometry is updated every 5 steps (via step counter).
-    """
-    rho = rho.to(device)
+MAX_MOVES_PER_STEP = 20  # Maximum number of molecule actions allowed per step
+PDE_UPDATE_INTERVAL = 5
+pde_step_counter = 0
 
-    # Quantize to 100 molecules (digital occupancy)
+###############################################################################
+# ALIVE ODE: Action Limited Evolution Engine
+###############################################################################
+
+def oxi_shapes_ode_alive(t, rho):
+    """
+    ALIVE: Action Limited Evolution Engine
+    Discrete molecule actions under capped external force, shaped by geometry.
+    Geometry (c-Ricci) and anisotropy updated every N steps. Only full molecules can move.
+    """
+    with torch.no_grad():
+        rho = rho.to(device)
+
+        # Quantize to 100 molecules
         counts = torch.round(rho * 100)
         counts = counts.clamp(0, 100)
         counts[-1] = 100 - counts[:-1].sum()
         rho = counts / 100.0
 
-      # PDE re-solve if needed (every N steps)
+        # PDE geometry update every N steps
         global pde_step_counter
         pde_step_counter += 1
-        if pde_step_counter % PDE_UPDATE_INTERVAL == 1:
+        if pde_step_counter % PDE_UPDATE_INTERVAL == 0:
             update_c_ricci_from_rho(rho)
 
-    # Anisotropy field A(x)
-    A = torch.zeros(num_states, device=device)
-    for i, s in enumerate(pf_states):
-        nbrs = neighbor_indices[s]
-        if len(nbrs) == 0:
-            continue
-        grad_vals = []
-        for j in nbrs:
-            dist = torch.norm(flat_pos_tensor[i] - flat_pos_tensor[j])
-            if dist > 1e-6:
-                grad_vals.append(torch.abs(c_ricci[i] - c_ricci[j]) / dist)
-        A[i] = sum(grad_vals) / len(grad_vals) if grad_vals else 0.0
+        inflow = torch.zeros_like(rho, device=device)
+        outflow = torch.zeros_like(rho, device=device)
 
-    # Degeneracy for each state
-    degeneracy_map = {0: 1, 1: 3, 2: 3, 3: 1}
-    degeneracy = torch.tensor([
-        degeneracy_map[s.count('1')] for s in pf_states
-    ], dtype=torch.float32, device=device)
+        # Degeneracy
+        degeneracy_map = {0: 1, 1: 3, 2: 3, 3: 1}
+        degeneracy = torch.tensor([
+            degeneracy_map[s.count('1')] for s in pf_states
+        ], dtype=torch.float32, device=device)
 
-    # Constants
+        # Constants
+        baseline_DeltaE = 1.0
+        Delta_x = 1.0
+        RT = 1.0
+
+        # Anisotropy field A(x)
+        global anisotropy
+        anisotropy = torch.zeros(num_states, device=device)
+        for i, s in enumerate(pf_states):
+            nbrs = neighbor_indices[s]
+            if len(nbrs) == 0:
+                continue
+            grad_vals = []
+            for j in nbrs:
+                dist = torch.norm(flat_pos_tensor[i] - flat_pos_tensor[j])
+                if dist > 1e-6:
+                    grad_vals.append(torch.abs(c_ricci[i] - c_ricci[j]) / dist)
+            anisotropy[i] = sum(grad_vals) / len(grad_vals) if grad_vals else 0.0
+
+        # Randomize number of molecules allowed to act
+        total_moves = np.random.randint(0, MAX_MOVES_PER_STEP + 1)
+
+        # Get list of indices with molecules
+        candidate_indices = [i for i, c in enumerate(counts) if c > 0]
+
+        for _ in range(total_moves):
+            if not candidate_indices:
+                break
+            i = np.random.choice(candidate_indices)
+            s = pf_states[i]
+
+            # Build transition probability list
+            neighbors = neighbor_indices[s]
+            if not neighbors:
+                inflow[i] += 0.01
+                continue
+
+            probs = []
+            for j in neighbors:
+                delta_S = compute_entropy_cost(i, j, rho)
+                delta_f = (baseline_DeltaE * torch.exp(rho[i]) - c_ricci[i] + delta_S) / RT
+                p_ij = torch.exp(-delta_f) * torch.exp(-anisotropy[j])
+                probs.append(p_ij.item())
+
+            probs = torch.tensor(probs, dtype=torch.float32, device=device)
+            if probs.sum() < 1e-8:
+                inflow[i] += 0.01
+                continue
+
+            probs /= probs.sum()
+            j_choice = torch.multinomial(probs, 1).item()
+            target_idx = neighbor_indices[s][j_choice]
+
+            inflow[target_idx] += 0.01
+            outflow[i] += 0.01
+
+        # Remainder of molecules stay in place
+        for i in range(num_states):
+            inflow[i] += (counts[i] / 100.0) - outflow[i]
+
+        return inflow - outflow
+
+###############################################################################
+# Geometry Update
+###############################################################################
+
+def update_c_ricci_from_rho(rho):
+    global c_ricci
+    c_ricci = lambda_net() * (L_torch @ rho)
+
+###############################################################################
+# Entropy Cost Function
+###############################################################################
+
+def compute_entropy_cost(i, j, rho):
     baseline_DeltaE = 1.0
-    Delta_x = 1.0
-    RT = 1.0
-
-    # Initialize flows
-    inflow = torch.zeros_like(rho, device=device)
-    outflow = torch.zeros_like(rho, device=device)
-
-    # Iterate over states
-    for i, s in enumerate(pf_states):
-        occ_i = rho[i]
-
-        # Skip if no whole molecule present
-        if occ_i < 0.0099:
-            inflow[i] += occ_i
-            continue
-
-        num_molecules = int(round(occ_i / 0.01))
-        if num_molecules == 0:
-            inflow[i] += occ_i
-            continue
-
-        # Base probability budget per molecule
-        for _ in range(num_molecules):
-            p_stay = 0.5
-            dynamic_pool = 0.5
-
-            # Transition pool among neighbors
-            p_raw = []
-            p_total = 0.0
-
-            for j in neighbor_indices[s]:
-                # --- ΔS computation ---
-                mass_heat = 0.1
-                reaction_heat = 0.01 * baseline_DeltaE
-                conformational_cost = torch.abs(c_ricci[j])
-                degeneracy_penalty = 1.0 / degeneracy[j]
-                delta_S = mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
-
-                # --- Δf computation ---
-                delta_f = (
-                    baseline_DeltaE * torch.exp(occ_i * Delta_x)
-                    - c_ricci[i]
-                    + delta_S
-                ) / RT
-
-                raw_p = torch.exp(-delta_f) * torch.exp(-A[j])
-                p_raw.append((j, raw_p))
-                p_total += raw_p.item()
-
-            # Normalize and scale to dynamic pool (0.5 max)
-            for j, raw in p_raw:
-                p_scaled = (raw / (p_total + 1e-8)) * dynamic_pool
-                inflow[j] += 0.01 * p_scaled
-                outflow[i] += 0.01 * p_scaled
-
-            # Remaining to stay
-            p_used = sum([(raw / (p_total + 1e-8)) * dynamic_pool for _, raw in p_raw])
-            p_stay_actual = 1.0 - p_used
-            inflow[i] += 0.01 * p_stay_actual
-
-    return inflow - outflow
+    mass_heat = 0.1
+    reaction_heat = 0.01 * baseline_DeltaE
+    conformational_cost = torch.abs(c_ricci[j])
+    degeneracy_map = {0: 1, 1: 3, 2: 3, 3: 1}
+    deg = degeneracy_map[pf_states[j].count('1')]
+    degeneracy_penalty = 1.0 / deg
+    return mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
 
 ###############################################################################
 # Geodesic Tracking Functions
@@ -330,7 +349,7 @@ def dominant_geodesic(trajectory, geodesics):
     return tuple(best_path) if best_path else None
 
 def evolve_time_series_and_geodesic(rho0, t_span):
-    rho_t = odeint(oxi_shapes_ode_digital, rho0, t_span)  # ← Use digital ODE here
+    rho_t = odeint(oxi_shapes_ode_alive, rho0, t_span)  
     dominant_path = []
     for r in rho_t:
         max_idx = torch.argmax(r).item()
