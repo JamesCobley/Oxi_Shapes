@@ -337,6 +337,7 @@ def dominant_geodesic(trajectory, geodesics):
 
 def evolve_time_series_and_geodesic(rho0, t_span):
     rho_t = odeint(oxi_shapes_ode, rho0, t_span)
+    rho_t = rho_t / rho_t.sum(dim=1, keepdim=True)  # normalize each timepoint
     dominant_path = []
     for r in rho_t:
         max_idx = torch.argmax(r).item()
