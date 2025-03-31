@@ -211,19 +211,81 @@ else:
 ###############################################################################
 # Neural ODE Function 
 ###############################################################################
+def update_phi(rho_vec, max_attempts=3):
+    """
+    Update φ using occupancy rho_vec with adaptive flexibility.
+    Tries a few times with increasing damping if necessary.
+    """
+    phi_vec = np.zeros(num_states)
+    kappa = 1.0
+    tol = 1e-3
+
+    for attempt in range(max_attempts):
+        damping = 0.05 / (attempt + 1)
+        for _ in range(1000):
+            nonlin = 0.5 * kappa * rho_vec * np.exp(2 * phi_vec)
+            F = L @ phi_vec + nonlin
+            J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
+            try:
+                delta_phi = np.linalg.solve(J, -F)
+            except np.linalg.LinAlgError:
+                break
+
+            for i in range(num_states):
+                if rho_vec[i] <= 1e-14:
+                    delta_phi[i] = 0.0
+            phi_vec += damping * delta_phi
+            if np.linalg.norm(delta_phi) < tol:
+                return phi_vec
+    print("⚠️ Warning: φ did not converge fully.")
+    return phi_vec
+
+
+def update_geometry_fields(rho_vec):
+    """
+    Recomputes φ, c-Ricci, and anisotropy A(x) from the current occupancy.
+    """
+    global phi_vec, c_ricci_nodes, A_field
+    phi_vec = update_phi(rho_vec)
+    lambda_value = lambda_net().detach().cpu().numpy()
+    c_ricci_vec = lambda_value * (L_np @ rho_vec)
+    c_ricci_nodes = {pf_states[i]: c_ricci_vec[i] for i in range(num_states)}
+
+    for (u, v) in G.edges():
+        G[u][v]['cRicci'] = (c_ricci_nodes[u] + c_ricci_nodes[v]) / 2.0
+
+    A_field = {}
+    for s in pf_states:
+        nbrs = list(G.neighbors(s))
+        grad_sum = 0.0
+        count = 0
+        for nbr in nbrs:
+            dist = np.linalg.norm(np.array(flat_pos[s]) - np.array(flat_pos[nbr]))
+            if dist > 1e-6:
+                grad_sum += abs(c_ricci_nodes[s] - c_ricci_nodes[nbr]) / dist
+                count += 1
+        A_field[s] = grad_sum / count if count > 0 else 0.0
+
+
 def oxi_shapes_ode(t, rho):
     """
     Monte Carlo-inspired redox engine using C-Ricci and entropy-based ΔS.
-    Implements inertial occupancy: no i-state moves unless acted upon.
-    Enforces: 
-      - Conservation of probability (∑P = 1)
-      - Minimum stay probability P_stay ≥ 0.5
-      - Dynamic P_red and P_ox up to 0.25 each
+    Implements inertial occupancy and probability constraints.
+    Updates PDE-derived fields every 5 steps.
     """
     rho = rho.to(device)
-    c_ricci = lambda_net() * (L_torch @ rho)
 
-    # Anisotropy field A(x)
+    if not hasattr(oxi_shapes_ode, "step"):
+        oxi_shapes_ode.step = 0
+
+    if oxi_shapes_ode.step % 5 == 0:
+        update_geometry_fields(rho.detach().cpu().numpy())
+
+    oxi_shapes_ode.step += 1
+
+    lambda_val = lambda_net()
+    c_ricci = lambda_val * (L_torch @ rho)
+
     A = torch.zeros(num_states, device=device)
     for i, s in enumerate(pf_states):
         nbrs = neighbor_indices[s]
@@ -251,9 +313,8 @@ def oxi_shapes_ode(t, rho):
 
     for i, s in enumerate(pf_states):
         occ_i = rho[i]
-
-        transitions = []
-        p_total_action = 0.0
+        p_neighbors = []
+        p_total = 0.0
 
         for j in neighbor_indices[s]:
             mass_heat = 0.1 * occ_i
@@ -269,23 +330,21 @@ def oxi_shapes_ode(t, rho):
             ) / RT
 
             raw_p_ij = torch.exp(-delta_f) * torch.exp(-A[j])
+
             if raw_p_ij > 1e-6:
-                transitions.append((j, raw_p_ij))
-                p_total_action += raw_p_ij
+                p_neighbors.append((j, raw_p_ij))
+                p_total += raw_p_ij
 
-        scaling_factor = min(0.5 / (p_total_action + 1e-8), 1.0)
-        stay_prob = 1.0 - scaling_factor * p_total_action
-        stay_prob = max(stay_prob, 0.5)
-
-        # Molecules that stay
-        inflow[i] += occ_i * stay_prob
-        outflow[i] += occ_i * (1.0 - stay_prob)
-
-        # Molecules that move
-        for j, raw_p_ij in transitions:
-            norm_p = scaling_factor * raw_p_ij
-            inflow[j] += occ_i * norm_p
-            outflow[i] += occ_i * norm_p
+        max_transferable = min(occ_i, 0.5)
+        if p_total > 0:
+            for j, raw_p_ij in p_neighbors:
+                normalized_p = raw_p_ij / (p_total + 1e-8)
+                flow = max_transferable * normalized_p
+                inflow[j] += flow
+                outflow[i] += flow
+            inflow[i] += occ_i - max_transferable
+        else:
+            inflow[i] += occ_i
 
     return inflow - outflow
 
