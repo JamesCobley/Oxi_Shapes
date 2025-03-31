@@ -379,10 +379,29 @@ def generate_systematic_initials():
 
     return initials
 
+from ripser import ripser
+from persim import plot_diagrams
+
+# --- Optional: persistent entropy
+def persistent_diagram(rho):
+    # Convert occupancy to distance matrix (1D into 2D)
+    dist = np.abs(rho[:, None] - rho[None, :])
+    dgms = ripser(dist, distance_matrix=True, maxdim=1)['dgms']
+    return dgms
+
+def topological_entropy(dgm):
+    if len(dgm) == 0 or len(dgm[0]) == 0:
+        return 0.0
+    lifespans = dgm[0][:, 1] - dgm[0][:, 0]
+    probs = lifespans / np.sum(lifespans)
+    entropy = -np.sum(probs * np.log2(probs + 1e-10))
+    return entropy
+
+# --- Replace loop in your create_dataset_ODE_target:
 def create_dataset_ODE_target(num_samples=None, t_span=None):
     if t_span is None:
         t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
-    X, Y, targets, geos = [], [], [], []
+    X, Y, targets, topo_H0_entropy = [], [], [], []
 
     initials = generate_systematic_initials()
     possible_targets = np.arange(0, 100, 5)
@@ -394,18 +413,26 @@ def create_dataset_ODE_target(num_samples=None, t_span=None):
             rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
             final_rho = rho_t[-1]
             final_rho = final_rho / final_rho.sum()
+
+            # --- Persistent homology
+            final_np = final_rho.detach().cpu().numpy()
+            dgms = persistent_diagram(final_np)
+            entropy_H0 = topological_entropy(dgms[0])
+
+            # --- Store everything
             X.append(rho0.detach().cpu().numpy())
-            Y.append(final_rho.detach().cpu().numpy())
+            Y.append(final_np)
             targets.append(target_ox)
+            topo_H0_entropy.append(entropy_H0)
+
             if geopath:
                 geo_counter[geopath] += 1
-                geos.append(geopath)
 
     print("Most traversed geodesics:")
     for path, count in geo_counter.most_common():
         print(" → ".join(path), "| Count:", count)
 
-    return np.array(X), np.array(Y), np.array(targets)
+    return np.array(X), np.array(Y), np.array(targets), np.array(topo_H0_entropy)
 
 ###############################################################################
 # Neural Network for Learning (OxiFlowNet)
