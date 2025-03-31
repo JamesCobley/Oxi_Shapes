@@ -90,42 +90,54 @@ plt.show()
 ###############################################################################
 # Initialize Occupancy and Solve φ Field (Poisson-like PDE)
 ###############################################################################
-# Initialize occupancy randomly.
-rho_vec = np.random.rand(num_states)
-rho_vec /= rho_vec.sum()
-occupancy = {pf_states[i]: rho_vec[i] for i in range(num_states)}
 
-# Build a simple Laplacian L from graph connectivity.
-A = np.zeros((num_states, num_states))
-for i, s1 in enumerate(pf_states):
-    for j, s2 in enumerate(pf_states):
-        if G.has_edge(s1, s2):
-            A[i, j] = 1
-D = np.diag(A.sum(axis=1))
-L = D - A
+# Function to solve φ field given current occupancy vector (rho)
+def solve_phi_field(rho_vec, kappa=1.0, max_iter=10000, tol=1e-3, damping=0.05):
+    """
+    Solves the non-linear φ field based on Poisson-like PDE:
+    Lφ + 0.5 * κ * ρ * exp(2φ) = 0
+    """
+    # Ensure rho is normalized (volume conserving)
+    rho_vec = rho_vec / np.sum(rho_vec)
 
-phi_vec = np.zeros(num_states)
-kappa = 1.0
-max_iter = 10000
-tol = 1e-3
-damping = 0.05
+    # Graph Laplacian from state-space connectivity
+    A = np.zeros((num_states, num_states))
+    for i, s1 in enumerate(pf_states):
+        for j, s2 in enumerate(pf_states):
+            if G.has_edge(s1, s2):
+                A[i, j] = 1
+    D = np.diag(A.sum(axis=1))
+    L = D - A  # Combinatorial Laplacian
 
-for iter in range(max_iter):
-    nonlin = 0.5 * kappa * rho_vec * np.exp(2 * phi_vec)
-    F = L @ phi_vec + nonlin
-    J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
-    delta_phi = np.linalg.solve(J, -F)
-    for i, s in enumerate(pf_states):
-        if occupancy[s] <= 1e-14:
-            delta_phi[i] = 0.0
-    phi_vec += damping * delta_phi
-    if np.linalg.norm(delta_phi) < tol:
-        print(f"φ converged after {iter+1} iterations.")
-        break
-else:
-    print("φ did not converge within iteration limit.")
+    # Initialize φ
+    phi_vec = np.zeros(num_states)
 
-phi = {s: phi_vec[state_index[s]] for s in pf_states}
+    for iter in range(max_iter):
+        # Nonlinear field term
+        nonlin = 0.5 * kappa * rho_vec * np.exp(2 * phi_vec)
+        F = L @ phi_vec + nonlin
+
+        # Jacobian for Newton-Raphson
+        J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
+
+        # Solve for delta
+        delta_phi = np.linalg.solve(J, -F)
+
+        # Inert states (zero occupancy) don't change φ
+        delta_phi[rho_vec <= 1e-14] = 0.0
+
+        phi_vec += damping * delta_phi
+
+        # Convergence check
+        if np.linalg.norm(delta_phi) < tol:
+            print(f"φ converged after {iter+1} iterations.")
+            break
+    else:
+        print("φ did not converge within iteration limit.")
+
+    # Return φ as both dict and array
+    phi_dict = {s: phi_vec[state_index[s]] for s in pf_states}
+    return phi_vec, phi_dict
 
 ###############################################################################
 # Compute Enriched C-Ricci and Anisotropy
@@ -153,36 +165,32 @@ def compute_cotangent_laplacian(node_xy, triangles):
         L_t[i,i] = np.sum(W[i,:])
     return L_t
 
-# Precompute cotangent Laplacian in NumPy, then convert to torch.
 L_np = compute_cotangent_laplacian(node_xy, triangles)
 L_torch = torch.tensor(L_np, dtype=torch.float32, device=device)
 
-# For visualization, we use a fixed lambda value (from the differentiable lambda).
-lambda_value = lambda_net().detach().cpu().numpy()
-c_ricci_vec = lambda_value * (L_np @ rho_vec)
-c_ricci_nodes = {pf_states[i]: c_ricci_vec[i] for i in range(num_states)}
+c_ricci = torch.zeros(num_states, device=device)
+anisotropy = torch.zeros(num_states, device=device)
 
-# Assign edgewise c-Ricci (average of endpoints).
-for (u, v) in G.edges():
-    G[u][v]['cRicci'] = (c_ricci_nodes[u] + c_ricci_nodes[v]) / 2.0
+def update_c_ricci_from_rho(rho):
+    """
+    Computes c-Ricci curvature and anisotropy from current occupancy vector.
+    Updates global c_ricci and anisotropy tensors.
+    """
+    global c_ricci, anisotropy
+    rho = rho / rho.sum()  # Ensure volume conservation
 
-# Compute anisotropy field A(x) for each node.
-A_field = {}
-for s in pf_states:
-    nbrs = list(G.neighbors(s))
-    grad_sum = 0.0
-    count = 0
-    for nbr in nbrs:
-        dist = np.linalg.norm(np.array(flat_pos[s]) - np.array(flat_pos[nbr]))
-        if dist > 1e-6:
-            grad_sum += abs(c_ricci_nodes[s] - c_ricci_nodes[nbr]) / dist
-            count += 1
-    A_field[s] = grad_sum / count if count > 0 else 0.0
+    # Ricci field: Laplacian deformation under density
+    c_ricci = lambda_net() * (L_torch @ rho)
 
-# For each edge, assign a penalty factor.
-for (u, v) in G.edges():
-    penalty = np.exp(- (A_field[u] + A_field[v]) / 2.0)
-    G[u][v]['penalty'] = penalty
+    # Anisotropy field: gradient of c-Ricci across neighbors
+    for i, s in enumerate(pf_states):
+        nbrs = neighbor_indices[s]
+        grad_vals = []
+        for j in nbrs:
+            dist = torch.norm(flat_pos_tensor[i] - flat_pos_tensor[j])
+            if dist > 1e-6:
+                grad_vals.append(torch.abs(c_ricci[i] - c_ricci[j]) / dist)
+        anisotropy[i] = sum(grad_vals) / len(grad_vals) if grad_vals else 0.0
 
 ###############################################################################
 # Sheaf Theory: Stalk Initialization & Consistency Check
@@ -255,20 +263,6 @@ def oxi_shapes_ode_alive(t, rho):
         Delta_x = 1.0
         RT = 1.0
 
-        # Anisotropy field A(x)
-        global anisotropy
-        anisotropy = torch.zeros(num_states, device=device)
-        for i, s in enumerate(pf_states):
-            nbrs = neighbor_indices[s]
-            if len(nbrs) == 0:
-                continue
-            grad_vals = []
-            for j in nbrs:
-                dist = torch.norm(flat_pos_tensor[i] - flat_pos_tensor[j])
-                if dist > 1e-6:
-                    grad_vals.append(torch.abs(c_ricci[i] - c_ricci[j]) / dist)
-            anisotropy[i] = sum(grad_vals) / len(grad_vals) if grad_vals else 0.0
-
         # Randomize number of molecules allowed to act
         total_moves = np.random.randint(0, MAX_MOVES_PER_STEP + 1)
 
@@ -311,14 +305,6 @@ def oxi_shapes_ode_alive(t, rho):
             inflow[i] += (counts[i] / 100.0) - outflow[i]
 
         return inflow - outflow
-
-###############################################################################
-# Geometry Update
-###############################################################################
-
-def update_c_ricci_from_rho(rho):
-    global c_ricci
-    c_ricci = lambda_net() * (L_torch @ rho)
 
 ###############################################################################
 # Entropy Cost Function
