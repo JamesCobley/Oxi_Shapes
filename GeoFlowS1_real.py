@@ -416,8 +416,9 @@ from collections import Counter
 geo_counter = Counter()
 
 ###############################################################################
-# Data Generation (Systematic Oxi-Shape Sampling)
+# Data Generation (Systematic Oxi-Shape Sampling + Geodesic + Topology)
 ###############################################################################
+
 def generate_systematic_initials():
     initials = []
     # (1) Single i-state occupancy
@@ -454,12 +455,14 @@ def generate_systematic_initials():
 from ripser import ripser
 from persim import plot_diagrams
 
-# --- Optional: persistent entropy
+# Persistent homology diagram
+
 def persistent_diagram(rho):
-    # Convert occupancy to distance matrix (1D into 2D)
     dist = np.abs(rho[:, None] - rho[None, :])
     dgms = ripser(dist, distance_matrix=True, maxdim=1)['dgms']
     return dgms
+
+# Persistent entropy
 
 def topological_entropy(dgm):
     if len(dgm) == 0 or len(dgm[0]) == 0:
@@ -469,25 +472,30 @@ def topological_entropy(dgm):
     entropy = -np.sum(probs * np.log2(probs + 1e-10))
     return entropy
 
-# --- Replace loop in your create_dataset_ODE_target:
-def create_dataset_ODE_target(num_samples=None, t_span=None):
+from collections import Counter
+
+def create_dataset_ODE_alive(t_span=None):
     if t_span is None:
         t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
-    X, Y, targets, geos = [], [], [], []
 
+    X, Y, geos = [], [], []
+    geo_counter = Counter()
     initials = generate_systematic_initials()
-    possible_targets = np.arange(0, 100, 5)
 
     for vec in initials:
         for _ in range(5):
             rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
-            target_ox = float(np.random.choice(possible_targets))
             rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
             final_rho = rho_t[-1]
             final_rho = final_rho / final_rho.sum()
+
+            # Digital enforcement
+            assert torch.allclose(final_rho * 100, torch.round(final_rho * 100), atol=1e-6), \
+                f"Non-digital occupancy detected: {final_rho}"
+
             X.append(rho0.detach().cpu().numpy())
             Y.append(final_rho.detach().cpu().numpy())
-            targets.append(target_ox)
+
             if geopath:
                 geo_counter[geopath] += 1
                 geos.append(geopath)
@@ -496,7 +504,7 @@ def create_dataset_ODE_target(num_samples=None, t_span=None):
     for path, count in geo_counter.most_common():
         print(" → ".join(path), "| Count:", count)
 
-    return np.array(X), np.array(Y), np.array(targets)
+    return np.array(X), np.array(Y), geos
 
 ###############################################################################
 # Neural Network for Learning (OxiFlowNet)
@@ -518,7 +526,8 @@ class OxiNet(nn.Module):
 ###############################################################################
 # Training and Evaluation Functions
 ###############################################################################
-def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5, lambda_geo=0.5):
+def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3,
+                lambda_topo=0.5, lambda_vol=0.5, lambda_geo=0.5, geodesics=None):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
@@ -562,7 +571,7 @@ def evaluate_model(model, X_test, Y_test):
 if __name__ == "__main__":
     print("Generating dataset using systematic Oxi-Shape sampling...")
     t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
-    X, Y, targets = create_dataset_ODE_target(t_span=t_span)
+    X, Y, geos = create_dataset_ODE_alive(t_span=t_span)
     perm = np.random.permutation(len(X))
     X, Y, targets = X[perm], Y[perm], targets[perm]
     split = int(0.8 * len(X))
