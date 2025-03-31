@@ -433,13 +433,13 @@ def create_dataset_ODE_alive(t_span=None):
     geo_counter = Counter()
     initials = generate_systematic_initials()
 
-       for vec in initials:
-    for _ in range(5):
+    for vec in initials[:10]:
+      for _ in range(5):
         rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
         rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
 
+
         final_rho = rho_t[-1]  # ← keep this line
-        # final_rho = final_rho / final_rho.sum()  ← REMOVE or comment this out
 
         # Digital enforcement
         assert torch.allclose(final_rho * 100, torch.round(final_rho * 100), atol=1e-6), \
@@ -470,10 +470,11 @@ class OxiNet(nn.Module):
         self.relu = nn.ReLU()
     
     def forward(self, x):
-    x = self.relu(self.fc1(x))
-    x = self.relu(self.fc2(x))
-    x = self.fc3(x)
-    return x  # raw logits (no softmax)
+      x = self.relu(self.fc1(x))
+      x = self.relu(self.fc2(x))
+      x = self.fc3(x)
+      return x  # raw logits (no softmax)
+
 
 ###############################################################################
 # Training and Evaluation Functions
