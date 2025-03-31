@@ -211,81 +211,16 @@ else:
 ###############################################################################
 # Neural ODE Function 
 ###############################################################################
-def update_phi(rho_vec, max_attempts=3):
-    """
-    Update φ using occupancy rho_vec with adaptive flexibility.
-    Tries a few times with increasing damping if necessary.
-    """
-    phi_vec = np.zeros(num_states)
-    kappa = 1.0
-    tol = 1e-3
-
-    for attempt in range(max_attempts):
-        damping = 0.05 / (attempt + 1)
-        for _ in range(1000):
-            nonlin = 0.5 * kappa * rho_vec * np.exp(2 * phi_vec)
-            F = L @ phi_vec + nonlin
-            J = L + np.diag(kappa * rho_vec * np.exp(2 * phi_vec))
-            try:
-                delta_phi = np.linalg.solve(J, -F)
-            except np.linalg.LinAlgError:
-                break
-
-            for i in range(num_states):
-                if rho_vec[i] <= 1e-14:
-                    delta_phi[i] = 0.0
-            phi_vec += damping * delta_phi
-            if np.linalg.norm(delta_phi) < tol:
-                return phi_vec
-    print("⚠️ Warning: φ did not converge fully.")
-    return phi_vec
-
-
-def update_geometry_fields(rho_vec):
-    """
-    Recomputes φ, c-Ricci, and anisotropy A(x) from the current occupancy.
-    """
-    global phi_vec, c_ricci_nodes, A_field
-    phi_vec = update_phi(rho_vec)
-    lambda_value = lambda_net().detach().cpu().numpy()
-    c_ricci_vec = lambda_value * (L_np @ rho_vec)
-    c_ricci_nodes = {pf_states[i]: c_ricci_vec[i] for i in range(num_states)}
-
-    for (u, v) in G.edges():
-        G[u][v]['cRicci'] = (c_ricci_nodes[u] + c_ricci_nodes[v]) / 2.0
-
-    A_field = {}
-    for s in pf_states:
-        nbrs = list(G.neighbors(s))
-        grad_sum = 0.0
-        count = 0
-        for nbr in nbrs:
-            dist = np.linalg.norm(np.array(flat_pos[s]) - np.array(flat_pos[nbr]))
-            if dist > 1e-6:
-                grad_sum += abs(c_ricci_nodes[s] - c_ricci_nodes[nbr]) / dist
-                count += 1
-        A_field[s] = grad_sum / count if count > 0 else 0.0
-
 
 def oxi_shapes_ode(t, rho):
     """
     Monte Carlo-inspired redox engine using C-Ricci and entropy-based ΔS.
-    Implements inertial occupancy and probability constraints.
-    Updates PDE-derived fields every 5 steps.
+    Implements inertial occupancy: no i-state moves unless acted upon.
     """
     rho = rho.to(device)
+    c_ricci = lambda_net() * (L_torch @ rho)
 
-    if not hasattr(oxi_shapes_ode, "step"):
-        oxi_shapes_ode.step = 0
-
-    if oxi_shapes_ode.step % 5 == 0:
-        update_geometry_fields(rho.detach().cpu().numpy())
-
-    oxi_shapes_ode.step += 1
-
-    lambda_val = lambda_net()
-    c_ricci = lambda_val * (L_torch @ rho)
-
+    # Anisotropy field A(x)
     A = torch.zeros(num_states, device=device)
     for i, s in enumerate(pf_states):
         nbrs = neighbor_indices[s]
@@ -313,6 +248,7 @@ def oxi_shapes_ode(t, rho):
 
     for i, s in enumerate(pf_states):
         occ_i = rho[i]
+
         p_neighbors = []
         p_total = 0.0
 
@@ -335,18 +271,61 @@ def oxi_shapes_ode(t, rho):
                 p_neighbors.append((j, raw_p_ij))
                 p_total += raw_p_ij
 
-        max_transferable = min(occ_i, 0.5)
         if p_total > 0:
             for j, raw_p_ij in p_neighbors:
                 normalized_p = raw_p_ij / (p_total + 1e-8)
-                flow = max_transferable * normalized_p
-                inflow[j] += flow
-                outflow[i] += flow
-            inflow[i] += occ_i - max_transferable
+                inflow[j] += occ_i * normalized_p
+                outflow[i] += occ_i * normalized_p
         else:
             inflow[i] += occ_i
 
     return inflow - outflow
+
+###############################################################################
+# Geodesic Tracking Functions
+###############################################################################
+
+def dominant_geodesic(trajectory, geodesics):
+    max_score = 0
+    best_path = None
+    for path in geodesics:
+        score = sum([1 for s in path if s in trajectory])
+        if score > max_score:
+            max_score = score
+            best_path = path
+    return tuple(best_path) if best_path else None
+
+def evolve_time_series_and_geodesic(rho0, t_span):
+    rho_t = odeint(oxi_shapes_ode, rho0, t_span)
+    dominant_path = []
+    for r in rho_t:
+        max_idx = torch.argmax(r).item()
+        dominant_path.append(pf_states[max_idx])
+    geo = dominant_geodesic(dominant_path, geodesics)
+    return rho_t, geo
+
+def geodesic_loss(predicted_final, initial, geodesics, pf_states):
+    max_idx_pred = torch.argmax(predicted_final, dim=1)
+    max_idx_init = torch.argmax(initial, dim=1)
+    batch_loss = 0.0
+    for i in range(len(max_idx_pred)):
+        pred_path = [pf_states[max_idx_init[i].item()], pf_states[max_idx_pred[i].item()]]
+        valid = any(set(pred_path).issubset(set(g)) for g in geodesics)
+        if not valid:
+            batch_loss += 1.0
+    return batch_loss / len(max_idx_pred)
+
+geodesics = [
+    ["000", "100", "101", "111"],
+    ["000", "100", "110", "111"],
+    ["000", "010", "110", "111"],
+    ["000", "010", "011", "111"],
+    ["000", "001", "101", "111"],
+    ["000", "001", "011", "111"]
+]
+
+from collections import Counter
+geo_counter = Counter()
 
 ###############################################################################
 # Geodesic Tracking Functions
@@ -441,7 +420,7 @@ def topological_entropy(dgm):
 def create_dataset_ODE_target(num_samples=None, t_span=None):
     if t_span is None:
         t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
-    X, Y, targets, topo_H0_entropy = [], [], [], []
+    X, Y, targets, geos = [], [], [], []
 
     initials = generate_systematic_initials()
     possible_targets = np.arange(0, 100, 5)
@@ -453,26 +432,18 @@ def create_dataset_ODE_target(num_samples=None, t_span=None):
             rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
             final_rho = rho_t[-1]
             final_rho = final_rho / final_rho.sum()
-
-            # --- Persistent homology
-            final_np = final_rho.detach().cpu().numpy()
-            dgms = persistent_diagram(final_np)
-            entropy_H0 = topological_entropy(dgms[0])
-
-            # --- Store everything
             X.append(rho0.detach().cpu().numpy())
-            Y.append(final_np)
+            Y.append(final_rho.detach().cpu().numpy())
             targets.append(target_ox)
-            topo_H0_entropy.append(entropy_H0)
-
             if geopath:
                 geo_counter[geopath] += 1
+                geos.append(geopath)
 
     print("Most traversed geodesics:")
     for path, count in geo_counter.most_common():
         print(" → ".join(path), "| Count:", count)
 
-    return np.array(X), np.array(Y), np.array(targets), np.array(topo_H0_entropy)
+    return np.array(X), np.array(Y), np.array(targets)
 
 ###############################################################################
 # Neural Network for Learning (OxiFlowNet)
@@ -494,14 +465,14 @@ class OxiNet(nn.Module):
 ###############################################################################
 # Training and Evaluation Functions
 ###############################################################################
-def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5):
+def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5, lambda_geo=0.5):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32, device=device)
     X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
     Y_val_t = torch.tensor(Y_val, dtype=torch.float32, device=device)
-    
+
     for epoch in range(1, epochs+1):
         model.train()
         optimizer.zero_grad()
@@ -511,7 +482,8 @@ def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lamb
         support_pred = (pred > 0.05).float()
         support_true = (Y_train_t > 0.05).float()
         topo_constraint = torch.mean((support_pred - support_true) ** 2)
-        total_loss = main_loss + lambda_vol * vol_constraint + lambda_topo * topo_constraint
+        geo_loss = geodesic_loss(pred, X_train_t, geodesics, pf_states)
+        total_loss = main_loss + lambda_vol * vol_constraint + lambda_topo * topo_constraint + lambda_geo * geo_loss
         total_loss.backward()
         optimizer.step()
         if epoch % 10 == 0:
