@@ -265,8 +265,43 @@ def oxi_shapes_ode(t, rho):
     outflow = torch.zeros_like(rho, device=device)
 
     for i, s in enumerate(pf_states):
-        for j in neighbor_indices[s]:
-            occ_i = rho[i]
+    occ_i = rho[i]
+    
+    # Gather transition probabilities
+    p_neighbors = []
+    p_total = 0.0
+
+    for j in neighbor_indices[s]:
+        # Compute ΔS (as before)
+        mass_heat = 0.1 * occ_i
+        reaction_heat = 0.01 * baseline_DeltaE
+        conformational_cost = torch.abs(c_ricci[j])
+        degeneracy_penalty = 1.0 / degeneracy[j]
+        delta_S = mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
+
+        # Δf
+        delta_f = (
+            baseline_DeltaE * torch.exp(occ_i * Delta_x)
+            - c_ricci[i]
+            + delta_S
+        ) / RT
+
+        # p_ij (raw)
+        raw_p_ij = torch.exp(-delta_f) * torch.exp(-A[j])
+        
+        if raw_p_ij > 1e-6:  # Apply minimal action threshold
+            p_neighbors.append((j, raw_p_ij))
+            p_total += raw_p_ij
+
+    if p_total > 0:
+        # Normalize and apply
+        for j, raw_p_ij in p_neighbors:
+            normalized_p = raw_p_ij / (p_total + 1e-8)
+            inflow[j] += occ_i * normalized_p
+            outflow[i] += occ_i * normalized_p
+    else:
+        # No action = no movement
+        inflow[i] += occ_i
 
             mass_heat = 0.1 * rho[i]
             reaction_heat = 0.01 * baseline_DeltaE
