@@ -272,10 +272,16 @@ def oxi_shapes_ode_with_target(t, rho, target_oxidation, gamma=0.1):
                 grad_vals.append(torch.abs(c_ricci[i] - c_ricci[j]) / dist)
         A[i] = sum(grad_vals) / len(grad_vals) if grad_vals else 0.0
 
-    # Degeneracy based on k (number of 1s)
+    # Degeneracy based on global k-bin (number of oxidized cysteines)
+    degeneracy_map = {
+    0: 1,
+    1: 3,
+    2: 3,
+    3: 1}
     degeneracy = torch.tensor(
-        [1, 3, 3, 1, 3, 3, 3, 1], dtype=torch.float32, device=device
-    )  # [000,001,010,100,011,101,110,111] → degeneracies
+    [degeneracy_map[s.count('1')] for s in pf_states],
+    dtype=torch.float32,
+    device=device)
 
     # Constants
     baseline_DeltaE = 1.0
