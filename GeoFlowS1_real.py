@@ -532,9 +532,6 @@ def evaluate_model(model, X_test, Y_test):
 ###############################################################################
 # Main Execution: Data Generation, Training, and Evaluation
 ###############################################################################
-###############################################################################
-# Main Execution: Data Generation, Training, and Evaluation
-###############################################################################
 if __name__ == "__main__":
     print("Generating dataset using systematic Oxi-Shape sampling...")
     t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
