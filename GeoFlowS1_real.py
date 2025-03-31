@@ -62,7 +62,7 @@ lambda_net = DifferentiableLambda(init_val=1.0).to(device)
 RT = 1.0
 
 ###############################################################################
-# 1. Define the Discrete State Space (R=3) & Its Embedding
+# Define the Discrete State Space (R=3) & Its Embedding
 ###############################################################################
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 allowed_edges = [
@@ -107,7 +107,7 @@ plt.title("Discrete Proteoform State Space (R=3)")
 plt.show()
 
 ###############################################################################
-# 2. Initialize Occupancy and Solve φ Field (Poisson-like PDE)
+# Initialize Occupancy and Solve φ Field (Poisson-like PDE)
 ###############################################################################
 # Initialize occupancy randomly.
 rho_vec = np.random.rand(num_states)
@@ -147,7 +147,7 @@ else:
 phi = {s: phi_vec[state_index[s]] for s in pf_states}
 
 ###############################################################################
-# 3. Compute Enriched C-Ricci and Anisotropy
+# Compute Enriched C-Ricci and Anisotropy
 ###############################################################################
 def compute_cotangent_laplacian(node_xy, triangles):
     N = node_xy.shape[0]
@@ -204,7 +204,7 @@ for (u, v) in G.edges():
     G[u][v]['penalty'] = penalty
 
 ###############################################################################
-# 4. Sheaf Theory: Stalk Initialization & Consistency Check
+# Sheaf Theory: Stalk Initialization & Consistency Check
 ###############################################################################
 def initialize_sheaf_stalks():
     stalks = {}
@@ -228,30 +228,10 @@ else:
     print("Sheaf stalks are consistent.")
 
 ###############################################################################
-# 5. Neural ODE Function with External Forcing for Dynamic Probability
+# Neural ODE Function with External Forcing for Dynamic Probability
 ###############################################################################
-def oxi_shapes_ode_with_target(t, rho, target_oxidation, gamma=0.1):
-    """
-    ODE function for evolving occupancy ρ (tensor shape (num_states,))
-    with external forcing to drive the system toward a target percent oxidation.
-    
-    The free-energy difference is computed as:
-      Δf(i→j) = ΔE(i→j)*exp[ρ(i)*Δx] - cRicci(i)*T(i,j) + ΔS + gamma*(P_current - P_target)
-    
-    And the transition probability:
-      p_ij = exp(-Δf(i→j)) * exp(-A(j))
-    
-    Here, we use:
-      - ΔE(i→j)= baseline_DeltaE (constant),
-      - Δx = 1,
-      - T(i,j)=1 for allowed transitions,
-      - ΔS = 0,
-      - P_current = current percent oxidation,
-      - P_target = target_oxidation (external parameter),
-      - gamma scales the forcing.
-    """
-    rho = rho.to(device)
-   def oxi_shapes_ode(t, rho):
+
+def oxi_shapes_ode(t, rho):
     """
     Monte Carlo-inspired redox engine using C-Ricci and entropy-based ΔS.
     """
@@ -272,18 +252,11 @@ def oxi_shapes_ode_with_target(t, rho, target_oxidation, gamma=0.1):
                 grad_vals.append(torch.abs(c_ricci[i] - c_ricci[j]) / dist)
         A[i] = sum(grad_vals) / len(grad_vals) if grad_vals else 0.0
 
-    # Degeneracy based on global k-bin (number of oxidized cysteines)
-    degeneracy_map = {
-    0: 1,
-    1: 3,
-    2: 3,
-    3: 1}
-    degeneracy = torch.tensor(
-    [degeneracy_map[s.count('1')] for s in pf_states],
-    dtype=torch.float32,
-    device=device)
+    degeneracy_map = {0: 1, 1: 3, 2: 3, 3: 1}
+    degeneracy = torch.tensor([
+        degeneracy_map[s.count('1')] for s in pf_states
+    ], dtype=torch.float32, device=device)
 
-    # Constants
     baseline_DeltaE = 1.0
     Delta_x = 1.0
     RT = 1.0
@@ -295,39 +268,61 @@ def oxi_shapes_ode_with_target(t, rho, target_oxidation, gamma=0.1):
         for j in neighbor_indices[s]:
             occ_i = rho[i]
 
-            # --- ΔS computation ---
             mass_heat = 0.1 * rho[i]
             reaction_heat = 0.01 * baseline_DeltaE
             conformational_cost = torch.abs(c_ricci[j])
             degeneracy_penalty = 1.0 / degeneracy[j]
             delta_S = mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
 
-            # --- Δf computation ---
             delta_f = (
                 baseline_DeltaE * torch.exp(rho[i] * Delta_x)
                 - c_ricci[i]
                 + delta_S
             ) / RT
 
-            # --- Transition probability ---
             p_ij = torch.exp(-delta_f) * torch.exp(-A[j])
-
             inflow[j] += occ_i * p_ij
             outflow[i] += occ_i * p_ij
 
     return inflow - outflow
 
-def evolve_oxi_shapes_pde_target(rho0, t_span, target_oxidation, gamma=0.1):
-    rho0 = rho0.to(device)
-    rho0 = rho0 / rho0.sum()
-    ode_func = lambda t, rho: oxi_shapes_ode_with_target(t, rho, target_oxidation, gamma)
-    rho_t = odeint(ode_func, rho0, t_span)
-    final_rho = rho_t[-1]
-    final_rho = final_rho / final_rho.sum()
-    return final_rho
+###############################################################################
+# Geodesic Tracking Functions
+###############################################################################
+
+def dominant_geodesic(trajectory, geodesics):
+    max_score = 0
+    best_path = None
+    for path in geodesics:
+        score = sum([1 for s in path if s in trajectory])
+        if score > max_score:
+            max_score = score
+            best_path = path
+    return tuple(best_path) if best_path else None
+
+def evolve_time_series_and_geodesic(rho0, t_span):
+    rho_t = odeint(oxi_shapes_ode, rho0, t_span)
+    dominant_path = []
+    for r in rho_t:
+        max_idx = torch.argmax(r).item()
+        dominant_path.append(pf_states[max_idx])
+    geo = dominant_geodesic(dominant_path, geodesics)
+    return rho_t, geo
+
+geodesics = [
+    ["000", "100", "101", "111"],
+    ["000", "100", "110", "111"],
+    ["000", "010", "110", "111"],
+    ["000", "010", "011", "111"],
+    ["000", "001", "101", "111"],
+    ["000", "001", "011", "111"]
+]
+
+from collections import Counter
+geo_counter = Counter()
 
 ###############################################################################
-# 6. Data Generation (Systematic Oxi-Shape Sampling)
+# Data Generation (Systematic Oxi-Shape Sampling)
 ###############################################################################
 def generate_systematic_initials():
     initials = []
@@ -365,24 +360,33 @@ def generate_systematic_initials():
 def create_dataset_ODE_target(num_samples=None, t_span=None):
     if t_span is None:
         t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
-    X, Y, targets = [], [], []
-    
+    X, Y, targets, geos = [], [], [], []
+
     initials = generate_systematic_initials()
     possible_targets = np.arange(0, 100, 5)
 
     for vec in initials:
-        for _ in range(5):  # replicate each shape to allow evolution with different targets
+        for _ in range(5):
             rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
             target_ox = float(np.random.choice(possible_targets))
-            final_rho = evolve_oxi_shapes_pde_target(rho0, t_span, target_ox, gamma=0.0)  # note: gamma=0.0
+            rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
+            final_rho = rho_t[-1]
+            final_rho = final_rho / final_rho.sum()
             X.append(rho0.detach().cpu().numpy())
             Y.append(final_rho.detach().cpu().numpy())
             targets.append(target_ox)
+            if geopath:
+                geo_counter[geopath] += 1
+                geos.append(geopath)
+
+    print("Most traversed geodesics:")
+    for path, count in geo_counter.most_common():
+        print(" → ".join(path), "| Count:", count)
 
     return np.array(X), np.array(Y), np.array(targets)
 
 ###############################################################################
-# 7. Neural Network for Learning (OxiFlowNet)
+# Neural Network for Learning (OxiFlowNet)
 ###############################################################################
 class OxiNet(nn.Module):
     def __init__(self, input_dim=8, hidden_dim=32, output_dim=8):
@@ -399,7 +403,7 @@ class OxiNet(nn.Module):
         return torch.softmax(x, dim=1)
 
 ###############################################################################
-# 8. Training and Evaluation Functions
+# Training and Evaluation Functions
 ###############################################################################
 def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5):
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -439,7 +443,7 @@ def evaluate_model(model, X_test, Y_test):
     return pred_test.detach().cpu().numpy(), test_loss
 
 ###############################################################################
-# 9. Main Execution: Data Generation, Training, and Evaluation
+# Main Execution: Data Generation, Training, and Evaluation
 ###############################################################################
 if __name__ == "__main__":
     print("Generating dataset using systematic Oxi-Shape sampling...")
