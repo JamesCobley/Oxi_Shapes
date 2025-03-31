@@ -2,26 +2,7 @@
 # coding: utf-8
 
 """
-Oxi-Shapes + Supervised ML Pipeline with External Forcing
-
-This script performs the following:
-  1. Defines the discrete state space (binomial diamond for R=3) and its 2D embedding.
-  2. Initializes occupancy and solves for the φ field (via a Poisson-like PDE).
-  3. Computes enriched c-Ricci (via a cotangent Laplacian) and anisotropy.
-  4. Initializes sheaf stalks and checks consistency.
-  5. Implements a differentiable ODE using torchdiffeq.odeint that evolves the occupancy ρ(x)
-     according to the Einstein-like Oxi-Shapes field equation. Here the free-energy difference
-     is given by:
-         Δf(i→j) = ΔE(i→j)*exp[ρ(i)*Δx] - R(i)*T(i,j) + ΔS + γ*(P_current - P_target)
-     and the transition probability is:
-         p_ij = exp(-Δf(i→j)) · exp(-A(j))
-     Thus, the external forcing (with hyperparameter γ and target percent oxidation)
-     drives the evolution away from trivial uniformity.
-  6. Generates a dataset of (initial occupancy → final occupancy) pairs using the PDE solver,
-     with each sample assigned a random target oxidation (in 5% bins from 0% to 100%).
-  7. Defines and trains a PyTorch neural network (OxiFlowNet) to predict the final occupancy
-     from the initial occupancy.
-  8. Evaluates the trained model and reports key metrics.
+Oxi-Shapes + Supervised ML Pipeline.
   
 Dependencies: torchdiffeq, ripser, persim
 """
