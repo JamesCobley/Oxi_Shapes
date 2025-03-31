@@ -433,7 +433,7 @@ def create_dataset_ODE_alive(t_span=None):
     geo_counter = Counter()
     initials = generate_systematic_initials()
 
-   for vec in initials:
+       for vec in initials:
     for _ in range(5):
         rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
         rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
@@ -470,10 +470,10 @@ class OxiNet(nn.Module):
         self.relu = nn.ReLU()
     
     def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        x = self.fc3(x)
-        return torch.softmax(x, dim=1)
+    x = self.relu(self.fc1(x))
+    x = self.relu(self.fc2(x))
+    x = self.fc3(x)
+    return x  # raw logits (no softmax)
 
 ###############################################################################
 # Training and Evaluation Functions
@@ -482,6 +482,7 @@ def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3,
                 lambda_topo=0.5, lambda_vol=0.5, lambda_geo=0.5, geodesics=None):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
+
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32, device=device)
     X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
@@ -490,7 +491,12 @@ def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3,
     for epoch in range(1, epochs+1):
         model.train()
         optimizer.zero_grad()
-        pred = model(X_train_t)
+        raw_pred = model(X_train_t)
+
+        # Quantize + normalize to mimic ALIVE physics
+        pred = torch.round(raw_pred * 100) / 100
+        pred = pred / pred.sum(dim=1, keepdim=True)
+
         main_loss = mse_loss(pred, Y_train_t)
         vol_constraint = torch.mean((torch.sum(pred, dim=1) - torch.sum(Y_train_t, dim=1)) ** 2)
         support_pred = (pred > 0.05).float()
@@ -498,25 +504,34 @@ def train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3,
         topo_constraint = torch.mean((support_pred - support_true) ** 2)
         geo_loss = geodesic_loss(pred, X_train_t, geodesics, pf_states)
         total_loss = main_loss + lambda_vol * vol_constraint + lambda_topo * topo_constraint + lambda_geo * geo_loss
+
         total_loss.backward()
         optimizer.step()
+
         if epoch % 10 == 0:
             model.eval()
             with torch.no_grad():
-                val_pred = model(X_val_t)
+                raw_val = model(X_val_t)
+                val_pred = torch.round(raw_val * 100) / 100
+                val_pred = val_pred / val_pred.sum(dim=1, keepdim=True)
                 val_loss = mse_loss(val_pred, Y_val_t)
-            print(f"Epoch {epoch}/{epochs} | Total Loss: {total_loss.item():.6f} | Train: {main_loss.item():.6f} | Val: {val_loss.item():.6f}")
+            print(f"Epoch {epoch}/{epochs} | Total Loss: {total_loss.item():.6f} | Train: {main_loss.item():.6f} | Val: {val_loss:.6f}")
 
 def evaluate_model(model, X_test, Y_test):
     model.eval()
     X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
     Y_test_t = torch.tensor(Y_test, dtype=torch.float32, device=device)
     with torch.no_grad():
-        pred_test = model(X_test_t)
+        raw_pred = model(X_test_t)
+        pred = torch.round(raw_pred * 100) / 100
+        pred = pred / pred.sum(dim=1, keepdim=True)
     mse_loss = nn.MSELoss()
-    test_loss = mse_loss(pred_test, Y_test_t).item()
-    return pred_test.detach().cpu().numpy(), test_loss
+    test_loss = mse_loss(pred, Y_test_t).item()
+    return pred.detach().cpu().numpy(), test_loss
 
+###############################################################################
+# Main Execution: Data Generation, Training, and Evaluation
+###############################################################################
 ###############################################################################
 # Main Execution: Data Generation, Training, and Evaluation
 ###############################################################################
@@ -524,15 +539,18 @@ if __name__ == "__main__":
     print("Generating dataset using systematic Oxi-Shape sampling...")
     t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
     X, Y, geos = create_dataset_ODE_alive(t_span=t_span)
+
+    # Shuffle and split
     perm = np.random.permutation(len(X))
-    X, Y, targets = X[perm], Y[perm], targets[perm]
+    X, Y = X[perm], Y[perm]
     split = int(0.8 * len(X))
     X_train, Y_train = X[:split], Y[:split]
     X_val, Y_val = X[split:], Y[split:]
 
     print("Building and training the neural network (OxiFlowNet)...")
     model = OxiNet(input_dim=8, hidden_dim=32, output_dim=8).to(device)
-    train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, lambda_topo=0.5, lambda_vol=0.5)
+    train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3,
+                lambda_topo=0.5, lambda_vol=0.5, lambda_geo=0.5, geodesics=geos)
 
     print("\nEvaluating on validation data...")
     pred_val, val_loss = evaluate_model(model, X_val, Y_val)
