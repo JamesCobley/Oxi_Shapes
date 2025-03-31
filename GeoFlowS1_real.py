@@ -381,41 +381,6 @@ from collections import Counter
 geo_counter = Counter()
 
 ###############################################################################
-# Geodesic Tracking Functions
-###############################################################################
-
-def dominant_geodesic(trajectory, geodesics):
-    max_score = 0
-    best_path = None
-    for path in geodesics:
-        score = sum([1 for s in path if s in trajectory])
-        if score > max_score:
-            max_score = score
-            best_path = path
-    return tuple(best_path) if best_path else None
-
-def evolve_time_series_and_geodesic(rho0, t_span):
-    rho_t = odeint(oxi_shapes_ode, rho0, t_span)
-    dominant_path = []
-    for r in rho_t:
-        max_idx = torch.argmax(r).item()
-        dominant_path.append(pf_states[max_idx])
-    geo = dominant_geodesic(dominant_path, geodesics)
-    return rho_t, geo
-
-geodesics = [
-    ["000", "100", "101", "111"],
-    ["000", "100", "110", "111"],
-    ["000", "010", "110", "111"],
-    ["000", "010", "011", "111"],
-    ["000", "001", "101", "111"],
-    ["000", "001", "011", "111"]
-]
-
-from collections import Counter
-geo_counter = Counter()
-
-###############################################################################
 # Data Generation (Systematic Oxi-Shape Sampling + Geodesic + Topology)
 ###############################################################################
 
@@ -482,23 +447,24 @@ def create_dataset_ODE_alive(t_span=None):
     geo_counter = Counter()
     initials = generate_systematic_initials()
 
-    for vec in initials:
-        for _ in range(5):
-            rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
-            rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
-            final_rho = rho_t[-1]
-            final_rho = final_rho / final_rho.sum()
+   for vec in initials:
+    for _ in range(5):
+        rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
+        rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
 
-            # Digital enforcement
-            assert torch.allclose(final_rho * 100, torch.round(final_rho * 100), atol=1e-6), \
-                f"Non-digital occupancy detected: {final_rho}"
+        final_rho = rho_t[-1]  # ← keep this line
+        # final_rho = final_rho / final_rho.sum()  ← REMOVE or comment this out
 
-            X.append(rho0.detach().cpu().numpy())
-            Y.append(final_rho.detach().cpu().numpy())
+        # Digital enforcement
+        assert torch.allclose(final_rho * 100, torch.round(final_rho * 100), atol=1e-6), \
+            f"Non-digital occupancy detected: {final_rho}"
 
-            if geopath:
-                geo_counter[geopath] += 1
-                geos.append(geopath)
+        X.append(rho0.detach().cpu().numpy())
+        Y.append(final_rho.detach().cpu().numpy())
+
+        if geopath:
+            geo_counter[geopath] += 1
+            geos.append(geopath)
 
     print("Most traversed geodesics:")
     for path, count in geo_counter.most_common():
