@@ -8,6 +8,8 @@ using StatsBase
 using DifferentialEquations
 using Ripserer
 using Distances  
+using Makie                   # For 3D visualization (GLMakie or CairoMakie)
+
 
 if CUDA.has_cuda()
     device = gpu
