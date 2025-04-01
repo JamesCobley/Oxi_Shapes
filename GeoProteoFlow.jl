@@ -424,3 +424,78 @@ y_pred = oxinet(x_example)  # outputs raw vector (no softmax)
 println("✅ OxiNet initialized. Sample output:")
 println(round.(y_pred; digits=4))
 
+################################################################################
+# Step 10: Training and Evaluation Functions (Flux)
+################################################################################
+
+using Flux: mse, train!, ADAM
+
+# Volume constraint: preserves ∑ρ = 1
+function volume_constraint(pred, target)
+    return mean((sum(pred, dims=1) .- sum(target, dims=1)).^2)
+end
+
+# Topology constraint: compare supports (binary presence of mass)
+function topology_constraint(pred, target; threshold=0.05)
+    support_pred = pred .> threshold
+    support_true = target .> threshold
+    return mean((support_pred .- support_true).^2)
+end
+
+# Geodesic constraint: ensure evolution stays on a valid path
+function geodesic_loss(pred, initial, geodesics::Vector{Vector{String}}, pf_states)
+    pred_idx = findmax.(eachcol(pred)) .|> x -> x[2]
+    init_idx = findmax.(eachcol(initial)) .|> x -> x[2]
+    loss = 0.0
+    for i in 1:length(pred_idx)
+        path = [pf_states[init_idx[i]], pf_states[pred_idx[i]]]
+        valid = any(all(in(path), g) for g in geodesics)
+        loss += valid ? 0.0 : 1.0
+    end
+    return loss / length(pred_idx)
+end
+
+# Training loop
+function train_model!(model, X_train, Y_train, X_val, Y_val;
+    epochs=100, lr=1e-3, λ_topo=0.5, λ_vol=0.5, λ_geo=0.5, geodesics=nothing
+)
+    opt = ADAM(lr)
+    loss_log = []
+
+    for epoch in 1:epochs
+        grads = Flux.gradient(Flux.params(model)) do
+            raw_pred = model(X_train)
+            pred = round.(raw_pred .* 100) ./ 100
+            pred ./= sum(pred; dims=1)
+
+            loss_main = mse(pred, Y_train)
+            loss_vol = volume_constraint(pred, Y_train)
+            loss_topo = topology_constraint(pred, Y_train)
+            loss_geo = geodesic_loss(pred, X_train, geodesics, pf_states)
+
+            total = loss_main + λ_vol * loss_vol + λ_topo * loss_topo + λ_geo * loss_geo
+            push!(loss_log, total)
+            return total
+        end
+
+        Flux.Optimise.update!(opt, Flux.params(model), grads)
+
+        if epoch % 10 == 0
+            raw_val = model(X_val)
+            val_pred = round.(raw_val .* 100) ./ 100
+            val_pred ./= sum(val_pred; dims=1)
+            val_loss = mse(val_pred, Y_val)
+            println("Epoch $epoch | Loss = $(round(loss_log[end], digits=5)) | Val MSE = $(round(val_loss, digits=5))")
+        end
+    end
+end
+
+# Evaluation
+function evaluate_model(model, X_test, Y_test)
+    raw_pred = model(X_test)
+    pred = round.(raw_pred .* 100) ./ 100
+    pred ./= sum(pred; dims=1)
+    return pred, mse(pred, Y_test)
+end
+
+
