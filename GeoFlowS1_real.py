@@ -576,6 +576,10 @@ if __name__ == "__main__":
         'flat_pos': flat_pos
     }, "oxinet_model.pt")
     print("✅ Trained model saved to 'oxinet_model.pt'")
+ 
+# Automatically download the model to local Downloads (Google Colab only)
+from google.colab import files
+files.download("oxinet_model.pt")
 
     for idx in np.random.choice(len(X_val), 3, replace=False):
         init_occ = X_val[idx]
