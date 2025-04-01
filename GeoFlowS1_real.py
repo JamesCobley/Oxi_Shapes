@@ -438,8 +438,6 @@ def create_dataset_ODE_alive(t_span=None, max_samples=500, save_every=50):
     initials = generate_systematic_initials_extended(n_shapes=100)
     for vec in initials:
         for _ in range(5):  # generate more variants per shape if needed
-            if total_samples >= max_samples:
-                break  # ✅ Stop at 500 total
 
             rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
             rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
