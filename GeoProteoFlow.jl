@@ -313,3 +313,47 @@ function geodesic_loss(pred_final::Matrix{Float64}, initial::Matrix{Float64})
     end
     return batch_loss / size(pred_final, 2)
 end
+
+# --- Generate Systematic Initial Distributions in Julia ---
+
+function generate_systematic_initials()
+    initials = []
+
+    # (1) Single occupancy states (pure i-states)
+    for i in 1:8
+        v = zeros(Float64, 8)
+        v[i] = 1.0
+        push!(initials, v)
+    end
+
+    # (2) Flat distribution
+    push!(initials, fill(1.0 / 8, 8))
+
+    # (3) Curved in k=1 (peak at "010")
+    curved_k1 = [0.0, 0.15, 0.7, 0.15, 0.0, 0.0, 0.0, 0.0]
+    push!(initials, curved_k1 ./ sum(curved_k1))
+
+    # (4) Curved in k=2 (peak at "101")
+    curved_k2 = [0.0, 0.0, 0.0, 0.0, 0.15, 0.7, 0.15, 0.0]
+    push!(initials, curved_k2 ./ sum(curved_k2))
+
+    # (5) Flat k=0/1 with peak in k=2
+    hybrid = [0.05, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.05]
+    push!(initials, hybrid ./ sum(hybrid))
+
+    # (6) Bell-shaped curve across i-space
+    bell = [0.05, 0.1, 0.1, 0.1, 0.15, 0.15, 0.15, 0.2]
+    push!(initials, bell ./ sum(bell))
+
+    # (7) Left-to-right gradient
+    gradient = collect(range(0.1, 0.9, length=8))
+    push!(initials, gradient ./ sum(gradient))
+
+    return initials
+end
+
+# Test output
+for (i, dist) in enumerate(generate_systematic_initials())
+    println("Initial ", i, ": ", round.(dist; digits=3))
+end
+
