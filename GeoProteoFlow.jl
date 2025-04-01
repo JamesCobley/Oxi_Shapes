@@ -10,7 +10,6 @@ using Ripserer
 using Distances  
 using Makie                   # For 3D visualization (GLMakie or CairoMakie)
 
-
 if CUDA.has_cuda()
     device = gpu
     println("Using device: GPU")
@@ -181,6 +180,10 @@ function update_c_ricci_and_anisotropy(rho::Vector{Float64})
     return c_ricci, A_field, mesh  # Also return the mesh if needed for visualization
 end
 
+################################################################################
+# Step 6: Sheath theory
+################################################################################
+
 function sheaf_consistency_relative(mesh::SimpleMesh; tolerance=0.2)
     inconsistencies = []
 
@@ -203,6 +206,10 @@ function sheaf_consistency_relative(mesh::SimpleMesh; tolerance=0.2)
 
     return inconsistencies
 end
+
+################################################################################
+# Step 7: ALIVE ODE Action LImited eVolution Engine
+################################################################################
 
 # Global Parameters
 const MAX_MOVES_PER_STEP = 10
@@ -301,8 +308,6 @@ global geodesics = [
     ["000", "001", "101", "111"],
     ["000", "001", "011", "111"]
 ]
-
-using StatsBase
 
 function geodesic_loss(pred_final::Matrix{Float64}, initial::Matrix{Float64})
     max_idx_pred = argmax(pred_final, dims=1)
