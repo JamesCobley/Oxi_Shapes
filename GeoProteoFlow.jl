@@ -384,3 +384,43 @@ function topological_entropy(diagrams)
     entropy = -sum(p * log2(p + 1e-10) for p in probs)
     return entropy
 end
+
+println("✅ Finished data generation.")
+println("Most traversed geodesics:")
+for (path, count) in sort(collect(geo_counter), by = x -> -x[2])
+    println(join(path, " → "), " | Count: ", count)
+end
+
+################################################################################
+# Step 8: OxiFlowNet Neural Network (Flux MLP)
+################################################################################
+
+# Define model architecture (similar to PyTorch version)
+struct OxiNet
+    fc1::Dense
+    fc2::Dense
+    fc3::Dense
+end
+
+# Constructor
+function OxiNet(input_dim::Int=8, hidden_dim::Int=32, output_dim::Int=8)
+    return OxiNet(
+        Dense(input_dim, hidden_dim, relu),
+        Dense(hidden_dim, hidden_dim, relu),
+        Dense(hidden_dim, output_dim)
+    )
+end
+
+# Forward pass definition
+(m::OxiNet)(x) = m.fc3(m.fc2(m.fc1(x)))
+
+# Instantiate the model
+oxinet = OxiNet()
+
+# Example usage
+x_example = rand(Float32, 8)
+y_pred = oxinet(x_example)  # outputs raw vector (no softmax)
+
+println("✅ OxiNet initialized. Sample output:")
+println(round.(y_pred; digits=4))
+
