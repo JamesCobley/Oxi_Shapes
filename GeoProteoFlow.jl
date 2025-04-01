@@ -5,6 +5,7 @@ using Meshes
 using GeometryBasics
 using LinearAlgebra
 using StatsBase
+using DifferentialEquations
 
 if CUDA.has_cuda()
     device = gpu
@@ -155,4 +156,160 @@ function compute_anisotropy(mesh::SimpleMesh, c_ricci::Vector{Float64})
         A_field[i] = isempty(grad_vals) ? 0.0 : mean(grad_vals)
     end
     return A_field
+end
+
+function update_c_ricci_and_anisotropy(rho::Vector{Float64})
+    rho_norm = rho ./ sum(rho)  # Ensure volume-conserving
+    λ = get_lambda()
+
+    # Step 1: Lift to 3D mesh
+    mesh = lift_to_3d_mesh(rho_norm)
+
+    # Step 2: Cotangent Laplacian
+    L = cotangent_laplacian(mesh)
+
+    # Step 3: Compute c-Ricci = λ ⋅ ∆ₜρ(x)
+    c_ricci = λ .* (L * rho_norm)
+
+    # Step 4: Compute anisotropy ∇(c-Ricci) from neighbors
+    A_field = compute_anisotropy(mesh, c_ricci)
+
+    return c_ricci, A_field, mesh  # Also return the mesh if needed for visualization
+end
+
+function sheaf_consistency_relative(mesh::SimpleMesh; tolerance=0.2)
+    inconsistencies = []
+
+    for (u, v) in allowed_edges
+        i = state_index[u]
+        j = state_index[v]
+        p0_u = flat_pos[u]
+        p0_v = flat_pos[v]
+        d0 = norm(p0_u - p0_v)
+
+        pt_u = mesh.points[i]
+        pt_v = mesh.points[j]
+        dt = norm(pt_u - pt_v)
+
+        δ = abs(dt - d0) / d0
+        if δ > tolerance
+            push!(inconsistencies, (u, v, round(δ, digits=3)))
+        end
+    end
+
+    return inconsistencies
+end
+
+# Global Parameters
+const MAX_MOVES_PER_STEP = 10
+const PDE_UPDATE_INTERVAL = 1
+global_pde_step_counter = Ref(0)  # mutable counter
+
+# Degeneracy map (bitwise 1-count)
+degeneracy_map = Dict(0 => 1, 1 => 3, 2 => 3, 3 => 1)
+
+# === ALIVE ODE: Action-Limited Evolution Engine ===
+function oxi_shapes_ode_alive(t, rho::Vector{Float64})
+    rho = rho ./ sum(rho)  # volume conservation
+    counts = round.(Int, rho .* 100)
+    counts[end] = 100 - sum(counts[1:end-1])  # force normalization
+    rho = counts ./ 100.0
+
+    global_pde_step_counter[] += 1
+    if global_pde_step_counter[] % PDE_UPDATE_INTERVAL == 0
+        global c_ricci, anisotropy, _ = update_c_ricci_and_anisotropy(rho)
+    end
+
+    inflow = zeros(Float64, num_states)
+    outflow = zeros(Float64, num_states)
+    total_moves = rand(0:MAX_MOVES_PER_STEP)
+    candidate_indices = findall(>(0), counts)
+
+    for _ in 1:total_moves
+        isempty(candidate_indices) && break
+        i = rand(candidate_indices)
+        s = pf_states[i]
+        neighbors = get(neighbor_indices, s, [])
+        isempty(neighbors) && (inflow[i] += 0.01; continue)
+
+        probs = Float64[]
+        for j in neighbors
+            delta_S = compute_entropy_cost(i, j, rho)
+            delta_f = (1.0 * exp(rho[i]) - c_ricci[i] + delta_S) / RT
+            p_ij = exp(-delta_f) * exp(-anisotropy[j])
+            push!(probs, p_ij)
+        end
+
+        if sum(probs) < 1e-8
+            inflow[i] += 0.01
+            continue
+        end
+
+        probs ./= sum(probs)
+        target_idx = neighbors[sample(DiscreteNonParametric(1:length(probs), probs))]
+        inflow[target_idx] += 0.01
+        outflow[i] += 0.01
+    end
+
+    for i in 1:num_states
+        inflow[i] += (counts[i] / 100.0) - outflow[i]
+    end
+
+    return inflow .- outflow
+end
+
+function compute_entropy_cost(i::Int, j::Int, rho::Vector{Float64})
+    baseline_DeltaE = 1.0
+    mass_heat = 0.1
+    reaction_heat = 0.01 * baseline_DeltaE
+    conformational_cost = abs(c_ricci[j])
+    deg = degeneracy_map[count("1", pf_states[j])]
+    degeneracy_penalty = 1.0 / deg
+    return mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
+end
+
+function dominant_geodesic(traj::Vector{String}, geodesics::Vector{Vector{String}})
+    max_score = 0
+    best_path = nothing
+    for path in geodesics
+        score = count(s -> s in path, traj)
+        if score > max_score
+            max_score = score
+            best_path = path
+        end
+    end
+    return best_path
+end
+
+function evolve_time_series_and_geodesic(rho0::Vector{Float64}, t_span)
+    prob = ODEProblem(oxi_shapes_ode_alive, rho0, (t_span[1], t_span[end]))
+    sol = solve(prob, Tsit5(), saveat=t_span)
+    traj = [pf_states[argmax(r)] for r in sol.u]
+    geo = dominant_geodesic(traj, geodesics)
+    return sol, geo
+end
+
+global geodesics = [
+    ["000", "100", "101", "111"],
+    ["000", "100", "110", "111"],
+    ["000", "010", "110", "111"],
+    ["000", "010", "011", "111"],
+    ["000", "001", "101", "111"],
+    ["000", "001", "011", "111"]
+]
+
+using StatsBase
+
+function geodesic_loss(pred_final::Matrix{Float64}, initial::Matrix{Float64})
+    max_idx_pred = argmax(pred_final, dims=1)
+    max_idx_init = argmax(initial, dims=1)
+    batch_loss = 0.0
+    for i in 1:size(pred_final, 2)
+        path = [pf_states[max_idx_init[i]], pf_states[max_idx_pred[i]]]
+        valid = any(all(s in g for s in path) for g in geodesics)
+        if !valid
+            batch_loss += 1.0
+        end
+    end
+    return batch_loss / size(pred_final, 2)
 end
