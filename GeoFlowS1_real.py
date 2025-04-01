@@ -425,7 +425,7 @@ def topological_entropy(dgm):
 
 from collections import Counter
 
-def create_dataset_ODE_alive(t_span=None):
+def create_dataset_ODE_alive(t_span=None, max_samples=500, save_every=50):
     if t_span is None:
         t_span = torch.linspace(0.0, 1.0, 100, dtype=torch.float32, device=device)
 
@@ -433,30 +433,48 @@ def create_dataset_ODE_alive(t_span=None):
     geo_counter = Counter()
     initials = generate_systematic_initials()
 
-    for vec in initials[:10]:
-      for _ in range(5):
-        rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
-        rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
+    total_samples = 0  # ✅ sample counter
 
+    initials = generate_systematic_initials_extended(n_shapes=100)
+    for vec in initials:
+        for _ in range(5):  # generate more variants per shape if needed
+            if total_samples >= max_samples:
+                break  # ✅ Stop at 500 total
 
-        final_rho = rho_t[-1]  # ← keep this line
+            rho0 = torch.tensor(vec, dtype=torch.float32, device=device)
+            rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
 
-        # Digital enforcement
-        assert torch.allclose(final_rho * 100, torch.round(final_rho * 100), atol=1e-6), \
-            f"Non-digital occupancy detected: {final_rho}"
+            final_rho = rho_t[-1]
 
-        X.append(rho0.detach().cpu().numpy())
-        Y.append(final_rho.detach().cpu().numpy())
+            # Digital enforcement
+            assert torch.allclose(final_rho * 100, torch.round(final_rho * 100), atol=1e-6), \
+                f"Non-digital occupancy detected: {final_rho}"
 
-        if geopath:
-            geo_counter[geopath] += 1
-            geos.append(geopath)
+            X.append(rho0.detach().cpu().numpy())
+            Y.append(final_rho.detach().cpu().numpy())
 
+            if geopath:
+                geo_counter[geopath] += 1
+                geos.append(geopath)
+
+            total_samples += 1  # ✅ update sample count
+
+            # ✅ Save intermediate files every 50
+            if total_samples % save_every == 0:
+                print(f"Saving checkpoint at {total_samples} samples...")
+                np.save(f"/mnt/data/X_partial_{total_samples}.npy", np.array(X))
+                np.save(f"/mnt/data/Y_partial_{total_samples}.npy", np.array(Y))
+
+        if total_samples >= max_samples:
+            break
+
+    print("✅ Finished data generation.")
     print("Most traversed geodesics:")
     for path, count in geo_counter.most_common():
         print(" → ".join(path), "| Count:", count)
 
     return np.array(X), np.array(Y), geos
+
 
 ###############################################################################
 # Neural Network for Learning (OxiFlowNet)
