@@ -1,100 +1,158 @@
+# --- Device Setup ---
 using Flux
 using CUDA
+using Meshes
+using GeometryBasics
 using LinearAlgebra
-using Random
-using Statistics
-using Plots
+using StatsBase
 
-# Try using GPU if available, fallback to CPU
-const DEVICE = CUDA.has_cuda() ? CUDADevice() : CPU()
-const FLOATX = CUDA.has_cuda() ? CuArray{Float32} : Array{Float32}
-
-if DEVICE isa CUDADevice
-    println("🚀 Device: GPU")
+if CUDA.has_cuda()
+    device = gpu
+    println("Using device: GPU")
 else
-    println("🧠 Device: CPU (CUDA not available)")
+    device = cpu
+    println("Using device: CPU")
 end
 
-# Differentiable λ parameter (stored in log-space for stability)
-lambda_net = Flux.param([log(1.0f0)])
+# --- Differentiable Lambda: Trainable scaling for c-Ricci ---
+# We store log(λ) for stability
+log_lambda = param([log(1.0f0)])  # Flux param makes it trainable
 
-# Getter function for the actual λ value
+# Accessor function
 function get_lambda()
-    return exp(lambda_net[1])
+    return exp(log_lambda[1])  # scalar λ value
 end
 
-# Global RT constant (same as in PyTorch)
+# --- Global RT constant ---
 const RT = 1.0f0
 
-using Graphs
-using Delaunay
-using LinearAlgebra
-using Plots  # or Makie if you prefer GPU plots
+################################################################################
+# Step 1: Define the flat 2D proteoform lattice with ρ(x) -> z(x)
+################################################################################
 
-# --- Define states and connectivity
+# Define the proteoform states and their flat (x, y) positions
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
+flat_pos = Dict(
+    "000" => Point3(0.0, 3.0, 0.0),
+    "001" => Point3(-2.0, 2.0, 0.0),
+    "010" => Point3(0.0, 2.0, 0.0),
+    "100" => Point3(2.0, 2.0, 0.0),
+    "011" => Point3(-1.0, 1.0, 0.0),
+    "101" => Point3(0.0, 1.0, 0.0),
+    "110" => Point3(1.0, 1.0, 0.0),
+    "111" => Point3(0.0, 0.0, 0.0)
+)
+
+# Define neighbor connections (edges by Hamming distance 1)
 allowed_edges = [
     ("000", "001"), ("000", "010"), ("000", "100"),
     ("001", "101"), ("001", "011"),
     ("010", "110"), ("010", "011"),
     ("011", "111"),
     ("100", "110"), ("100", "101"),
-    ("101", "111"),
-    ("110", "111")
+    ("101", "111"), ("110", "111")
 ]
 
-num_states = length(pf_states)
 state_index = Dict(s => i for (i, s) in enumerate(pf_states))
-index_state = Dict(i => s for (s, i) in state_index)
+num_states = length(pf_states)
 
-# --- Create graph
-G = SimpleGraph(num_states)
-for (u, v) in allowed_edges
-    add_edge!(G, state_index[u], state_index[v])
+################################################################################
+# Step 2: Define occupancy ρ(x) and build curved 3D mesh with z = ρ(x)
+################################################################################
+
+function lift_to_3d_mesh(rho::Vector{Float64})
+    @assert length(rho) == num_states
+    rho = rho ./ sum(rho)  # Ensure volume conservation
+    lifted_points = [Point3(flat_pos[s].x, flat_pos[s].y, rho[state_index[s]]) for s in pf_states]
+
+    # Manually define triangles for the R=3 diamond based on connectivity
+    triangles = [
+        Triangle(1, 2, 3), Triangle(1, 3, 4), Triangle(2, 5, 3),
+        Triangle(3, 5, 6), Triangle(3, 6, 7), Triangle(4, 3, 7),
+        Triangle(5, 8, 6), Triangle(6, 8, 7)
+    ]
+
+    mesh = SimpleMesh(lifted_points, triangles)
+    return mesh
 end
 
-# --- Flat diamond layout (2D positions)
-flat_pos = Dict(
-    "000" => [0.0, 3.0],
-    "001" => [-2.0, 2.0],
-    "010" => [0.0, 2.0],
-    "100" => [2.0, 2.0],
-    "011" => [-1.0, 1.0],
-    "101" => [0.0, 1.0],
-    "110" => [1.0, 1.0],
-    "111" => [0.0, 0.0]
-)
+################################################################################
+# Step 3: Compute cotangent Laplacian ∆_T over 3D mesh
+################################################################################
 
-# --- Node positions as matrix (each row: [x, y])
-node_xy = reduce(vcat, [reshape(flat_pos[s], 1, 2) for s in pf_states])
-triangulation = delaunay(node_xy')  # transpose for correct orientation
-triangles = triangulation.triangles  # matrix with column = triangle (3 indices)
+function cotangent_laplacian(mesh::SimpleMesh)
+    N = length(mesh.points)
+    L = zeros(Float64, N, N)
+    A = zeros(Float64, N)
 
-# --- Precompute neighbor indices (index-based)
-neighbor_indices = Dict{String, Vector{Int}}()
-for s in pf_states
-    neighbors = []
-    for (u, v) in allowed_edges
-        if u == s
-            push!(neighbors, state_index[v])
-        elseif v == s
-            push!(neighbors, state_index[u])
+    for tri in mesh.connectivity
+        i, j, k = tri.indices
+        p1, p2, p3 = mesh.points[i], mesh.points[j], mesh.points[k]
+
+        # Edges
+        u = p2 - p1
+        v = p3 - p1
+        w = p3 - p2
+
+        # Angles
+        angle_i = acos(clamp(dot(u, v) / (norm(u) * norm(v)), -1, 1))
+        angle_j = acos(clamp(dot(-u, w) / (norm(u) * norm(w)), -1, 1))
+        angle_k = acos(clamp(dot(-v, -w) / (norm(v) * norm(w)), -1, 1))
+
+        # Cotangent weights
+        cot_i = 1 / tan(angle_i)
+        cot_j = 1 / tan(angle_j)
+        cot_k = 1 / tan(angle_k)
+
+        for (a, b, cot) in ((j,k,cot_i), (i,k,cot_j), (i,j,cot_k))
+            L[a,b] -= cot
+            L[b,a] -= cot
+            L[a,a] += cot
+            L[b,b] += cot
         end
     end
-    neighbor_indices[s] = neighbors
+
+    return L
 end
 
-# --- Optional GPU-ready flat position tensor
-flat_pos_tensor = Float32.(node_xy)  # [8 x 2] matrix
-# If you're using CUDA, do: `flat_pos_tensor = cu(flat_pos_tensor)`
+################################################################################
+# Step 4: Compute c-Ricci = λ ⋅ ∆_T ρ(x)
+################################################################################
 
-# --- Visualization (Plots.jl example)
-scatter(node_xy[:,1], node_xy[:,2], label="States", color=:skyblue, markersize=8)
-for (u, v) in allowed_edges
-    i, j = state_index[u], state_index[v]
-    plot!([node_xy[i,1], node_xy[j,1]], [node_xy[i,2], node_xy[j,2]], color=:gray, lw=2)
+function compute_c_ricci(rho::Vector{Float64}, λ::Float64 = 1.0)
+    mesh = lift_to_3d_mesh(rho)
+    L = cotangent_laplacian(mesh)
+    rho_norm = rho ./ sum(rho)  # Ensure volume is normalized
+    c_ricci = λ .* (L * rho_norm)
+    return c_ricci
 end
-title!("Proteoform State Space (R=3)")
-xlabel!("X")
-ylabel!("Y")
-display(current())  # show plot
+
+# Example run:
+rho_example = rand(num_states)
+c_ricci_out = compute_c_ricci(rho_example, 1.0)
+println("c-Ricci curvature:", round.(c_ricci_out; digits=4))
+
+################################################################################
+# Step 5: Compute anisotropy field A(x) = ∇_T [C-Ricci(x)]
+################################################################################
+
+function compute_anisotropy(mesh::SimpleMesh, c_ricci::Vector{Float64})
+    A_field = zeros(Float64, num_states)
+
+    for i in 1:num_states
+        p_i = mesh.points[i]
+        grad_vals = Float64[]
+        for j in 1:num_states
+            if i == j
+                continue
+            end
+            p_j = mesh.points[j]
+            d = norm(p_j - p_i)
+            if d > 1e-6
+                push!(grad_vals, abs(c_ricci[i] - c_ricci[j]) / d)
+            end
+        end
+        A_field[i] = isempty(grad_vals) ? 0.0 : mean(grad_vals)
+    end
+    return A_field
+end
