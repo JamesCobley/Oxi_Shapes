@@ -6,6 +6,8 @@ using GeometryBasics
 using LinearAlgebra
 using StatsBase
 using DifferentialEquations
+using Ripserer
+using Distances  
 
 if CUDA.has_cuda()
     device = gpu
@@ -356,4 +358,22 @@ end
 for (i, dist) in enumerate(generate_systematic_initials())
     println("Initial ", i, ": ", round.(dist; digits=3))
 end
+# Persistent homology diagram using Ripserer.jl
+function persistent_diagram(rho::Vector{Float64})
+    D = pairwise(Euclidean(), rho, dims=1)
+    result = ripser(D, dim_max=1, metric=:precomputed)
+    return result
+end
 
+# Compute persistent entropy from H0 diagram
+function topological_entropy(diagrams)
+    if isempty(diagrams) || isempty(diagrams[1])
+        return 0.0
+    end
+    births = diagrams[1][!, :birth]
+    deaths = diagrams[1][!, :death]
+    lifespans = deaths .- births
+    probs = lifespans ./ sum(lifespans)
+    entropy = -sum(p * log2(p + 1e-10) for p in probs)
+    return entropy
+end
