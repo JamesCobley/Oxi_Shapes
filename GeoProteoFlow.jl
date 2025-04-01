@@ -498,4 +498,67 @@ function evaluate_model(model, X_test, Y_test)
     return pred, mse(pred, Y_test)
 end
 
+################################################################################
+# Step 10: Main Execution: Data Generation, Training, and Evaluation in Julia
+################################################################################
 
+println("🌀 Generating dataset using systematic Oxi-Shape sampling...")
+
+# Time span for simulation (discretized)
+t_span = range(0.0, stop=1.0, length=100)
+
+# Generate data (using your Julia version of ODE + geodesic engine)
+X_data, Y_data, geos = create_dataset_ODE_alive(t_span, max_samples=300)
+
+# Shuffle and split
+perm = shuffle(1:size(X_data, 1))
+X_data, Y_data = X_data[perm, :], Y_data[perm, :]
+split_idx = Int(round(0.8 * size(X_data, 1)))
+
+X_train = transpose(X_data[1:split_idx, :])
+Y_train = transpose(Y_data[1:split_idx, :])
+X_val   = transpose(X_data[split_idx+1:end, :])
+Y_val   = transpose(Y_data[split_idx+1:end, :])
+
+# Define the model
+model = Chain(
+    Dense(8, 32, relu),
+    Dense(32, 32, relu),
+    Dense(32, 8)
+)
+
+println("🚀 Training the neural network (OxiFlowNet)...")
+train_model!(model, X_train, Y_train, X_val, Y_val;
+    epochs=100,
+    lr=1e-3,
+    λ_topo=0.5,
+    λ_vol=0.5,
+    λ_geo=0.5,
+    geodesics=geos
+)
+
+println("🔍 Evaluating on validation data...")
+pred_val, val_loss = evaluate_model(model, X_val, Y_val)
+println("📉 Validation Loss: ", round(val_loss, digits=6))
+
+# Save the model
+using BSON
+BSON.@save "oxinet_model.bson" model pf_states flat_pos
+println("✅ Trained model saved to 'oxinet_model.bson'")
+
+# Optionally trigger download (Google Colab only)
+# using Downloads
+# Downloads.download("oxinet_model.bson", "Downloads/oxinet_model.bson")
+
+# Show random predictions
+println("🧪 Sample Predictions:")
+for idx in rand(1:size(X_val, 2), 3)
+    init_occ = X_val[:, idx]
+    true_final = Y_val[:, idx]
+    pred_final = pred_val[:, idx]
+
+    println("\n--- Sample $idx ---")
+    println("Initial occupancy:     ", round.(init_occ, digits=3))
+    println("True final occupancy:  ", round.(true_final, digits=3))
+    println("Predicted occupancy:   ", round.(pred_final, digits=3))
+end
