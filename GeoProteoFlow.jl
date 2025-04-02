@@ -7,7 +7,7 @@ using LinearAlgebra
 using StatsBase
 using DifferentialEquations
 using Ripserer
-using Distances  
+using Distances
 using Makie                   # For 3D visualization (GLMakie or CairoMakie)
 
 if CUDA.has_cuda()
@@ -19,16 +19,16 @@ else
 end
 
 # --- Differentiable Lambda: Trainable scaling for c-Ricci ---
-# We store log(λ) for stability
-log_lambda = param([log(1.0f0)])  # Flux param makes it trainable
+using Flux
 
-# Accessor function
+# Ref container for log(λ), wrapped as a parameter
+λ_container = Ref(log(1.0f0))
+ps_lambda = Flux.Params([λ_container])  # Include in training parameter set
+
+# Accessor to get the real λ value
 function get_lambda()
-    return exp(log_lambda[1])  # scalar λ value
+    return exp(λ_container[])
 end
-
-# --- Global RT constant ---
-const RT = 1.0f0
 
 ################################################################################
 # Step 1: Define the flat 2D proteoform lattice with ρ(x) -> z(x)
