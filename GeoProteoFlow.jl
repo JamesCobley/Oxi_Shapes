@@ -95,32 +95,32 @@ end
 function cotangent_laplacian(mesh::SimpleMesh)
     N = length(mesh.points)
     L = zeros(Float64, N, N)
-    A = zeros(Float64, N)
+    ϵ = 1e-8  # Small epsilon to avoid instability
 
     for tri in mesh.connectivity
         i, j, k = tri.indices
         p1, p2, p3 = mesh.points[i], mesh.points[j], mesh.points[k]
 
-        # Edges
+        # Edge vectors
         u = p2 - p1
         v = p3 - p1
         w = p3 - p2
 
         # Angles
-        angle_i = acos(clamp(dot(u, v) / (norm(u) * norm(v)), -1, 1))
-        angle_j = acos(clamp(dot(-u, w) / (norm(u) * norm(w)), -1, 1))
-        angle_k = acos(clamp(dot(-v, -w) / (norm(v) * norm(w)), -1, 1))
+        angle_i = acos(clamp(dot(u, v) / (norm(u) * norm(v)), -1.0, 1.0))
+        angle_j = acos(clamp(dot(-u, w) / (norm(u) * norm(w)), -1.0, 1.0))
+        angle_k = acos(clamp(dot(-v, -w) / (norm(v) * norm(w)), -1.0, 1.0))
 
-        # Cotangent weights
-        cot_i = 1 / tan(angle_i)
-        cot_j = 1 / tan(angle_j)
-        cot_k = 1 / tan(angle_k)
+        # Safe cotangent weights
+        cot_i = abs(tan(angle_i)) < ϵ ? 0.0 : 1.0 / tan(angle_i)
+        cot_j = abs(tan(angle_j)) < ϵ ? 0.0 : 1.0 / tan(angle_j)
+        cot_k = abs(tan(angle_k)) < ϵ ? 0.0 : 1.0 / tan(angle_k)
 
-        for (a, b, cot) in ((j,k,cot_i), (i,k,cot_j), (i,j,cot_k))
-            L[a,b] -= cot
-            L[b,a] -= cot
-            L[a,a] += cot
-            L[b,b] += cot
+        for (a, b, cot) in ((j, k, cot_i), (i, k, cot_j), (i, j, cot_k))
+            L[a, b] -= cot
+            L[b, a] -= cot
+            L[a, a] += cot
+            L[b, b] += cot
         end
     end
 
