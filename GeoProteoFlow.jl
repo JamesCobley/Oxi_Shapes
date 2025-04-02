@@ -73,15 +73,24 @@ num_states = length(pf_states)
 
 function lift_to_3d_mesh(rho::Vector{Float64})
     @assert length(rho) == num_states
-    rho = rho ./ sum(rho)  # Ensure volume conservation
+    rho = rho ./ sum(rho)  # Volume conservation
 
-    lifted_points = [Point3(flat_pos[s][1], flat_pos[s][2], rho[state_index[s]]) for s in pf_states]
+    # Lift z = ρ(x)
+    lifted_points = [
+        Point3(flat_pos[s][1], flat_pos[s][2], rho[state_index[s]])
+        for s in pf_states
+    ]
 
-    # Manually define triangles for the R=3 diamond based on connectivity
+    # Use fully qualified Simplex type
     triangles = [
-        Triangle(1, 2, 3), Triangle(1, 3, 4), Triangle(2, 5, 3),
-        Triangle(3, 5, 6), Triangle(3, 6, 7), Triangle(4, 3, 7),
-        Triangle(5, 8, 6), Triangle(6, 8, 7)
+        Meshes.Simplex((1, 2, 3)),
+        Meshes.Simplex((1, 3, 4)),
+        Meshes.Simplex((2, 5, 3)),
+        Meshes.Simplex((3, 5, 6)),
+        Meshes.Simplex((3, 6, 7)),
+        Meshes.Simplex((4, 3, 7)),
+        Meshes.Simplex((5, 8, 6)),
+        Meshes.Simplex((6, 8, 7))
     ]
 
     mesh = SimpleMesh(lifted_points, triangles)
