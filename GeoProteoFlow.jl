@@ -1,3 +1,10 @@
+# ╔═╡ Install required packages (only needs to run once per session)
+using Pkg
+Pkg.activate(".")  # Optional: activate project environment
+Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
+         "StatsBase", "DifferentialEquations", "Ripserer",
+         "Distances", "Makie"])
+
 # --- Device Setup ---
 using Flux
 using CUDA
