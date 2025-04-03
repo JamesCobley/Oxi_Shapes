@@ -5,41 +5,25 @@ Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
          "StatsBase", "DifferentialEquations", "Ripserer",
          "Distances", "Makie"])
 
-# --- Imports ---
-using Flux
-using CUDA
-using LinearAlgebra
-using StatsBase
 using GeometryBasics: Point3
+using LinearAlgebra
+using CairoMakie
 
-# === Lambda parameter (trainable) ===
-λ_container = Ref(log(1.0f0))         # log(λ) for stable optimization
-ps_lambda = Flux.Params([λ_container])
+CairoMakie.activate!()
 
-function get_lambda()
-    return Float64(exp(λ_container[]))  # Convert back to λ
-end
-
-# === Proteoform state lattice (Pascal diamond) ===
+# === Pascal Diamond ===
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
-
-# Coordinates in (x, y) for each i-state
 flat_pos = Dict(
-    "000" => Point3( 0.0, 3.0, 0.0),
-    "001" => Point3(-2.0, 2.0, 0.0),
-    "010" => Point3( 0.0, 2.0, 0.0),
-    "100" => Point3( 2.0, 2.0, 0.0),
-    "011" => Point3(-1.0, 1.0, 0.0),
-    "101" => Point3( 0.0, 1.0, 0.0),
-    "110" => Point3( 1.0, 1.0, 0.0),
-    "111" => Point3( 0.0, 0.0, 0.0)
+    "000" => (0.0, 3.0),
+    "001" => (-2.0, 2.0),
+    "010" => (0.0, 2.0),
+    "100" => (2.0, 2.0),
+    "011" => (-1.0, 1.0),
+    "101" => (0.0, 1.0),
+    "110" => (1.0, 1.0),
+    "111" => (0.0, 0.0)
 )
-
-state_index = Dict(s => i for (i, s) in enumerate(pf_states))
-num_states = length(pf_states)
-
-# Allowed edges (bitwise Hamming-1 transitions)
-allowed_edges = [
+edges = [
     ("000", "001"), ("000", "010"), ("000", "100"),
     ("001", "011"), ("001", "101"),
     ("010", "011"), ("010", "110"),
@@ -47,33 +31,63 @@ allowed_edges = [
     ("011", "111"), ("101", "111"), ("110", "111")
 ]
 
-# === Graph Laplacian constructor ===
-function build_graph_laplacian(pf_states, allowed_edges)
-    n = length(pf_states)
-    idx_map = Dict(s => i for (i, s) in enumerate(pf_states))
-    L = zeros(Float64, n, n)
+# === Lift to z(x) = -ρ(x) ===
+function lift_to_z_plane(rho::Vector{Float64}, pf_states, flat_pos)
+    return [Point3(flat_pos[s][1], flat_pos[s][2], -rho[i]) for (i, s) in enumerate(pf_states)]
+end
 
-    for (u, v) in allowed_edges
-        i, j = idx_map[u], idx_map[v]
-        L[i, j] = -1
-        L[j, i] = -1
-        L[i, i] += 1
-        L[j, j] += 1
+# === R(x) as deviation in edge distances ===
+function compute_R_from_distances(points3D, flat_pos, pf_states, edges)
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    R = zeros(Float64, length(pf_states))
+    for (i, s) in enumerate(pf_states)
+        p0 = flat_pos[s]
+        p3 = points3D[i]
+        neighbors = [v for (u, v) in edges if u == s]
+        append!(neighbors, [u for (u, v) in edges if v == s])
+        for n in neighbors
+            j = idx[n]
+            q0 = flat_pos[n]
+            q3 = points3D[j]
+            d0 = norm([p0[1] - q0[1], p0[2] - q0[2]])
+            d3 = norm(p3 - q3)
+            R[i] += d3 - d0
+        end
+    end
+    return R
+end
+
+# === Visualization ===
+function visualize_lifted(points3D, pf_states, edges)
+    fig = Figure(size=(800, 600))
+    ax = Axis3(fig[1,1], title="Oxi-Shape Axiom Deformation")
+
+    xs = [p[1] for p in points3D]
+    ys = [p[2] for p in points3D]
+    zs = [p[3] for p in points3D]
+
+    scatter!(ax, xs, ys, zs; markersize=15, color=:cornflowerblue)
+
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    for (u, v) in edges
+        i, j = idx[u], idx[v]
+        line = [points3D[i], points3D[j]]
+        lines!(ax, getindex.(line, 1), getindex.(line, 2), getindex.(line, 3), color=:gray)
     end
 
-    return L  # row-sum is zero → volume conserving
+    return fig
 end
 
-# === Ricci curvature computation ===
-function compute_c_ricci(rho::Vector{Float64}; λ::Float64 = get_lambda())
-    @assert abs(sum(rho) - 1.0) < 1e-6 "ρ(x) must be normalized for volume conservation"
-    L = build_graph_laplacian(pf_states, allowed_edges)
-    return λ .* (L * rho)
-end
+# === Example run ===
+ρ = [0.0, 0.0, 0.0, 0.0, 0.05, 0.1, 0.25, 0.6]
+ρ ./= sum(ρ)
 
-# === Example usage ===
-rho_example = rand(num_states)
-rho_example ./= sum(rho_example)  # normalize for volume conservation
+points3D = lift_to_z_plane(ρ, pf_states, flat_pos)
+R_vals = compute_R_from_distances(points3D, flat_pos, pf_states, edges)
 
-c_ricci = compute_c_ricci(rho_example)
-println("✅ c-Ricci curvature (volume-conserving): ", round.(c_ricci; digits=4))
+fig = visualize_lifted(points3D, pf_states, edges)
+display(fig)
+save("oxi_shape.png", fig)
+
+
+println("R(x): ", round.(R_vals; digits=4))
