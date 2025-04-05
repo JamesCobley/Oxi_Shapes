@@ -12,6 +12,7 @@ using Random
 using StatsBase: sample, Weights
 using LinearAlgebra
 using Ripserer
+using Statistics
 using ComplexityMeasures
 using Distributions
 using Distances
