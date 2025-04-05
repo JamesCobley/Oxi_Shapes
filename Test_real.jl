@@ -255,7 +255,6 @@ function topological_entropy(dgm)
     return entropy
 end
 
-
 # Function to generate systematic initial conditions
 function generate_systematic_initials()
     initials = []
@@ -380,7 +379,7 @@ function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32
 end
 
 # === Training Function ===
-function train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, geodesics=geos)
+function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
     opt = ADAM(lr)
     loss_fn(ŷ, y) = Flux.Losses.mse(ŷ, y)
 
@@ -388,13 +387,16 @@ function train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3,
         gs = Flux.gradient(Flux.params(model)) do
             raw_pred = model(X_train)
             pred = round.(raw_pred .* 100) ./ 100
-            pred ./= sum(pred; dims=1)
+            pred = pred ./ sum(pred; dims=1)
 
             main_loss = loss_fn(pred, Y_train)
-            println("Epoch $epoch - Geodesic Loss: ", geodesic_loss(pred, X_train, pf_states, geodesics))
+            geo_loss = geodesic_loss(pred, X_train, pf_states, geodesics)
+            println("Epoch $epoch - MSE: $(round(main_loss, digits=4)) | Geodesic Loss: $geo_loss")
             return main_loss
         end
         Flux.Optimise.update!(opt, Flux.params(model), gs)
+    end
+end
 
         if epoch % 10 == 0
             raw_val = model(X_val)
@@ -427,6 +429,18 @@ split = Int(round(0.8 * length(X)))
 X_train, Y_train = X[1:split], Y[1:split]
 X_val, Y_val = X[split+1:end], Y[split+1:end]
 
+# Convert from vector of vectors to matrix (8, N)
+X_train_mat = hcat(X_train...)
+Y_train_mat = hcat(Y_train...)
+X_val_mat = hcat(X_val...)
+Y_val_mat = hcat(Y_val...)
+
+# Convert to Float32 to match model
+X_train_mat = Float32.(X_train_mat)
+Y_train_mat = Float32.(Y_train_mat)
+X_val_mat = Float32.(X_val_mat)
+Y_val_mat = Float32.(Y_val_mat)
+
 println("Building and training the neural network (OxiFlowNet)...")
 model = Chain(
     Dense(8, 32, relu),
@@ -434,7 +448,7 @@ model = Chain(
     Dense(32, 8)
 )
 
-train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, geodesics=geos)
+train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat; epochs=100, lr=1e-3, geodesics=geos)
 
 println("\nEvaluating on validation data...")
 pred_val, val_loss = evaluate_model(model, X_val, Y_val)
