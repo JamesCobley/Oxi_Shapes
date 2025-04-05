@@ -3,7 +3,7 @@ using Pkg
 Pkg.activate(".")  # Optional: activate project environment
 Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
          "StatsBase", "DifferentialEquations", "Ripserer",
-         "Distances", "Interploations", "CairoMakie"])
+         "Distances", "Interploations", "CairoMakie", "DelimitedFiles", "Distributions", "ComplexityMeasures"])
 
 using CairoMakie
 using GeometryBasics: Point2, Point3
@@ -11,6 +11,10 @@ using Interpolations
 using Random
 using StatsBase: sample, Weights
 using LinearAlgebra
+using Ripserer
+using ComplexityMeasures
+using Distributions
+using DelimitedFiles
 
 CairoMakie.activate!()
 
@@ -229,7 +233,27 @@ function geodesic_loss(initial::Vector{Float64}, final::Vector{Float64}, pf_stat
     return valid ? 0.0 : 1.0
 end
 
-# === Generate Initial Conditions for Dataset ===
+# Function to compute the persistent homology diagram
+function persistent_diagram(rho::Vector{Float64})
+    # Compute the pairwise distance matrix
+    dist = pairwise(Euclidean(), reshape(rho, :, 1))
+    # Compute the persistence diagrams using Ripserer
+    dgms = ripserer(dist, dim_max=1)
+    return dgms
+end
+
+# Function to compute the persistent entropy
+function topological_entropy(dgm::Vector{PersistenceDiagrams.PersistenceDiagram})
+    if isempty(dgm) || isempty(dgm[1])
+        return 0.0
+    end
+    lifespans = [p.death - p.birth for p in dgm[1]]
+    probs = lifespans / sum(lifespans)
+    entropy = -sum(probs .* log2.(probs .+ 1e-10))
+    return entropy
+end
+
+# Function to generate systematic initial conditions
 function generate_systematic_initials()
     initials = []
 
@@ -243,25 +267,79 @@ function generate_systematic_initials()
     # (2) Flat occupancy
     push!(initials, fill(1.0 / 8, 8))
 
-    # (3) Curved within k=1
+    # (3) Curved within k=1 (e.g., 010 peak)
     curved_k1 = [0.0, 0.15, 0.7, 0.15, 0.0, 0.0, 0.0, 0.0]
-    push!(initials, curved_k1 ./ sum(curved_k1))
+    push!(initials, curved_k1 / sum(curved_k1))
 
-    # (4) Curved within k=2
+    # (4) Curved within k=2 (e.g., 101 peak)
     curved_k2 = [0.0, 0.0, 0.0, 0.0, 0.15, 0.7, 0.15, 0.0]
-    push!(initials, curved_k2 ./ sum(curved_k2))
+    push!(initials, curved_k2 / sum(curved_k2))
 
-    # (5) Hybrid
+    # (5) Flat in k=0 & k=1, peaked in k=2
     hybrid = [0.05, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.05]
-    push!(initials, hybrid ./ sum(hybrid))
+    push!(initials, hybrid / sum(hybrid))
 
-    # (6) Bell shape
+    # (6) Bell shape across k
     bell = [0.05, 0.1, 0.1, 0.1, 0.15, 0.15, 0.15, 0.2]
-    push!(initials, bell ./ sum(bell))
+    push!(initials, bell / sum(bell))
 
-    # (7) Gradient
-    gradient = collect(range(0.1, stop=0.9, length=8))
-    push!(initials, gradient ./ sum(gradient))
+    # (7) Geometric gradient (left to right in flat_pos)
+    gradient = range(0.1, stop=0.9, length=8)
+    push!(initials, gradient / sum(gradient))
 
     return initials
+end
+
+# Function to create dataset using ODE solver
+function create_dataset_ODE_alive(t_span=nothing, max_samples=500, save_every=50)
+    if isnothing(t_span)
+        t_span = range(0.0, stop=1.0, length=100)
+    end
+
+    X, Y, geos = [], [], []
+    geo_counter = Dict{Vector{String}, Int}()
+    initials = generate_systematic_initials()
+
+    total_samples = 0  # Sample counter
+
+    for vec in initials
+        for _ in 1:5  # Generate more variants per shape if needed
+            rho0 = vec
+            rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
+
+            final_rho = rho_t[end]
+
+            # Digital enforcement
+            @assert all(isapprox.(final_rho * 100, round.(final_rho * 100), atol=1e-6)) "Non-digital occupancy detected: $final_rho"
+
+            push!(X, rho0)
+            push!(Y, final_rho)
+
+            if !isnothing(geopath)
+                geo_counter[geopath] = get(geo_counter, geopath, 0) + 1
+                push!(geos, geopath)
+            end
+
+            total_samples += 1  # Update sample count
+
+            # Save intermediate files every save_every samples
+            if total_samples % save_every == 0
+                println("Saving checkpoint at $total_samples samples...")
+                writedlm("/mnt/data/X_partial_$total_samples.csv", X, ',')
+                writedlm("/mnt/data/Y_partial_$total_samples.csv", Y, ',')
+            end
+        end
+
+        if total_samples >= max_samples
+            break
+        end
+    end
+
+    println("Finished data generation.")
+    println("Most traversed geodesics:")
+    for (path, count) in sort(collect(geo_counter), by=x->x[2], rev=true)
+        println(join(path, " → "), " | Count: ", count)
+    end
+
+    return X, Y, geos
 end
