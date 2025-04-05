@@ -365,3 +365,53 @@ end
 
 # Define the forward pass
 (m::OxiNet)(x) = m.fc3(m.fc2(m.fc1(x)))
+
+# === Geodesic Loss (no weights) ===
+function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32}, pf_states, geodesics)
+    batch_size = size(predicted_final, 2)
+    loss = 0.0
+    for i in 1:batch_size
+        start_idx = argmax(initial[:, i])
+        end_idx = argmax(predicted_final[:, i])
+        pred_path = [pf_states[start_idx], pf_states[end_idx]]
+        valid = any(all(x -> x ∈ g, pred_path) for g in geodesics)
+        loss += valid ? 0.0 : 1.0
+    end
+    return loss / batch_size
+end
+
+# === Training Function ===
+function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3, geodesics=nothing, pf_states=pf_states)
+    opt = ADAM(lr)
+    loss_fn(ŷ, y) = Flux.Losses.mse(ŷ, y)
+
+    for epoch in 1:epochs
+        gs = Flux.gradient(Flux.params(model)) do
+            raw_pred = model(X_train)
+            pred = round.(raw_pred .* 100) ./ 100
+            pred ./= sum(pred; dims=1)
+
+            main_loss = loss_fn(pred, Y_train)
+            println("Epoch $epoch - Geodesic Loss: ", geodesic_loss(pred, X_train, pf_states, geodesics))
+            return main_loss
+        end
+        Flux.Optimise.update!(opt, Flux.params(model), gs)
+
+        if epoch % 10 == 0
+            raw_val = model(X_val)
+            val_pred = round.(raw_val .* 100) ./ 100
+            val_pred ./= sum(val_pred; dims=1)
+            val_loss = loss_fn(val_pred, Y_val)
+            println("Epoch $epoch/$epochs | Val Loss: $(val_loss) ")
+        end
+    end
+end
+
+# === Evaluation Function ===
+function evaluate_model(model, X_test, Y_test)
+    raw_pred = model(X_test)
+    pred = round.(raw_pred .* 100) ./ 100
+    pred ./= sum(pred; dims=1)
+    loss = Flux.Losses.mse(pred, Y_test)
+    return pred, loss
+end
