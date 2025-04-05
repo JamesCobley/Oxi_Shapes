@@ -18,7 +18,8 @@ using Distributions
 using Distances
 using DelimitedFiles
 using Flux
-using BSON: @save
+using BSON
+using BSON: @save  # You already have this, so keep it
 
 
 CairoMakie.activate!()
@@ -463,14 +464,14 @@ pred_val, val_loss = evaluate_model(model, X_val_mat, Y_val_mat)
 println("Validation Loss: $(round(val_loss, digits=6))")
 
 # Save model
-Flux.@save "oxinet_model.bson" model pf_states flat_pos
+BSON.@save "oxinet_model.bson" model pf_states flat_pos
 println("✅ Trained model saved to 'oxinet_model.bson'")
 
 # Display sample predictions
 for idx in rand(1:length(X_val), 3)
     init_occ = X_val[idx]
     true_final = Y_val[idx]
-    pred_final = pred_val[idx]
+    pred_final = pred_val[:, idx]  # ← fixed line
     println("\n--- Sample ---")
     println("Initial occupancy: ", round.(init_occ, digits=3))
     println("True final occupancy: ", round.(true_final, digits=3))
