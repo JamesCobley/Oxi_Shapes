@@ -415,3 +415,43 @@ function evaluate_model(model, X_test, Y_test)
     loss = Flux.Losses.mse(pred, Y_test)
     return pred, loss
 end
+
+println("Generating dataset using systematic Oxi-Shape sampling...")
+t_span = range(0.0, stop=1.0, length=100)
+X, Y, geos = create_dataset_ODE_alive(t_span=t_span)
+
+# Shuffle and split the dataset
+perm = shuffle(1:length(X))
+X = X[perm]
+Y = Y[perm]
+split = Int(round(0.8 * length(X)))
+X_train, Y_train = X[1:split], Y[1:split]
+X_val, Y_val = X[split+1:end], Y[split+1:end]
+
+println("Building and training the neural network (OxiFlowNet)...")
+model = Chain(
+    Dense(8, 32, relu),
+    Dense(32, 32, relu),
+    Dense(32, 8)
+)
+
+train_model!(model, X_train, Y_train, X_val, Y_val, 100, 1e-3, geos)
+
+println("\nEvaluating on validation data...")
+pred_val, val_loss = evaluate_model(model, X_val, Y_val)
+println("Validation Loss: $(round(val_loss, digits=6))")
+
+# Save model
+Flux.@save "oxinet_model.bson" model pf_states flat_pos
+println("✅ Trained model saved to 'oxinet_model.bson'")
+
+# Display sample predictions
+for idx in rand(1:length(X_val), 3)
+    init_occ = X_val[idx]
+    true_final = Y_val[idx]
+    pred_final = pred_val[idx]
+    println("\n--- Sample ---")
+    println("Initial occupancy: ", round.(init_occ, digits=3))
+    println("True final occupancy: ", round.(true_final, digits=3))
+    println("Predicted final occupancy: ", round.(pred_final, digits=3))
+end
