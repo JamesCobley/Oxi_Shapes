@@ -1,3 +1,10 @@
+# ╔═╡ Install required packages (only needs to run once per session)
+using Pkg
+Pkg.activate(".")  # Optional: activate project environment
+Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
+         "StatsBase", "DifferentialEquations", "Ripserer",
+         "Distances", "Interploations", "CairoMakie"])
+
 using CairoMakie
 using GeometryBasics: Point2, Point3
 using Interpolations
@@ -107,39 +114,6 @@ function sheaf_consistency(stalks, edges; threshold=2.5)
         end
     end
     return inconsistencies
-end
-
-# === Plotting ===
-function plot_c_ricci_surface_interpolated(flat_pos, field, pf_states)
-    fig = Figure(size=(900, 700))
-    ax = Axis3(fig[1, 1], title="Interpolated C-Ricci Surface Field", perspectiveness=0.8)
-
-    xs = [flat_pos[s][1] for s in pf_states]
-    ys = [flat_pos[s][2] for s in pf_states]
-
-    grid_x = LinRange(minimum(xs)-0.5, maximum(xs)+0.5, 100)
-    grid_y = LinRange(minimum(ys)-0.5, maximum(ys)+0.5, 100)
-    grid_z = fill(NaN, length(grid_x), length(grid_y))
-
-    for (i, s) in enumerate(pf_states)
-        x_idx = findmin(abs.(grid_x .- flat_pos[s][1]))[2]
-        y_idx = findmin(abs.(grid_y .- flat_pos[s][2]))[2]
-        grid_z[x_idx, y_idx] = field[i]
-    end
-
-    interp_func = interpolate(grid_z, BSpline(Linear()))
-    interp_func_itp = extrapolate(interp_func, NaN)
-    surface!(ax, grid_x, grid_y, (x, y) -> interp_func_itp[x, y], colormap=:viridis)
-
-    for (i, s) in enumerate(pf_states)
-        x, y = flat_pos[s]
-        z = field[i]
-        scatter!(ax, [x], [y], [z], markersize=10, color=:black)
-        text!(ax, s, position=(x, y, z + 0.05), align=(:center, :bottom), fontsize=14)
-    end
-
-    Colorbar(fig[1, 2], limits=extrema(field), colormap=:viridis, label="C-Ricci (Dirichlet)")
-    fig
 end
 
 function compute_entropy_cost(i, j, C_R_vals, pf_states)
@@ -255,35 +229,39 @@ function geodesic_loss(initial::Vector{Float64}, final::Vector{Float64}, pf_stat
     return valid ? 0.0 : 1.0
 end
 
-# === Run Example ===
-ρ = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9]
-ρ ./= sum(ρ)
+# === Generate Initial Conditions for Dataset ===
+function generate_systematic_initials()
+    initials = []
 
-points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
+    # (1) Single i-state occupancy
+    for i in 1:8
+        vec = zeros(8)
+        vec[i] = 1.0
+        push!(initials, vec)
+    end
 
-println("Anisotropy field: ", round.(anisotropy_vals; digits=4))
+    # (2) Flat occupancy
+    push!(initials, fill(1.0 / 8, 8))
 
-sheaf_stalks = initialize_sheaf_stalks(flat_pos, pf_states)
-inconsistencies = sheaf_consistency(sheaf_stalks, edges)
-if !isempty(inconsistencies)
-    println("Sheaf inconsistencies found: ", inconsistencies)
-else
-    println("Sheaf stalks are consistent.")
+    # (3) Curved within k=1
+    curved_k1 = [0.0, 0.15, 0.7, 0.15, 0.0, 0.0, 0.0, 0.0]
+    push!(initials, curved_k1 ./ sum(curved_k1))
+
+    # (4) Curved within k=2
+    curved_k2 = [0.0, 0.0, 0.0, 0.0, 0.15, 0.7, 0.15, 0.0]
+    push!(initials, curved_k2 ./ sum(curved_k2))
+
+    # (5) Hybrid
+    hybrid = [0.05, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.05]
+    push!(initials, hybrid ./ sum(hybrid))
+
+    # (6) Bell shape
+    bell = [0.05, 0.1, 0.1, 0.1, 0.15, 0.15, 0.15, 0.2]
+    push!(initials, bell ./ sum(bell))
+
+    # (7) Gradient
+    gradient = collect(range(0.1, stop=0.9, length=8))
+    push!(initials, gradient ./ sum(gradient))
+
+    return initials
 end
-
-fig_surf = plot_c_ricci_surface_interpolated(flat_pos, C_R_vals, pf_states)
-save("C_Ricci_interpolated_surface.png", fig_surf)
-display(fig_surf)
-
-# === Run Geodesic Test ===
-ρ_init = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9]
-ρ_init ./= sum(ρ_init)
-
-ρ_series, traj, geo = evolve_time_series_and_geodesic!(ρ_init, 1, pf_states, flat_pos, edges; max_moves_per_step=10)
-
-println("Dominant geodesic: ", geo)
-println("Trajectory: ", traj)
-println("Geodesic loss: ", geodesic_loss(ρ_series[1], ρ_series[end], pf_states, geodesics))
-println("\n--- Proteoform Distributions ---")
-println("Start ρ: ", round.(ρ_series[1]; digits=4))
-println("End   ρ: ", round.(ρ_series[end]; digits=4))
