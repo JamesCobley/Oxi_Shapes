@@ -97,17 +97,6 @@ function compute_anisotropy(C_R_vals, pf_states, flat_pos, edges)
     return anisotropy
 end
 
-anisotropy_vals = compute_anisotropy(C_R_vals, pf_states, flat_pos, edges)
-println("Anisotropy field: ", round.(anisotropy_vals; digits=4))
-
-sheaf_stalks = initialize_sheaf_stalks(flat_pos, pf_states)
-inconsistencies = sheaf_consistency(sheaf_stalks, edges)
-if !isempty(inconsistencies)
-    println("Sheaf inconsistencies found: ", inconsistencies)
-else
-    println("Sheaf stalks are consistent.")
-end
-
 function initialize_sheaf_stalks(flat_pos, pf_states)
     stalks = Dict{String, Vector{Float64}}()
     for s in pf_states
@@ -116,6 +105,16 @@ function initialize_sheaf_stalks(flat_pos, pf_states)
     return stalks
 end
 
+function sheaf_consistency(stalks, edges; threshold=2.5)
+    inconsistencies = []
+    for (u, v) in edges
+        diff = norm(stalks[u] .- stalks[v])
+        if diff > threshold
+            push!(inconsistencies, (u, v, diff))
+        end
+    end
+    return inconsistencies
+end
 
 # === Interpolated Surface Plot ===
 function plot_c_ricci_surface_interpolated(flat_pos, field, pf_states)
@@ -125,7 +124,6 @@ function plot_c_ricci_surface_interpolated(flat_pos, field, pf_states)
     xs = [flat_pos[s][1] for s in pf_states]
     ys = [flat_pos[s][2] for s in pf_states]
 
-    # Grid
     grid_x = LinRange(minimum(xs)-0.5, maximum(xs)+0.5, 100)
     grid_y = LinRange(minimum(ys)-0.5, maximum(ys)+0.5, 100)
     grid_z = fill(NaN, length(grid_x), length(grid_y))
@@ -136,12 +134,10 @@ function plot_c_ricci_surface_interpolated(flat_pos, field, pf_states)
         grid_z[x_idx, y_idx] = field[i]
     end
 
-    # Interpolation
     interp_func = interpolate(grid_z, BSpline(Linear()))
     interp_func_itp = extrapolate(interp_func, NaN)
     surface!(ax, grid_x, grid_y, (x, y) -> interp_func_itp[x, y], colormap=:viridis)
 
-    # Overlay points
     for (i, s) in enumerate(pf_states)
         x, y = flat_pos[s]
         z = field[i]
@@ -160,6 +156,17 @@ end
 points3D = lift_to_z_plane(ρ, pf_states, flat_pos)
 R_vals = compute_R(points3D, flat_pos, pf_states, edges)
 C_R_vals = compute_c_ricci_dirichlet(R_vals, pf_states, edges)
+
+anisotropy_vals = compute_anisotropy(C_R_vals, pf_states, flat_pos, edges)
+println("Anisotropy field: ", round.(anisotropy_vals; digits=4))
+
+sheaf_stalks = initialize_sheaf_stalks(flat_pos, pf_states)
+inconsistencies = sheaf_consistency(sheaf_stalks, edges)
+if !isempty(inconsistencies)
+    println("Sheaf inconsistencies found: ", inconsistencies)
+else
+    println("Sheaf stalks are consistent.")
+end
 
 fig_surf = plot_c_ricci_surface_interpolated(flat_pos, C_R_vals, pf_states)
 save("C_Ricci_interpolated_surface.png", fig_surf)
