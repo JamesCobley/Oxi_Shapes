@@ -294,21 +294,21 @@ function generate_systematic_initials()
 end
 
 # Function to create dataset using ODE solver
-function create_dataset_ODE_alive(t_span=nothing, max_samples=500, save_every=50)
+function create_dataset_ODE_alive(; t_span=nothing, max_samples=500, save_every=50)
     if isnothing(t_span)
         t_span = range(0.0, stop=1.0, length=100)
     end
 
     X, Y, geos = [], [], []
     geo_counter = Dict{Vector{String}, Int}()
-    initials = generate_systematic_initials()
+    initials = generate_systematic_initials()[1:10]  # Use only the first 10 distributions for speed testing
 
     total_samples = 0  # Sample counter
 
     for vec in initials
         for _ in 1:5  # Generate more variants per shape if needed
             rho0 = vec
-            rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
+            rho_t, geopath = evolve_time_series_and_geodesic!(rho0, length(t_span), pf_states, flat_pos, edges)
             final_rho = rho_t[end]
             dgms = persistent_diagram(final_rho)
             ent = topological_entropy(dgms)
@@ -381,7 +381,7 @@ function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32
 end
 
 # === Training Function ===
-function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3, geodesics=nothing, pf_states=pf_states)
+function train_model(model, X_train, Y_train, X_val, Y_val; epochs=10, lr=1e-3, geodesics=nothing, pf_states=pf_states)
     opt = ADAM(lr)
     loss_fn(ŷ, y) = Flux.Losses.mse(ŷ, y)
 
@@ -435,7 +435,7 @@ model = Chain(
     Dense(32, 8)
 )
 
-train_model!(model, X_train, Y_train, X_val, Y_val, 100, 1e-3, geos)
+train_model!(model, X_train, Y_train, X_val, Y_val, 10, 1e-3, geos)
 
 println("\nEvaluating on validation data...")
 pred_val, val_loss = evaluate_model(model, X_val, Y_val)
