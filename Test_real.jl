@@ -3,7 +3,7 @@ using Pkg
 Pkg.activate(".")  # Optional: activate project environment
 Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
          "StatsBase", "DifferentialEquations", "Ripserer",
-         "Distances", "Interploations", "CairoMakie", "DelimitedFiles", "Distributions", "ComplexityMeasures"])
+         "Distances", "Interploations", "CairoMakie", "DelimitedFiles", "Distributions", "ComplexityMeasures", "BSON"])
 
 using CairoMakie
 using GeometryBasics: Point2, Point3
@@ -18,10 +18,10 @@ using Distributions
 using Distances
 using DelimitedFiles
 using Flux
+using BSON: @save
+
 
 CairoMakie.activate!()
-
-
 
 # === Proteoform Setup ===
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
@@ -245,7 +245,6 @@ function persistent_diagram(rho::Vector{Float64})
     return dgms
 end
 
-
 # Function to compute the persistent entropy
 function topological_entropy(dgm)
     if isempty(dgm) || isempty(dgm[1])
@@ -407,13 +406,14 @@ end
 
 
 # === Evaluation Function ===
-function evaluate_model(model, X_test, Y_test)
-    raw_pred = model(X_test)
+function evaluate_model(model, X_val_mat, Y_val_mat)
+    raw_pred = model(X_val_mat)
     pred = round.(raw_pred .* 100) ./ 100
     pred ./= sum(pred; dims=1)
-    loss = Flux.Losses.mse(pred, Y_test)
+    loss = Flux.Losses.mse(pred, Y_val_mat)
     return pred, loss
 end
+
 
 println("Generating dataset using systematic Oxi-Shape sampling...")
 t_span = range(0.0, stop=1.0, length=100)
@@ -423,6 +423,11 @@ X, Y, geos = create_dataset_ODE_alive(t_span=t_span)
 perm = shuffle(1:length(X))
 X = X[perm]
 Y = Y[perm]
+
+# Convert individual vectors to Float32
+X = [Float32.(x) for x in X]
+Y = [Float32.(y) for y in Y]
+
 split = Int(round(0.8 * length(X)))
 X_train, Y_train = X[1:split], Y[1:split]
 X_val, Y_val = X[split+1:end], Y[split+1:end]
@@ -433,11 +438,15 @@ Y_train_mat = hcat(Y_train...)
 X_val_mat = hcat(X_val...)
 Y_val_mat = hcat(Y_val...)
 
-# Convert to Float32 to match model
+# (No need to Float32.() here again, but harmless)
 X_train_mat = Float32.(X_train_mat)
 Y_train_mat = Float32.(Y_train_mat)
 X_val_mat = Float32.(X_val_mat)
 Y_val_mat = Float32.(Y_val_mat)
+
+println("First X sample size: ", size(X[1]))
+println("First Y sample size: ", size(Y[1]))
+println("X[1] type: ", typeof(X[1]))
 
 println("Building and training the neural network (OxiFlowNet)...")
 model = Chain(
@@ -446,10 +455,11 @@ model = Chain(
     Dense(32, 8)
 )
 
-train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat; epochs=100, lr=1e-3, geodesics=geos)
+train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat;
+            epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
 
 println("\nEvaluating on validation data...")
-pred_val, val_loss = evaluate_model(model, X_val, Y_val)
+pred_val, val_loss = evaluate_model(model, X_val_mat, Y_val_mat)
 println("Validation Loss: $(round(val_loss, digits=6))")
 
 # Save model
