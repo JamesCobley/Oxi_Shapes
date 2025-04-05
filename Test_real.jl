@@ -310,8 +310,6 @@ function create_dataset_ODE_alive(; t_span=nothing, max_samples=500, save_every=
             rho0 = vec
             rho_t, geopath = evolve_time_series_and_geodesic!(rho0, length(t_span), pf_states, flat_pos, edges)
             final_rho = rho_t[end]
-            dgms = persistent_diagram(final_rho)
-            ent = topological_entropy(dgms)
 
             # Digital enforcement
             @assert all(isapprox.(final_rho * 100, round.(final_rho * 100), atol=1e-6)) "Non-digital occupancy detected: $final_rho"
@@ -329,8 +327,9 @@ function create_dataset_ODE_alive(; t_span=nothing, max_samples=500, save_every=
             # Save intermediate files every save_every samples
             if total_samples % save_every == 0
                 println("Saving checkpoint at $total_samples samples...")
-                writedlm("/mnt/data/X_partial_$total_samples.csv", X, ',')
-                writedlm("/mnt/data/Y_partial_$total_samples.csv", Y, ',')
+                writedlm("X_partial_$total_samples.csv", X, ',')
+                writedlm("Y_partial_$total_samples.csv", Y, ',')
+
             end
         end
 
@@ -381,7 +380,7 @@ function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32
 end
 
 # === Training Function ===
-function train_model(model, X_train, Y_train, X_val, Y_val; epochs=10, lr=1e-3, geodesics=nothing, pf_states=pf_states)
+function train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, geodesics=geos)
     opt = ADAM(lr)
     loss_fn(ŷ, y) = Flux.Losses.mse(ŷ, y)
 
@@ -435,7 +434,7 @@ model = Chain(
     Dense(32, 8)
 )
 
-train_model!(model, X_train, Y_train, X_val, Y_val, 10, 1e-3, geos)
+train_model(model, X_train, Y_train, X_val, Y_val, epochs=100, lr=1e-3, geodesics=geos)
 
 println("\nEvaluating on validation data...")
 pred_val, val_loss = evaluate_model(model, X_val, Y_val)
