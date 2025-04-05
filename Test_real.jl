@@ -14,6 +14,7 @@ using LinearAlgebra
 using Ripserer
 using ComplexityMeasures
 using Distributions
+using Distances
 using DelimitedFiles
 
 CairoMakie.activate!()
@@ -235,23 +236,23 @@ end
 
 # Function to compute the persistent homology diagram
 function persistent_diagram(rho::Vector{Float64})
-    # Compute the pairwise distance matrix
-    dist = pairwise(Euclidean(), reshape(rho, :, 1))
-    # Compute the persistence diagrams using Ripserer
-    dgms = ripserer(dist, dim_max=1)
+    points = reshape(rho, :, 1)  # 8×1 matrix: 8 points in ℝ¹
+    dgms = ripserer(points; dim_max=1)
     return dgms
 end
 
+
 # Function to compute the persistent entropy
-function topological_entropy(dgm::Vector{PersistenceDiagrams.PersistenceDiagram})
+function topological_entropy(dgm)
     if isempty(dgm) || isempty(dgm[1])
         return 0.0
     end
-    lifespans = [p.death - p.birth for p in dgm[1]]
-    probs = lifespans / sum(lifespans)
+    lifespans = [pt.death - pt.birth for pt in dgm[1]]
+    probs = lifespans ./ sum(lifespans)
     entropy = -sum(probs .* log2.(probs .+ 1e-10))
     return entropy
 end
+
 
 # Function to generate systematic initial conditions
 function generate_systematic_initials()
@@ -306,8 +307,9 @@ function create_dataset_ODE_alive(t_span=nothing, max_samples=500, save_every=50
         for _ in 1:5  # Generate more variants per shape if needed
             rho0 = vec
             rho_t, geopath = evolve_time_series_and_geodesic(rho0, t_span)
-
             final_rho = rho_t[end]
+            dgms = persistent_diagram(final_rho)
+            ent = topological_entropy(dgms)
 
             # Digital enforcement
             @assert all(isapprox.(final_rho * 100, round.(final_rho * 100), atol=1e-6)) "Non-digital occupancy detected: $final_rho"
