@@ -6,12 +6,13 @@ Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
          "Distances", "CairoMakie"])
 
 using CairoMakie
-using GeometryBasics: Point3
+using GeometryBasics: Point2, Point3
+using Interpolations
 using LinearAlgebra
 
 CairoMakie.activate!()
 
-# === Data ===
+# === Proteoform Setup ===
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 flat_pos = Dict(
     "000" => (0.0, 3.0),
@@ -31,7 +32,7 @@ edges = [
     ("011", "111"), ("101", "111"), ("110", "111")
 ]
 
-# === Functions ===
+# === Lifting and Curvature Computation ===
 function lift_to_z_plane(rho, pf_states, flat_pos)
     [Point3(flat_pos[s][1], flat_pos[s][2], -rho[i]) for (i, s) in enumerate(pf_states)]
 end
@@ -56,49 +57,64 @@ function compute_R(points3D, flat_pos, pf_states, edges)
     return R
 end
 
-function plot_curved_shape(points3D, pf_states, edges, field; title="Curvature Field", λ=1.0)
-    fig = Figure(size=(900, 700))
-    ax = Axis3(fig[1,1], title=title)
+function compute_c_ricci_dirichlet(R, pf_states, edges)
     idx = Dict(s => i for (i, s) in enumerate(pf_states))
-
-    xs = [p[1] for p in points3D]
-    ys = [p[2] for p in points3D]
-    zs = [p[3] for p in points3D]
-
-    scatter!(ax, xs, ys, zs; markersize=16, color=field, colormap=:viridis)
-
-    for (u, v) in edges
-        i, j = idx[u], idx[v]
-        lines!(ax,
-            [points3D[i][1], points3D[j][1]],
-            [points3D[i][2], points3D[j][2]],
-            [points3D[i][3], points3D[j][3]],
-            color=:gray)
+    C_R = zeros(Float64, length(pf_states))
+    for (i, s) in enumerate(pf_states)
+        neighbors = [v for (u, v) in edges if u == s]
+        append!(neighbors, [u for (u, v) in edges if v == s])
+        for n in neighbors
+            j = idx[n]
+            C_R[i] += (R[i] - R[j])^2
+        end
     end
+    return C_R
+end
+
+# === Interpolated Surface Plot ===
+function plot_c_ricci_surface_interpolated(flat_pos, field, pf_states)
+    fig = Figure(size=(900, 700))
+    ax = Axis3(fig[1, 1], title="Interpolated C-Ricci Surface Field", perspectiveness=0.8)
+
+    xs = [flat_pos[s][1] for s in pf_states]
+    ys = [flat_pos[s][2] for s in pf_states]
+
+    # Grid
+    grid_x = LinRange(minimum(xs)-0.5, maximum(xs)+0.5, 100)
+    grid_y = LinRange(minimum(ys)-0.5, maximum(ys)+0.5, 100)
+    grid_z = fill(NaN, length(grid_x), length(grid_y))
 
     for (i, s) in enumerate(pf_states)
-        text!(ax, s, position=(xs[i], ys[i], zs[i]+0.15), align=(:center, :bottom), fontsize=14)
+        x_idx = findmin(abs.(grid_x .- flat_pos[s][1]))[2]
+        y_idx = findmin(abs.(grid_y .- flat_pos[s][2]))[2]
+        grid_z[x_idx, y_idx] = field[i]
     end
 
-    Colorbar(fig[1,2], limits=extrema(field), colormap=:viridis, label="Field Value")
+    # Interpolation
+    interp_func = interpolate(grid_z, BSpline(Linear()))
+    interp_func_itp = extrapolate(interp_func, NaN)
+    surface!(ax, grid_x, grid_y, (x, y) -> interp_func_itp[x, y], colormap=:viridis)
+
+    # Overlay points
+    for (i, s) in enumerate(pf_states)
+        x, y = flat_pos[s]
+        z = field[i]
+        scatter!(ax, [x], [y], [z], markersize=10, color=:black)
+        text!(ax, s, position=(x, y, z + 0.05), align=(:center, :bottom), fontsize=14)
+    end
+
+    Colorbar(fig[1, 2], limits=extrema(field), colormap=:viridis, label="C-Ricci (Dirichlet)")
     fig
 end
 
-# === Example run ===
-ρ = [0.1, 0.0, 0.0, 0.0, 0.00, 0.0, 0.0, 0.9]
+# === Run Example ===
+ρ = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9]
 ρ ./= sum(ρ)
 
 points3D = lift_to_z_plane(ρ, pf_states, flat_pos)
 R_vals = compute_R(points3D, flat_pos, pf_states, edges)
+C_R_vals = compute_c_ricci_dirichlet(R_vals, pf_states, edges)
 
-fig_R = plot_curved_shape(points3D, pf_states, edges, R_vals, title="R(x) Scalar Curvature")
-save("R_field_oxi_shape.png", fig_R)
-display(fig_R)
-
-# === C-Ricci ===
-λ = 8.0
-C_R = λ .* R_vals
-
-fig_CR = plot_curved_shape(points3D, pf_states, edges, C_R, title="C-Ricci Field (λ=1.0)")
-save("C_Ricci_oxi_shape.png", fig_CR)
-display(fig_CR)
+fig_surf = plot_c_ricci_surface_interpolated(flat_pos, C_R_vals, pf_states)
+save("C_Ricci_interpolated_surface.png", fig_surf)
+display(fig_surf)
