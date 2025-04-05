@@ -3,7 +3,7 @@ using Pkg
 Pkg.activate(".")  # Optional: activate project environment
 Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
          "StatsBase", "DifferentialEquations", "Ripserer",
-         "Distances", "CairoMakie"])
+         "Distances", "Interploations", "CairoMakie"])
 
 using CairoMakie
 using GeometryBasics: Point2, Point3
@@ -70,6 +70,52 @@ function compute_c_ricci_dirichlet(R, pf_states, edges)
     end
     return C_R
 end
+
+function compute_anisotropy(C_R_vals, pf_states, flat_pos, edges)
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    neighbor_indices = Dict(s => Int[] for s in pf_states)
+    for (u, v) in edges
+        push!(neighbor_indices[u], idx[v])
+        push!(neighbor_indices[v], idx[u])
+    end
+
+    anisotropy = zeros(Float64, length(pf_states))
+    for (i, s) in enumerate(pf_states)
+        nbrs = neighbor_indices[s]
+        grad_vals = Float64[]
+        for j in nbrs
+            dist = norm([
+                flat_pos[s][1] - flat_pos[pf_states[j]][1],
+                flat_pos[s][2] - flat_pos[pf_states[j]][2]
+            ])
+            if dist > 1e-6
+                push!(grad_vals, abs(C_R_vals[i] - C_R_vals[j]) / dist)
+            end
+        end
+        anisotropy[i] = isempty(grad_vals) ? 0.0 : sum(grad_vals) / length(grad_vals)
+    end
+    return anisotropy
+end
+
+anisotropy_vals = compute_anisotropy(C_R_vals, pf_states, flat_pos, edges)
+println("Anisotropy field: ", round.(anisotropy_vals; digits=4))
+
+sheaf_stalks = initialize_sheaf_stalks(flat_pos, pf_states)
+inconsistencies = sheaf_consistency(sheaf_stalks, edges)
+if !isempty(inconsistencies)
+    println("Sheaf inconsistencies found: ", inconsistencies)
+else
+    println("Sheaf stalks are consistent.")
+end
+
+function initialize_sheaf_stalks(flat_pos, pf_states)
+    stalks = Dict{String, Vector{Float64}}()
+    for s in pf_states
+        stalks[s] = [flat_pos[s][1], flat_pos[s][2]]
+    end
+    return stalks
+end
+
 
 # === Interpolated Surface Plot ===
 function plot_c_ricci_surface_interpolated(flat_pos, field, pf_states)
