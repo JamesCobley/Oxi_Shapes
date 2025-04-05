@@ -2,6 +2,7 @@ using CairoMakie
 using GeometryBasics: Point2, Point3
 using Interpolations
 using Random
+using StatsBase: sample, Weights
 using LinearAlgebra
 
 CairoMakie.activate!()
@@ -152,7 +153,7 @@ function compute_entropy_cost(i, j, C_R_vals, pf_states)
     return mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
 end
 
-function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=20)
+function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=10)
     idx = Dict(s => i for (i, s) in enumerate(pf_states))
     neighbor_indices = Dict(s => Int[] for s in pf_states)
     for (u, v) in edges
@@ -165,7 +166,7 @@ function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=20)
     counts[end] = 100 - sum(counts[1:end-1])
     ρ .= counts / 100
 
-    # Update geometry based on current ρ
+    # Update geometry from current ρ
     points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
 
     inflow = zeros(Float64, length(pf_states))
@@ -178,8 +179,8 @@ function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=20)
         isempty(candidate_indices) && break
         i = rand(candidate_indices)
         s = pf_states[i]
-
         nbrs = neighbor_indices[s]
+
         if isempty(nbrs)
             inflow[i] += 0.01
             continue
@@ -204,7 +205,6 @@ function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=20)
         outflow[i] += 0.01
     end
 
-    # Static fraction remains
     for i in eachindex(pf_states)
         inflow[i] += (counts[i] / 100.0) - outflow[i]
     end
@@ -279,7 +279,7 @@ display(fig_surf)
 ρ_init = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9]
 ρ_init ./= sum(ρ_init)
 
-ρ_series, traj, geo = evolve_time_series_and_geodesic!(ρ_init, 100, pf_states, flat_pos, edges; max_moves_per_step=10)
+ρ_series, traj, geo = evolve_time_series_and_geodesic!(ρ_init, 1, pf_states, flat_pos, edges; max_moves_per_step=10)
 
 println("Dominant geodesic: ", geo)
 println("Trajectory: ", traj)
