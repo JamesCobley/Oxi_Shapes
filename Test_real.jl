@@ -453,8 +453,10 @@ println("Building and training the neural network (OxiFlowNet)...")
 model = Chain(
     Dense(8, 32, relu),
     Dense(32, 32, relu),
-    Dense(32, 8)
+    Dense(32, 8),
+    relu  # Ensures no negative outputs
 )
+
 
 train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat;
             epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
