@@ -16,6 +16,7 @@ using ComplexityMeasures
 using Distributions
 using Distances
 using DelimitedFiles
+using Flux
 
 CairoMakie.activate!()
 
@@ -345,3 +346,21 @@ function create_dataset_ODE_alive(t_span=nothing, max_samples=500, save_every=50
 
     return X, Y, geos
 end
+
+# Define the model
+struct OxiNet
+    fc1::Dense
+    fc2::Dense
+    fc3::Dense
+end
+
+# Constructor for OxiNet
+function OxiNet(input_dim::Int=8, hidden_dim::Int=32, output_dim::Int=8)
+    fc1 = Dense(input_dim, hidden_dim, relu)
+    fc2 = Dense(hidden_dim, hidden_dim, relu)
+    fc3 = Dense(hidden_dim, output_dim)  # No activation (raw logits)
+    return OxiNet(fc1, fc2, fc3)
+end
+
+# Define the forward pass
+(m::OxiNet)(x) = m.fc3(m.fc2(m.fc1(x)))
