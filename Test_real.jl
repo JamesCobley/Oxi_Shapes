@@ -21,6 +21,8 @@ using Flux
 
 CairoMakie.activate!()
 
+
+
 # === Proteoform Setup ===
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 flat_pos = Dict(
@@ -379,34 +381,30 @@ function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32
 end
 
 # === Training Function ===
-function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
-    opt = ADAM(lr)
-    loss_fn(ŷ, y) = Flux.Losses.mse(ŷ, y)
+function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3, geodesics, pf_states)
+    # Initialize optimizer with learning rate
+    opt = Optimisers.setup(Optimisers.Adam(lr), model)
 
     for epoch in 1:epochs
-        gs = Flux.gradient(Flux.params(model)) do
-            raw_pred = model(X_train)
-            pred = round.(raw_pred .* 100) ./ 100
-            pred = pred ./ sum(pred; dims=1)
+        # Compute loss and gradients using the modern pattern
+        loss, back = Flux.withgradient(model) do m
+            raw_pred = m(X_train)  # Forward pass
+            pred = round.(raw_pred .* 100) ./ 100  # Optional: rounding for stability
+            pred = pred ./ sum(pred; dims=1)  # Normalize predictions
 
-            main_loss = loss_fn(pred, Y_train)
-            geo_loss = geodesic_loss(pred, X_train, pf_states, geodesics)
-            println("Epoch $epoch - MSE: $(round(main_loss, digits=4)) | Geodesic Loss: $geo_loss")
-            return main_loss
+            # Log geodesic loss separately
+            println("Epoch $epoch - Geodesic Loss: ", geodesic_loss(pred, X_train, pf_states, geodesics))
+
+            return Flux.Losses.mse(pred, Y_train)  # Main loss
         end
-        Flux.Optimise.update!(opt, Flux.params(model), gs)
+
+        # Update model parameters and optimizer state
+        opt, model = Optimisers.update(opt, model, back)
     end
+
+    return model  # Return the trained model
 end
 
-        if epoch % 10 == 0
-            raw_val = model(X_val)
-            val_pred = round.(raw_val .* 100) ./ 100
-            val_pred ./= sum(val_pred; dims=1)
-            val_loss = loss_fn(val_pred, Y_val)
-            println("Epoch $epoch/$epochs | Val Loss: $(val_loss) ")
-        end
-    end
-end
 
 # === Evaluation Function ===
 function evaluate_model(model, X_test, Y_test)
