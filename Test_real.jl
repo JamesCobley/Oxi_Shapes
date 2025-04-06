@@ -3,7 +3,7 @@ using Pkg
 Pkg.activate(".")  # Optional: activate project environment
 Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
          "StatsBase", "DifferentialEquations", "Ripserer",
-         "Distances", "Interploations", "CairoMakie", "DelimitedFiles", "Distributions", "ComplexityMeasures", "BSON"])
+         "Distances", "Interpolations", "CairoMakie", "DelimitedFiles", "Distributions", "ComplexityMeasures", "BSON"])
 
 using CairoMakie
 using GeometryBasics: Point2, Point3
