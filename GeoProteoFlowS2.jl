@@ -1,6 +1,7 @@
 using LinearAlgebra
 using Statistics
 using StatsBase
+using Distributions
 using BSON
 using BSON: @load, @save
 
@@ -9,8 +10,7 @@ using BSON: @load, @save
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 state_index = Dict(s => i for (i, s) in enumerate(pf_states))
 
-# Convert k-priors to full i-state occupancy
-function kpriors_to_istate(k_priors::Vector{Float64})
+function sample_from_kpriors(k_priors::Vector{Float64}; min_val=0.0)
     groups = Dict(
         0 => ["000"],
         1 => ["001", "010", "100"],
@@ -18,12 +18,23 @@ function kpriors_to_istate(k_priors::Vector{Float64})
         3 => ["111"]
     )
     occupancy = zeros(Float64, length(pf_states))
+
     for k in 0:3
-        for s in groups[k]
-            occupancy[state_index[s]] = k_priors[k + 1] / length(groups[k])
+        states = groups[k]
+        n = length(states)
+        if iszero(k_priors[k + 1])
+            continue
+        end
+
+        rand_weights = rand(Dirichlet(n, 1.0))
+        scaled = rand_weights * k_priors[k + 1]
+
+        for (i, s) in enumerate(states)
+            occupancy[state_index[s]] = scaled[i]
         end
     end
-    return occupancy
+
+    return occupancy ./ sum(occupancy)  # Normalize just in case
 end
 
 # --- Metric Functions ---
@@ -54,7 +65,7 @@ function lyapunov_exponent_kbins(rho_series::Vector{<:AbstractVector{<:Real}})
     return coeffs[1]  # Slope is the Lyapunov exponent
 end
 
-function evolve_time_series_alive(rho0::Vector{Float64}, T::Int, pf_states, flat_pos, edges; max_moves_per_step=10)
+function evolve_time_series_alive(rho0::Vector{Float64}, T::Int, pf_states, flat_pos, edges; max_moves_per_step=20)
     """
     Discrete-time evolution using oxi_shapes_alive!
     Returns a vector of occupancy vectors over T time steps.
@@ -76,8 +87,11 @@ empirical_start_k = [0.25, 0.75, 0.0, 0.0]
 empirical_end_k   = [0.06, 0.53, 0.33, 0.10]
 
 # Convert k-priors to full occupancy (length 8) for R=3.
-rho_start_full = kpriors_to_istate(empirical_start_k)
-rho_target_full = kpriors_to_istate(empirical_end_k)
+rho_start_full = sample_from_kpriors(empirical_start_k)
+rho_target_full = sample_from_kpriors(empirical_end_k)
+
+println("Sampled Initial i-state: ", round.(rho_start_full, digits=3))
+println("Sampled Target i-state: ", round.(rho_target_full, digits=3))
 
 println("Empirical Start k-priors: ", empirical_start_k)
 println("Empirical End k-priors: ", empirical_end_k)
@@ -167,7 +181,7 @@ println("Lyapunov Exponent (k-bin trajectory): ", round(lyap_exp_k, digits=6))
 
 # Simulate trajectories for many molecules (stochastic variation via model rollout)
 num_molecules = 100
-trajectories = [predict_trajectory_with_metadata(model, rho_start_empirical, 240) for _ in 1:num_molecules]
+trajectories = [predict_trajectory_with_metadata(model, Float32.(sample_from_kpriors(empirical_start_k)), 240) for _ in 1:num_molecules]
 
 # Confidence = max occupancy in final state
 final_preds = [traj[1][end] for traj in trajectories]  # traj[1] is the trajectory
@@ -187,11 +201,16 @@ for (idx, traj) in enumerate(top5_trajectories)
 
     println("\nTop Prediction $(idx):")
     println("Final occupancy: ", round.(final_occ, digits=3))
+   
     println("ML Input Start (Occupancy): ", round.(rho_start_empirical, digits=3))
-    println("ML Input Percent Oxidation (Start): ", percent_oxidation(rho_start_empirical))
-    println("Percent oxidation: ", round(perc_ox, digits=2))
-    println("Shannon entropy: ", round(entropy_val, digits=3))
-    println("Lyapunov exponent: ", round(lyap_val, digits=6))
+    println("ML Input Percent Oxidation (Start): ", round(percent_oxidation(rho_start_empirical), digits=2))
+
+    println("Final Predicted Occupancy (End): ", round.(final_occ, digits=3))
+    println("Predicted Percent Oxidation (End): ", round(percent_oxidation(final_occ), digits=2))
+
+    println("Predicted Shannon Entropy: ", round(entropy_val, digits=3))
+    println("Predicted Lyapunov Exponent: ", round(lyap_val, digits=6))
+
 end
 
 # --- Master metadata dictionary for full export
