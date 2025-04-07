@@ -21,7 +21,6 @@ using Flux
 using BSON
 using BSON: @save  
 
-
 CairoMakie.activate!()
 
 # === Proteoform Setup ===
@@ -456,7 +455,6 @@ model = Chain(
     Dense(32, 8),
     relu  # Ensures no negative outputs
 )
-
 
 train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat;
             epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
