@@ -219,40 +219,14 @@ function evolve_time_series_and_geodesic!(ρ0::Vector{Float64}, T::Int, pf_state
     trajectory = String[]
     ρ_series = [copy(ρ)]
 
-    # === Add counters for k+ and k- moves
-    k_plus = 0
-    k_minus = 0
-
-    idx = Dict(s => i for (i, s) in enumerate(pf_states))  # Index map
-
     for t in 1:T
-        ρ_before = copy(ρ)
-
-        # Call engine
         oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
-
-        # === Compare state transitions
-        i_before = argmax(ρ_before)
-        i_after = argmax(ρ)
-
-        k_before = count(c -> c == '1', pf_states[i_before])
-        k_after = count(c -> c == '1', pf_states[i_after])
-
-        if k_after > k_before
-            k_plus += 1
-        elseif k_after < k_before
-            k_minus += 1
-        end
-
-        # Track state
         push!(ρ_series, copy(ρ))
         push!(trajectory, pf_states[argmax(ρ)])
     end
 
     geo = dominant_geodesic(trajectory, geodesics)
-
-    # === Return additional metadata
-    return ρ_series, trajectory, geo, k_plus, k_minus
+    return ρ_series, trajectory, geo
 end
 
 function geodesic_loss(initial::Vector{Float64}, final::Vector{Float64}, pf_states, geodesics)
@@ -280,7 +254,7 @@ function topological_entropy(dgm)
 end
 
 # Function to generate systematic initial conditions
-function generate_systematic_initials(num_random::Int=10)
+function generate_systematic_initials()
     initials = []
 
     # (1) Single i-state occupancy
@@ -309,11 +283,11 @@ function generate_systematic_initials(num_random::Int=10)
     bell = [0.05, 0.1, 0.1, 0.1, 0.15, 0.15, 0.15, 0.2]
     push!(initials, bell / sum(bell))
 
-    # (7) Geometric gradient
+    # (7) Geometric gradient (left to right in flat_pos)
     gradient = range(0.1, stop=0.9, length=8)
     push!(initials, gradient / sum(gradient))
 
-    # (8) Add random distributions (well-formed, normalized)
+     # (8) Add random distributions (well-formed, normalized)
     for _ in 1:num_random
         rand_vec = rand(8)
         push!(initials, rand_vec / sum(rand_vec))
@@ -323,32 +297,47 @@ function generate_systematic_initials(num_random::Int=10)
 end
 
 # Function to create dataset using ODE solver
-function create_dataset_ODE_alive(; t_span=nothing, save_every=100)
+function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every=250)
     if isnothing(t_span)
         t_span = range(0.0, stop=1.0, length=100)
     end
 
-    # Generate systematic and random initial conditions
-    systematic = generate_systematic_initials()
-    num_random = 100 - length(systematic)
-    randoms = [rand(8) |> x -> x / sum(x) for _ in 1:num_random]
-
-    # Combine and label for tracking
-    labeled_initials = vcat([(x, "systematic") for x in systematic], [(x, "random") for x in randoms])
-
     X, Y, geos = [], [], []
     geo_counter = Dict{Vector{String}, Int}()
-    total_samples = 0
-    global metadatas = []
+function generate_systematic_initials()
+    initials = []
 
-    for (vec, kind) in labeled_initials
-        for _ in 1:10  # Each shape sampled 10 times
+    # (1) Single i-state occupancy
+    for i in 1:8
+        vec = zeros(8)
+        vec[i] = 1.0
+        push!(initials, vec)
+    end
+
+    # (2–7) Add predefined curved/flat shapes
+    # (Your existing ones here...)
+
+    # (8) Add random distributions to bring total to 100
+    num_random = 100 - length(initials)
+    for _ in 1:num_random
+        rand_vec = rand(8)
+        push!(initials, rand_vec / sum(rand_vec))
+    end
+
+    return initials
+end
+
+    initials = generate_systematic_initials()  # Use only the first 10 distributions for speed testing
+
+    total_samples = 0  # Sample counter
+
+    for vec in initials
+        for _ in 1:10  # Generate more variants per shape if needed
             rho0 = vec
-            rho_t, trajectory, geopath, k_plus, k_minus = evolve_time_series_and_geodesic!(
-                rho0, length(t_span), pf_states, flat_pos, edges
-            )
+            rho_t, geopath = evolve_time_series_and_geodesic!(rho0, length(t_span), pf_states, flat_pos, edges)
             final_rho = rho_t[end]
 
+            # Digital enforcement
             @assert all(isapprox.(final_rho * 100, round.(final_rho * 100), atol=1e-6)) "Non-digital occupancy detected: $final_rho"
 
             push!(X, rho0)
@@ -359,34 +348,19 @@ function create_dataset_ODE_alive(; t_span=nothing, save_every=100)
                 push!(geos, geopath)
             end
 
-            start_k = sum([count(c -> c == '1', pf_states[i]) * round(rho0[i]*100) for i in 1:8])
-            end_k   = sum([count(c -> c == '1', pf_states[i]) * round(final_rho[i]*100) for i in 1:8])
-            start_i = pf_states[argmax(rho0)]
-            end_i   = pf_states[argmax(final_rho)]
+            total_samples += 1  # Update sample count
 
-            sample_meta = Dict(
-                :start_rho => rho0,
-                :end_rho => final_rho,
-                :start_k => start_k,
-                :end_k => end_k,
-                :start_i => start_i,
-                :end_i => end_i,
-                :geodesic => geopath,
-                :device => CUDA.has_cuda() ? "gpu" : "cpu",
-                :trajectory => trajectory,
-                :k_plus => k_plus,
-                :k_minus => k_minus,
-                :origin => kind
-            )
-
-            push!(metadatas, sample_meta)
-            total_samples += 1
-
+            # Save intermediate files every save_every samples
             if total_samples % save_every == 0
                 println("Saving checkpoint at $total_samples samples...")
                 writedlm("X_partial_$total_samples.csv", X, ',')
                 writedlm("Y_partial_$total_samples.csv", Y, ',')
+
             end
+        end
+
+        if total_samples >= max_samples
+            break
         end
     end
 
@@ -432,7 +406,7 @@ function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32
 end
 
 # === Training Function ===
-function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3, geodesics, pf_states)
+function train_model(model, X_train, Y_train, X_val, Y_val; epochs=500, lr=1e-3, geodesics, pf_states)
     # Initialize optimizer with learning rate
     opt = Optimisers.setup(Optimisers.Adam(lr), model)
 
@@ -522,7 +496,7 @@ pred_val, val_loss = evaluate_model(model, X_val_mat, Y_val_mat)
 println("Validation Loss: $(round(val_loss, digits=6))")
 
 # Save model
-BSON.@save "oxinet_model.bson" model=cpu(model) pf_states flat_pos metadata=metadatas
+BSON.@save "oxinet_model.bson" model=cpu(model) pf_states flat_pos
 println("✅ Trained model saved to 'oxinet_model.bson'")
 
 # Display sample predictions
