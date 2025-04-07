@@ -28,35 +28,30 @@ end
 
 # --- Metric Functions ---
 
-# (1) Percent oxidation: average number of 1's per state × 100
-function percent_oxidation(occupancy::Vector{Float64})
+function percent_oxidation(occupancy::AbstractVector{<:Real})
     oxidation_levels = [(count(==('1'), s) / 3) * 100 for s in pf_states]
     return sum(occupancy .* oxidation_levels)
 end
 
-# (2) Shannon entropy of the distribution
-function shannon_entropy(occupancy::Vector{Float64})
+function shannon_entropy(occupancy::AbstractVector{<:Real})
     p = filter(x -> x > 0, occupancy)
     return -sum(p .* log2.(p))
 end
 
-# (3) Lyapunov exponent from k-bin oxidation trajectory
-function lyapunov_exponent_kbins(rho_series::Vector{Vector{Float64}})
+function lyapunov_exponent_kbins(rho_series::Vector{<:AbstractVector{<:Real}})
     k_series = [
         sum(count(==('1'), s) * rho[i] for (i, s) in enumerate(pf_states)) / 3
         for rho in rho_series
     ]
 
     diffs = abs.(diff(k_series))
-    diffs = replace(diffs, 0.0 => 1e-12)
+    diffs = replace(diffs, 0.0 => 1e-12)  # Avoid log(0)
     log_diffs = log.(diffs)
 
     t = collect(0:length(log_diffs)-1)
     A = hcat(t, ones(length(t)))
     coeffs = A \ log_diffs
-    slope = coeffs[1]
-
-    return slope
+    return coeffs[1]  # Slope is the Lyapunov exponent
 end
 
 function evolve_time_series_alive(rho0::Vector{Float64}, T::Int, pf_states, flat_pos, edges; max_moves_per_step=10)
@@ -170,15 +165,15 @@ println("Lyapunov Exponent (k-bin trajectory): ", round(lyap_exp_k, digits=6))
 
 # Simulate trajectories for many molecules (stochastic variation via model rollout)
 num_molecules = 100
-trajectories = [predict_trajectory(model, rho_start_empirical, 240) for _ in 1:num_molecules]
+trajectories = [predict_trajectory_with_metadata(model, rho_start_empirical, 240) for _ in 1:num_molecules]
 
 # Confidence = max occupancy in final state
-final_preds = [traj[end] for traj in trajectories]
+final_preds = [traj[1][end] for traj in trajectories]  # traj[1] is the trajectory
 confidences = [maximum(pred) for pred in final_preds]
 
 # Get top 5 most confident predictions
 top5_indices = partialsortperm(confidences, rev=true, 1:5)
-top5_trajectories = trajectories[top5_indices]
+top5_trajectories = [trajectories[i][1] for i in top5_indices]  # again, only the trajectory
 
 # Compute metrics for the top 5 trajectories
 for (idx, traj) in enumerate(top5_trajectories)
@@ -195,24 +190,12 @@ for (idx, traj) in enumerate(top5_trajectories)
     println("Lyapunov exponent: ", round(lyap_val, digits=6))
 end
 
-# --- Fisher Information Metric
-function fisher_information(occupancy_series::Vector{Vector{Float64}})
-    diffs = [norm(occupancy_series[i+1] .- occupancy_series[i]) for i in 1:length(occupancy_series)-1]
-    return sum(diffs .^ 2)
-end
-
-fisher_vals = [fisher_information(traj) for traj in trajectories]
-fisher_info = mean(fisher_vals)
-
-println("Fisher Information Metric (ML trajectories): ", round(fisher_info, digits=6))
-
 # --- Master metadata dictionary for full export
 master_metadata = Dict(
     "empirical_metadata" => metadata,
     "all_trajectories" => trajectories,
     "confidences" => confidences,
     "top5_trajectories" => top5_trajectories,
-    "fisher_information" => fisher_info,
     "pf_states" => pf_states,
     "empirical_start_k" => empirical_start_k,
     "empirical_end_k" => empirical_end_k
