@@ -390,7 +390,7 @@ function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3,
 
     for epoch in 1:epochs
         # Compute loss and gradients using the modern pattern
-        loss, back = Flux.withgradient(model) do m
+        loss, grads = Flux.withgradient(model) do m
             raw_pred = m(X_train)  # Forward pass
             pred = round.(raw_pred .* 100) ./ 100  # Optional: rounding for stability
             pred = pred ./ sum(pred; dims=1)  # Normalize predictions
@@ -402,7 +402,7 @@ function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3,
         end
 
         # Update model parameters and optimizer state
-        opt, model = Optimisers.update(opt, model, back)
+        opt, model = Optimisers.update(opt, model, grads[1])
     end
 
     return model  # Return the trained model
