@@ -20,8 +20,12 @@ using DelimitedFiles
 using Flux
 using BSON
 using BSON: @save  
+using CUDA
 
 CairoMakie.activate!()
+
+# Set device dynamically: use GPU if available, otherwise CPU
+device(x) = CUDA.functional() ? gpu(x) : x
 
 # === Proteoform Setup ===
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
@@ -414,7 +418,6 @@ function evaluate_model(model, X_val_mat, Y_val_mat)
     return pred, loss
 end
 
-
 println("Generating dataset using systematic Oxi-Shape sampling...")
 t_span = range(0.0, stop=1.0, length=100)
 X, Y, geos = create_dataset_ODE_alive(t_span=t_span)
@@ -449,12 +452,19 @@ println("First Y sample size: ", size(Y[1]))
 println("X[1] type: ", typeof(X[1]))
 
 println("Building and training the neural network (OxiFlowNet)...")
+# Build the model
 model = Chain(
     Dense(8, 32, relu),
     Dense(32, 32, relu),
     Dense(32, 8),
     relu  # Ensures no negative outputs
-)
+) |> device
+
+# Move training and validation data to the right device
+X_train_mat = device(X_train_mat)
+Y_train_mat = device(Y_train_mat)
+X_val_mat   = device(X_val_mat)
+Y_val_mat   = device(Y_val_mat)
 
 train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat;
             epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
@@ -464,7 +474,7 @@ pred_val, val_loss = evaluate_model(model, X_val_mat, Y_val_mat)
 println("Validation Loss: $(round(val_loss, digits=6))")
 
 # Save model
-BSON.@save "oxinet_model.bson" model pf_states flat_pos
+BSON.@save "oxinet_model.bson" model=cpu(model) pf_states flat_pos
 println("✅ Trained model saved to 'oxinet_model.bson'")
 
 # Display sample predictions
