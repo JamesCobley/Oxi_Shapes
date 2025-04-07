@@ -2,7 +2,7 @@ using LinearAlgebra
 using Statistics
 using StatsBase
 using BSON
-using BSON: @load
+using BSON: @load, @save
 
 
 # Define proteoform states and indexing
@@ -112,21 +112,55 @@ println("Predicted Percent Oxidation:", percent_oxidation(predicted_final_occ))
 println("Predicted Shannon Entropy:", round(shannon_entropy(predicted_final_occ), digits=3))
 
 # Generate time series trajectory via model rollouts
-function predict_trajectory(model, initial, steps=240)
+function predict_trajectory_with_metadata(model, initial, steps=240)
     traj = [initial]
     current = initial
+    total_moves = 0
+    oxidizing_moves = 0
+    reducing_moves = 0
+
     for _ in 1:steps
         pred = model(current)
         pred = round.(pred .* 100) ./ 100
         pred ./= sum(pred)
+
+        # Compute oxidation level change (for move classification)
+        k_prev = percent_oxidation(current)
+        k_new = percent_oxidation(pred)
+
+        if k_new > k_prev + 1e-4
+            oxidizing_moves += 1
+        elseif k_new < k_prev - 1e-4
+            reducing_moves += 1
+        end
+        total_moves += 1
+
         push!(traj, pred)
         current = pred
     end
-    return traj
+
+    return traj, total_moves, oxidizing_moves, reducing_moves
 end
 
 # Run trajectory prediction
-traj_series = predict_trajectory(model, rho_start_empirical, 240)
+traj_series, total_moves, ox_moves, red_moves = predict_trajectory_with_metadata(model, rho_start_empirical, 240)
+final_occ = traj_series[end]
+percent_series = [percent_oxidation(r) for r in traj_series]
+entropy_final = shannon_entropy(final_occ)
+lyapunov_exp = lyapunov_exponent_kbins(traj_series)
+
+metadata = Dict(
+    "initial_state" => rho_start_empirical,
+    "final_state" => final_occ,
+    "trajectory" => traj_series,
+    "percent_series" => percent_series,
+    "entropy_final" => entropy_final,
+    "lyapunov" => lyapunov_exp,
+    "trajectory_id" => "empirical_run_1",
+    "total_moves" => total_moves,
+    "oxidizing_moves" => ox_moves,
+    "reducing_moves" => red_moves
+)
 
 # Compute Lyapunov exponent over trajectory
 percent_series = [percent_oxidation(r) for r in traj_series]
@@ -161,23 +195,6 @@ for (idx, traj) in enumerate(top5_trajectories)
     println("Lyapunov exponent: ", round(lyap_val, digits=6))
 end
 
-# --- Poincaré Recurrence Plot (textual/debug mode)
-function poincare_recurrence(series::Vector{Float64}; threshold::Float64=1.0)
-    N = length(series)
-    R = falses(N, N)
-    for i in 1:N
-        for j in 1:N
-            R[i, j] = abs(series[i] - series[j]) < threshold
-        end
-    end
-    return R
-end
-
-rec_plot_top = poincare_recurrence([percent_oxidation(r) for r in top5_trajectories[1]]; threshold=1.0)
-
-# Optional: plot if using Makie or other plotting lib
-# display_heatmap(rec_plot_top)
-
 # --- Fisher Information Metric
 function fisher_information(occupancy_series::Vector{Vector{Float64}})
     diffs = [norm(occupancy_series[i+1] .- occupancy_series[i]) for i in 1:length(occupancy_series)-1]
@@ -189,10 +206,10 @@ fisher_info = mean(fisher_vals)
 
 println("Fisher Information Metric (ML trajectories): ", round(fisher_info, digits=6))
 
-# --- Feigenbaum placeholder
-function estimate_feigenbaum(percent_series::Vector{Float64})
-    return 4.669  # Placeholder: universal Feigenbaum delta
-end
+# --- Save metadata for downstream analysis
+using Dates
+timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
+save_path = "simulation_metadata_$timestamp.bson"
 
-feigenbaum = estimate_feigenbaum(percent_series)
-println("Estimated Feigenbaum constant (placeholder): ", feigenbaum)
+BSON.@save save_path metadata
+println("✅ Metadata saved to '$save_path'")
