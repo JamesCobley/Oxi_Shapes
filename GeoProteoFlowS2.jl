@@ -1,5 +1,9 @@
 using LinearAlgebra
 using Statistics
+using StatsBase
+using BSON
+using BSON: @load
+
 
 # Define proteoform states and indexing
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
@@ -88,3 +92,107 @@ println("Empirical Percent Oxidation (Target): ", percent_oxidation(rho_target_f
 
 println("Empirical Shannon Entropy (Start): ", round(shannon_entropy(rho_start_full), digits=3))
 println("Empirical Shannon Entropy (Target): ", round(shannon_entropy(rho_target_full), digits=3))
+
+# Load the trained model from BSON file
+@load "oxinet_model.bson" model pf_states flat_pos
+
+# Convert empirical start to Float32 for prediction
+rho_start_empirical = Float32.(rho_start_full)
+
+# Predict the final occupancy using the trained neural network model
+predicted_final_occ = model(rho_start_empirical)
+
+# Normalize and round the prediction
+predicted_final_occ = round.(predicted_final_occ .* 100) ./ 100
+predicted_final_occ ./= sum(predicted_final_occ)
+
+# Print predicted metrics
+println("\nML Predicted Final Occupancy:", round.(predicted_final_occ, digits=3))
+println("Predicted Percent Oxidation:", percent_oxidation(predicted_final_occ))
+println("Predicted Shannon Entropy:", round(shannon_entropy(predicted_final_occ), digits=3))
+
+# Generate time series trajectory via model rollouts
+function predict_trajectory(model, initial, steps=240)
+    traj = [initial]
+    current = initial
+    for _ in 1:steps
+        pred = model(current)
+        pred = round.(pred .* 100) ./ 100
+        pred ./= sum(pred)
+        push!(traj, pred)
+        current = pred
+    end
+    return traj
+end
+
+# Run trajectory prediction
+traj_series = predict_trajectory(model, rho_start_empirical, 240)
+
+# Compute Lyapunov exponent over trajectory
+percent_series = [percent_oxidation(r) for r in traj_series]
+lyap_exp_k = lyapunov_exponent_kbins(traj_series)
+
+println("Lyapunov Exponent (k-bin trajectory): ", round(lyap_exp_k, digits=6))
+
+# Simulate trajectories for many molecules (stochastic variation via model rollout)
+num_molecules = 100
+trajectories = [predict_trajectory(model, rho_start_empirical, 240) for _ in 1:num_molecules]
+
+# Confidence = max occupancy in final state
+final_preds = [traj[end] for traj in trajectories]
+confidences = [maximum(pred) for pred in final_preds]
+
+# Get top 5 most confident predictions
+top5_indices = partialsortperm(confidences, rev=true, 1:5)
+top5_trajectories = trajectories[top5_indices]
+
+# Compute metrics for the top 5 trajectories
+for (idx, traj) in enumerate(top5_trajectories)
+    final_occ = traj[end]
+    perc_ox = percent_oxidation(final_occ)
+    entropy_val = shannon_entropy(final_occ)
+    perc_series_traj = [percent_oxidation(r) for r in traj]
+    lyap_val = lyapunov_exponent_kbins(traj)
+
+    println("\nTop Prediction $(idx):")
+    println("Final occupancy: ", round.(final_occ, digits=3))
+    println("Percent oxidation: ", round(perc_ox, digits=2))
+    println("Shannon entropy: ", round(entropy_val, digits=3))
+    println("Lyapunov exponent: ", round(lyap_val, digits=6))
+end
+
+# --- Poincaré Recurrence Plot (textual/debug mode)
+function poincare_recurrence(series::Vector{Float64}; threshold::Float64=1.0)
+    N = length(series)
+    R = falses(N, N)
+    for i in 1:N
+        for j in 1:N
+            R[i, j] = abs(series[i] - series[j]) < threshold
+        end
+    end
+    return R
+end
+
+rec_plot_top = poincare_recurrence([percent_oxidation(r) for r in top5_trajectories[1]]; threshold=1.0)
+
+# Optional: plot if using Makie or other plotting lib
+# display_heatmap(rec_plot_top)
+
+# --- Fisher Information Metric
+function fisher_information(occupancy_series::Vector{Vector{Float64}})
+    diffs = [norm(occupancy_series[i+1] .- occupancy_series[i]) for i in 1:length(occupancy_series)-1]
+    return sum(diffs .^ 2)
+end
+
+fisher_vals = [fisher_information(traj) for traj in trajectories]
+fisher_info = mean(fisher_vals)
+
+println("Fisher Information Metric (ML trajectories): ", round(fisher_info, digits=6))
+
+# --- Feigenbaum placeholder
+function estimate_feigenbaum(percent_series::Vector{Float64})
+    return 4.669  # Placeholder: universal Feigenbaum delta
+end
+
+feigenbaum = estimate_feigenbaum(percent_series)
+println("Estimated Feigenbaum constant (placeholder): ", feigenbaum)
