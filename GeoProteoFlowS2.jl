@@ -206,10 +206,22 @@ fisher_info = mean(fisher_vals)
 
 println("Fisher Information Metric (ML trajectories): ", round(fisher_info, digits=6))
 
-# --- Save metadata for downstream analysis
+# --- Master metadata dictionary for full export
+master_metadata = Dict(
+    "empirical_metadata" => metadata,
+    "all_trajectories" => trajectories,
+    "confidences" => confidences,
+    "top5_trajectories" => top5_trajectories,
+    "fisher_information" => fisher_info,
+    "pf_states" => pf_states,
+    "empirical_start_k" => empirical_start_k,
+    "empirical_end_k" => empirical_end_k
+)
+
+# Save to BSON file with timestamp
 using Dates
 timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
-save_path = "simulation_metadata_$timestamp.bson"
+save_path = "full_simulation_metadata_$timestamp.bson"
 
-BSON.@save save_path metadata
-println("✅ Metadata saved to '$save_path'")
+BSON.@save save_path master_metadata
+println("✅ Full simulation metadata saved to '$save_path'")
