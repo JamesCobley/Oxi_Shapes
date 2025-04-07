@@ -1,18 +1,24 @@
-# ╔═╡ Install required packages (only needs to run once per session)
-using Pkg
-Pkg.activate(".")  # Optional: activate project environment
-Pkg.add(["Flux", "CUDA", "Meshes", "GeometryBasics", "LinearAlgebra",
-         "StatsBase", "DifferentialEquations", "Ripserer",
-         "Distances", "Interploations", "CairoMakie"])
-
 using CairoMakie
 using GeometryBasics: Point2, Point3
 using Interpolations
 using Random
 using StatsBase: sample, Weights
 using LinearAlgebra
+using Ripserer
+using Statistics
+using ComplexityMeasures
+using Distributions
+using Distances
+using DelimitedFiles
+using Flux
+using BSON
+using BSON: @save  
+using CUDA
 
 CairoMakie.activate!()
+
+# Set device dynamically: use GPU if available, otherwise CPU
+device(x) = CUDA.functional() ? gpu(x) : x
 
 # === Proteoform Setup ===
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
@@ -116,39 +122,6 @@ function sheaf_consistency(stalks, edges; threshold=2.5)
     return inconsistencies
 end
 
-# === Plotting ===
-function plot_c_ricci_surface_interpolated(flat_pos, field, pf_states)
-    fig = Figure(size=(900, 700))
-    ax = Axis3(fig[1, 1], title="Interpolated C-Ricci Surface Field", perspectiveness=0.8)
-
-    xs = [flat_pos[s][1] for s in pf_states]
-    ys = [flat_pos[s][2] for s in pf_states]
-
-    grid_x = LinRange(minimum(xs)-0.5, maximum(xs)+0.5, 100)
-    grid_y = LinRange(minimum(ys)-0.5, maximum(ys)+0.5, 100)
-    grid_z = fill(NaN, length(grid_x), length(grid_y))
-
-    for (i, s) in enumerate(pf_states)
-        x_idx = findmin(abs.(grid_x .- flat_pos[s][1]))[2]
-        y_idx = findmin(abs.(grid_y .- flat_pos[s][2]))[2]
-        grid_z[x_idx, y_idx] = field[i]
-    end
-
-    interp_func = interpolate(grid_z, BSpline(Linear()))
-    interp_func_itp = extrapolate(interp_func, NaN)
-    surface!(ax, grid_x, grid_y, (x, y) -> interp_func_itp[x, y], colormap=:viridis)
-
-    for (i, s) in enumerate(pf_states)
-        x, y = flat_pos[s]
-        z = field[i]
-        scatter!(ax, [x], [y], [z], markersize=10, color=:black)
-        text!(ax, s, position=(x, y, z + 0.05), align=(:center, :bottom), fontsize=14)
-    end
-
-    Colorbar(fig[1, 2], limits=extrema(field), colormap=:viridis, label="C-Ricci (Dirichlet)")
-    fig
-end
-
 function compute_entropy_cost(i, j, C_R_vals, pf_states)
     baseline_DeltaE = 1.0
     mass_heat = 0.1
@@ -246,14 +219,40 @@ function evolve_time_series_and_geodesic!(ρ0::Vector{Float64}, T::Int, pf_state
     trajectory = String[]
     ρ_series = [copy(ρ)]
 
+    # === Add counters for k+ and k- moves
+    k_plus = 0
+    k_minus = 0
+
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))  # Index map
+
     for t in 1:T
+        ρ_before = copy(ρ)
+
+        # Call engine
         oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
+
+        # === Compare state transitions
+        i_before = argmax(ρ_before)
+        i_after = argmax(ρ)
+
+        k_before = count(c -> c == '1', pf_states[i_before])
+        k_after = count(c -> c == '1', pf_states[i_after])
+
+        if k_after > k_before
+            k_plus += 1
+        elseif k_after < k_before
+            k_minus += 1
+        end
+
+        # Track state
         push!(ρ_series, copy(ρ))
         push!(trajectory, pf_states[argmax(ρ)])
     end
 
     geo = dominant_geodesic(trajectory, geodesics)
-    return ρ_series, trajectory, geo
+
+    # === Return additional metadata
+    return ρ_series, trajectory, geo, k_plus, k_minus
 end
 
 function geodesic_loss(initial::Vector{Float64}, final::Vector{Float64}, pf_states, geodesics)
@@ -262,35 +261,277 @@ function geodesic_loss(initial::Vector{Float64}, final::Vector{Float64}, pf_stat
     return valid ? 0.0 : 1.0
 end
 
-# === Run Example ===
-ρ = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9]
-ρ ./= sum(ρ)
-
-points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
-
-println("Anisotropy field: ", round.(anisotropy_vals; digits=4))
-
-sheaf_stalks = initialize_sheaf_stalks(flat_pos, pf_states)
-inconsistencies = sheaf_consistency(sheaf_stalks, edges)
-if !isempty(inconsistencies)
-    println("Sheaf inconsistencies found: ", inconsistencies)
-else
-    println("Sheaf stalks are consistent.")
+# Function to compute the persistent homology diagram
+function persistent_diagram(rho::Vector{Float64})
+    points = reshape(rho, :, 1)  # 8×1 matrix: 8 points in ℝ¹
+    dgms = ripserer(points; dim_max=1)
+    return dgms
 end
 
-fig_surf = plot_c_ricci_surface_interpolated(flat_pos, C_R_vals, pf_states)
-save("C_Ricci_interpolated_surface.png", fig_surf)
-display(fig_surf)
+# Function to compute the persistent entropy
+function topological_entropy(dgm)
+    if isempty(dgm) || isempty(dgm[1])
+        return 0.0
+    end
+    lifespans = [pt.death - pt.birth for pt in dgm[1]]
+    probs = lifespans ./ sum(lifespans)
+    entropy = -sum(probs .* log2.(probs .+ 1e-10))
+    return entropy
+end
 
-# === Run Geodesic Test ===
-ρ_init = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9]
-ρ_init ./= sum(ρ_init)
+# Function to generate systematic initial conditions
+function generate_systematic_initials(num_random::Int=10)
+    initials = []
 
-ρ_series, traj, geo = evolve_time_series_and_geodesic!(ρ_init, 1, pf_states, flat_pos, edges; max_moves_per_step=10)
+    # (1) Single i-state occupancy
+    for i in 1:8
+        vec = zeros(8)
+        vec[i] = 1.0
+        push!(initials, vec)
+    end
 
-println("Dominant geodesic: ", geo)
-println("Trajectory: ", traj)
-println("Geodesic loss: ", geodesic_loss(ρ_series[1], ρ_series[end], pf_states, geodesics))
-println("\n--- Proteoform Distributions ---")
-println("Start ρ: ", round.(ρ_series[1]; digits=4))
-println("End   ρ: ", round.(ρ_series[end]; digits=4))
+    # (2) Flat occupancy
+    push!(initials, fill(1.0 / 8, 8))
+
+    # (3) Curved within k=1 (e.g., 010 peak)
+    curved_k1 = [0.0, 0.15, 0.7, 0.15, 0.0, 0.0, 0.0, 0.0]
+    push!(initials, curved_k1 / sum(curved_k1))
+
+    # (4) Curved within k=2 (e.g., 101 peak)
+    curved_k2 = [0.0, 0.0, 0.0, 0.0, 0.15, 0.7, 0.15, 0.0]
+    push!(initials, curved_k2 / sum(curved_k2))
+
+    # (5) Flat in k=0 & k=1, peaked in k=2
+    hybrid = [0.05, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.05]
+    push!(initials, hybrid / sum(hybrid))
+
+    # (6) Bell shape across k
+    bell = [0.05, 0.1, 0.1, 0.1, 0.15, 0.15, 0.15, 0.2]
+    push!(initials, bell / sum(bell))
+
+    # (7) Geometric gradient
+    gradient = range(0.1, stop=0.9, length=8)
+    push!(initials, gradient / sum(gradient))
+
+    # (8) Add random distributions (well-formed, normalized)
+    for _ in 1:num_random
+        rand_vec = rand(8)
+        push!(initials, rand_vec / sum(rand_vec))
+    end
+
+    return initials
+end
+
+# Function to create dataset using ODE solver
+function create_dataset_ODE_alive(; t_span=nothing, save_every=100)
+    if isnothing(t_span)
+        t_span = range(0.0, stop=1.0, length=100)
+    end
+
+    # Generate systematic and random initial conditions
+    systematic = generate_systematic_initials()
+    num_random = 100 - length(systematic)
+    randoms = [rand(8) |> x -> x / sum(x) for _ in 1:num_random]
+
+    # Combine and label for tracking
+    labeled_initials = vcat([(x, "systematic") for x in systematic], [(x, "random") for x in randoms])
+
+    X, Y, geos = [], [], []
+    geo_counter = Dict{Vector{String}, Int}()
+    total_samples = 0
+    global metadatas = []
+
+    for (vec, kind) in labeled_initials
+        for _ in 1:10  # Each shape sampled 10 times
+            rho0 = vec
+            rho_t, trajectory, geopath, k_plus, k_minus = evolve_time_series_and_geodesic!(
+                rho0, length(t_span), pf_states, flat_pos, edges
+            )
+            final_rho = rho_t[end]
+
+            @assert all(isapprox.(final_rho * 100, round.(final_rho * 100), atol=1e-6)) "Non-digital occupancy detected: $final_rho"
+
+            push!(X, rho0)
+            push!(Y, final_rho)
+
+            if !isnothing(geopath)
+                geo_counter[geopath] = get(geo_counter, geopath, 0) + 1
+                push!(geos, geopath)
+            end
+
+            start_k = sum([count(c -> c == '1', pf_states[i]) * round(rho0[i]*100) for i in 1:8])
+            end_k   = sum([count(c -> c == '1', pf_states[i]) * round(final_rho[i]*100) for i in 1:8])
+            start_i = pf_states[argmax(rho0)]
+            end_i   = pf_states[argmax(final_rho)]
+
+            sample_meta = Dict(
+                :start_rho => rho0,
+                :end_rho => final_rho,
+                :start_k => start_k,
+                :end_k => end_k,
+                :start_i => start_i,
+                :end_i => end_i,
+                :geodesic => geopath,
+                :device => CUDA.has_cuda() ? "gpu" : "cpu",
+                :trajectory => trajectory,
+                :k_plus => k_plus,
+                :k_minus => k_minus,
+                :origin => kind
+            )
+
+            push!(metadatas, sample_meta)
+            total_samples += 1
+
+            if total_samples % save_every == 0
+                println("Saving checkpoint at $total_samples samples...")
+                writedlm("X_partial_$total_samples.csv", X, ',')
+                writedlm("Y_partial_$total_samples.csv", Y, ',')
+            end
+        end
+    end
+
+    println("Finished data generation.")
+    println("Most traversed geodesics:")
+    for (path, count) in sort(collect(geo_counter), by=x->x[2], rev=true)
+        println(join(path, " → "), " | Count: ", count)
+    end
+
+    return X, Y, geos
+end
+
+# Define the model
+struct OxiNet
+    fc1::Dense
+    fc2::Dense
+    fc3::Dense
+end
+
+# Constructor for OxiNet
+function OxiNet(input_dim::Int=8, hidden_dim::Int=32, output_dim::Int=8)
+    fc1 = Dense(input_dim, hidden_dim, relu)
+    fc2 = Dense(hidden_dim, hidden_dim, relu)
+    fc3 = Dense(hidden_dim, output_dim)  # No activation (raw logits)
+    return OxiNet(fc1, fc2, fc3)
+end
+
+# Define the forward pass
+(m::OxiNet)(x) = m.fc3(m.fc2(m.fc1(x)))
+
+# === Geodesic Loss (no weights) ===
+function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32}, pf_states, geodesics)
+    batch_size = size(predicted_final, 2)
+    loss = 0.0
+    for i in 1:batch_size
+        start_idx = argmax(initial[:, i])
+        end_idx = argmax(predicted_final[:, i])
+        pred_path = [pf_states[start_idx], pf_states[end_idx]]
+        valid = any(all(x -> x ∈ g, pred_path) for g in geodesics)
+        loss += valid ? 0.0 : 1.0
+    end
+    return loss / batch_size
+end
+
+# === Training Function ===
+function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3, geodesics, pf_states)
+    # Initialize optimizer with learning rate
+    opt = Optimisers.setup(Optimisers.Adam(lr), model)
+
+    for epoch in 1:epochs
+        # Compute loss and gradients using the modern pattern
+        loss, back = Flux.withgradient(model) do m
+            raw_pred = m(X_train)  # Forward pass
+            pred = round.(raw_pred .* 100) ./ 100  # Optional: rounding for stability
+            pred = pred ./ sum(pred; dims=1)  # Normalize predictions
+
+            # Log geodesic loss separately
+            println("Epoch $epoch - Geodesic Loss: ", geodesic_loss(pred, X_train, pf_states, geodesics))
+
+            return Flux.Losses.mse(pred, Y_train)  # Main loss
+        end
+
+        # Update model parameters and optimizer state
+        opt, model = Optimisers.update(opt, model, back)
+    end
+
+    return model  # Return the trained model
+end
+
+
+# === Evaluation Function ===
+function evaluate_model(model, X_val_mat, Y_val_mat)
+    raw_pred = model(X_val_mat)
+    pred = round.(raw_pred .* 100) ./ 100
+    pred ./= sum(pred; dims=1)
+    loss = Flux.Losses.mse(pred, Y_val_mat)
+    return pred, loss
+end
+
+println("Generating dataset using systematic Oxi-Shape sampling...")
+t_span = range(0.0, stop=1.0, length=100)
+X, Y, geos = create_dataset_ODE_alive(t_span=t_span)
+
+# Shuffle and split the dataset
+perm = shuffle(1:length(X))
+X = X[perm]
+Y = Y[perm]
+
+# Convert individual vectors to Float32
+X = [Float32.(x) for x in X]
+Y = [Float32.(y) for y in Y]
+
+split = Int(round(0.8 * length(X)))
+X_train, Y_train = X[1:split], Y[1:split]
+X_val, Y_val = X[split+1:end], Y[split+1:end]
+
+# Convert from vector of vectors to matrix (8, N)
+X_train_mat = hcat(X_train...)
+Y_train_mat = hcat(Y_train...)
+X_val_mat = hcat(X_val...)
+Y_val_mat = hcat(Y_val...)
+
+# (No need to Float32.() here again, but harmless)
+X_train_mat = Float32.(X_train_mat)
+Y_train_mat = Float32.(Y_train_mat)
+X_val_mat = Float32.(X_val_mat)
+Y_val_mat = Float32.(Y_val_mat)
+
+println("First X sample size: ", size(X[1]))
+println("First Y sample size: ", size(Y[1]))
+println("X[1] type: ", typeof(X[1]))
+
+println("Building and training the neural network (OxiFlowNet)...")
+# Build the model
+model = Chain(
+    Dense(8, 32, relu),
+    Dense(32, 32, relu),
+    Dense(32, 8),
+    relu  # Ensures no negative outputs
+) |> device
+
+# Move training and validation data to the right device
+X_train_mat = device(X_train_mat)
+Y_train_mat = device(Y_train_mat)
+X_val_mat   = device(X_val_mat)
+Y_val_mat   = device(Y_val_mat)
+
+train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat;
+            epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
+
+println("\nEvaluating on validation data...")
+pred_val, val_loss = evaluate_model(model, X_val_mat, Y_val_mat)
+println("Validation Loss: $(round(val_loss, digits=6))")
+
+# Save model
+BSON.@save "oxinet_model.bson" model=cpu(model) pf_states flat_pos metadata=metadatas
+println("✅ Trained model saved to 'oxinet_model.bson'")
+
+# Display sample predictions
+for idx in rand(1:length(X_val), 3)
+    init_occ = X_val[idx]
+    true_final = Y_val[idx]
+    pred_final = pred_val[:, idx]  # ← fixed line
+    println("\n--- Sample ---")
+    println("Initial occupancy: ", round.(init_occ, digits=3))
+    println("True final occupancy: ", round.(true_final, digits=3))
+    println("Predicted final occupancy: ", round.(pred_final, digits=3))
+end
