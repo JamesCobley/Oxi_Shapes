@@ -423,28 +423,22 @@ function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32
 end
 
 # === Training Function ===
-function train_model(model, X_train, Y_train, X_val, Y_val; epochs=200, lr=1e-3, geodesics, pf_states)
-    # Initialize optimizer with learning rate
+function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3)
     opt = Optimisers.setup(Optimisers.Adam(lr), model)
 
     for epoch in 1:epochs
-        # Compute loss and gradients using the modern pattern
         loss, grads = Flux.withgradient(model) do m
-            raw_pred = m(X_train)  # Forward pass
-            pred = round.(raw_pred .* 100) ./ 100  # Optional: rounding for stability
-            pred = pred ./ sum(pred; dims=1)  # Normalize predictions
-
-            # Log geodesic loss separately
-            println("Epoch $epoch - Geodesic Loss: ", geodesic_loss(pred, X_train, pf_states, geodesics))
-
-            return Flux.Losses.mse(pred, Y_train)  # Main loss
+            raw_pred = m(X_train)
+            pred = round.(raw_pred .* 100) ./ 100
+            pred = pred ./ sum(pred; dims=1)
+            return Flux.Losses.mse(pred, Y_train)
         end
 
-        # Update model parameters and optimizer state
         opt, model = Optimisers.update(opt, model, grads[1])
+        println("Epoch $epoch - Training Loss: ", round(loss, digits=6))
     end
 
-    return model  # Return the trained model
+    return model
 end
 
 
@@ -505,8 +499,7 @@ Y_train_mat = device(Y_train_mat)
 X_val_mat   = device(X_val_mat)
 Y_val_mat   = device(Y_val_mat)
 
-train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat;
-            epochs=200, lr=1e-3, geodesics=geos, pf_states=pf_states)
+train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat; epochs=200, lr=1e-4)
 
 println("\nEvaluating on validation data...")
 pred_val, val_loss = evaluate_model(model, X_val_mat, Y_val_mat)
