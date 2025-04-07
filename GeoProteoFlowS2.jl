@@ -103,6 +103,8 @@ predicted_final_occ ./= sum(predicted_final_occ)
 
 # Print predicted metrics
 println("\nML Predicted Final Occupancy:", round.(predicted_final_occ, digits=3))
+println("ML Input Start (Occupancy): ", round.(rho_start_empirical, digits=3))
+println("ML Input Percent Oxidation (Start): ", percent_oxidation(rho_start_empirical))
 println("Predicted Percent Oxidation:", percent_oxidation(predicted_final_occ))
 println("Predicted Shannon Entropy:", round(shannon_entropy(predicted_final_occ), digits=3))
 
@@ -185,6 +187,8 @@ for (idx, traj) in enumerate(top5_trajectories)
 
     println("\nTop Prediction $(idx):")
     println("Final occupancy: ", round.(final_occ, digits=3))
+    println("ML Input Start (Occupancy): ", round.(rho_start_empirical, digits=3))
+    println("ML Input Percent Oxidation (Start): ", percent_oxidation(rho_start_empirical))
     println("Percent oxidation: ", round(perc_ox, digits=2))
     println("Shannon entropy: ", round(entropy_val, digits=3))
     println("Lyapunov exponent: ", round(lyap_val, digits=6))
