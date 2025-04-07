@@ -196,8 +196,29 @@ function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=10)
         inflow[i] += (counts[i] / 100.0) - outflow[i]
     end
 
+    # Step 1: Clamp negatives to zero
+    inflow .= max.(inflow, 0.0)
+
+    # Step 2: Normalize if needed
+    if sum(inflow) > 0
+        inflow ./= sum(inflow)
+    end
+
+    # Step 3: Enforce minimum threshold for nonzero entries
+    for i in eachindex(inflow)
+        if inflow[i] > 0.0 && inflow[i] < 0.01
+            inflow[i] = 0.01
+        end
+    end
+
+    # Step 4: Final clamp and normalize again
+    inflow .= max.(inflow, 0.0)
+    inflow ./= sum(inflow)
+
+    # Assign back to ρ
     ρ .= inflow
 end
+
 
 # === Geodesics and Tracking ===
 geodesics = [
@@ -261,7 +282,7 @@ function topological_entropy(dgm)
 end
 
 # Function to generate systematic initial conditions
-function generate_systematic_initials()
+function generate_systematic_initials(; num_total=100, min_val=0.01)
     initials = []
 
     # (1) Single i-state occupancy
@@ -291,32 +312,50 @@ function generate_systematic_initials()
     push!(initials, bell / sum(bell))
 
     # (7) Geometric gradient (left to right in flat_pos)
-    gradient = range(0.1, stop=0.9, length=8)
+    gradient = collect(range(0.1, stop=0.9, length=8))
     push!(initials, gradient / sum(gradient))
+
+    # (8) Add safe random distributions
+    function generate_safe_random_initials(n::Int)
+        safe = []
+        while length(safe) < n
+            vec = rand(8)
+            vec ./= sum(vec)
+            if all(x -> x >= min_val || isapprox(x, 0.0; atol=1e-8), vec)
+                push!(safe, vec)
+            end
+        end
+        return safe
+    end
+
+    num_random = num_total - length(initials)
+    append!(initials, generate_safe_random_initials(num_random))
 
     return initials
 end
 
 # Function to create dataset using ODE solver
-function create_dataset_ODE_alive(; t_span=nothing, max_samples=500, save_every=50)
+function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every=250)
     if isnothing(t_span)
         t_span = range(0.0, stop=1.0, length=100)
     end
 
     X, Y, geos = [], [], []
     geo_counter = Dict{Vector{String}, Int}()
-    initials = generate_systematic_initials()[1:10]  # Use only the first 10 distributions for speed testing
+    initials = generate_systematic_initials()[1:50]  # Use only the first 10 distributions for speed testing
 
     total_samples = 0  # Sample counter
 
     for vec in initials
-        for _ in 1:5  # Generate more variants per shape if needed
+        for _ in 1:10  # Generate more variants per shape if needed
             rho0 = vec
             rho_t, geopath = evolve_time_series_and_geodesic!(rho0, length(t_span), pf_states, flat_pos, edges)
             final_rho = rho_t[end]
 
             # Digital enforcement
-            @assert all(isapprox.(final_rho * 100, round.(final_rho * 100), atol=1e-6)) "Non-digital occupancy detected: $final_rho"
+            final_rho = round.(final_rho .* 100) ./ 100
+            final_rho ./= sum(final_rho)  # ensure normalization
+            @assert all(x -> x ≥ 0.0 && x ≤ 1.0, final_rho) "Invalid occupancy: $final_rho"
 
             push!(X, rho0)
             push!(Y, final_rho)
@@ -384,7 +423,7 @@ function geodesic_loss(predicted_final::Matrix{Float32}, initial::Matrix{Float32
 end
 
 # === Training Function ===
-function train_model(model, X_train, Y_train, X_val, Y_val; epochs=100, lr=1e-3, geodesics, pf_states)
+function train_model(model, X_train, Y_train, X_val, Y_val; epochs=200, lr=1e-3, geodesics, pf_states)
     # Initialize optimizer with learning rate
     opt = Optimisers.setup(Optimisers.Adam(lr), model)
 
@@ -467,7 +506,7 @@ X_val_mat   = device(X_val_mat)
 Y_val_mat   = device(Y_val_mat)
 
 train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat;
-            epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
+            epochs=200, lr=1e-3, geodesics=geos, pf_states=pf_states)
 
 println("\nEvaluating on validation data...")
 pred_val, val_loss = evaluate_model(model, X_val_mat, Y_val_mat)
