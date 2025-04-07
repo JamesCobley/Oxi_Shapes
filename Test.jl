@@ -284,13 +284,14 @@ function generate_systematic_initials()
     push!(initials, bell / sum(bell))
 
     # (7) Geometric gradient (left to right in flat_pos)
-    gradient = range(0.1, stop=0.9, length=8)
+    gradient = collect(range(0.1, stop=0.9, length=8))
     push!(initials, gradient / sum(gradient))
 
      # (8) Add random distributions (well-formed, normalized)
+    num_random = 100 - length(initials)
     for _ in 1:num_random
-        rand_vec = rand(8)
-        push!(initials, rand_vec / sum(rand_vec))
+    rand_vec = rand(8)
+    push!(initials, rand_vec / sum(rand_vec))
     end
 
     return initials
@@ -304,36 +305,12 @@ function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every
 
     X, Y, geos = [], [], []
     geo_counter = Dict{Vector{String}, Int}()
-function generate_systematic_initials()
-    initials = []
-
-    # (1) Single i-state occupancy
-    for i in 1:8
-        vec = zeros(8)
-        vec[i] = 1.0
-        push!(initials, vec)
-    end
-
-    # (2–7) Add predefined curved/flat shapes
-    # (Your existing ones here...)
-
-    # (8) Add random distributions to bring total to 100
-    num_random = 100 - length(initials)
-    for _ in 1:num_random
-        rand_vec = rand(8)
-        push!(initials, rand_vec / sum(rand_vec))
-    end
-
-    return initials
-end
-
-    initials = generate_systematic_initials()  # Use only the first 10 distributions for speed testing
-
+    initials = generate_systematic_initials()
     total_samples = 0  # Sample counter
 
     for vec in initials
         for _ in 1:10  # Generate more variants per shape if needed
-            rho0 = vec
+            rho0 = vec  # vec should be one of your generated initial conditions
             rho_t, geopath = evolve_time_series_and_geodesic!(rho0, length(t_span), pf_states, flat_pos, edges)
             final_rho = rho_t[end]
 
@@ -430,7 +407,6 @@ function train_model(model, X_train, Y_train, X_val, Y_val; epochs=500, lr=1e-3,
     return model  # Return the trained model
 end
 
-
 # === Evaluation Function ===
 function evaluate_model(model, X_val_mat, Y_val_mat)
     raw_pred = model(X_val_mat)
@@ -489,7 +465,7 @@ X_val_mat   = device(X_val_mat)
 Y_val_mat   = device(Y_val_mat)
 
 train_model(model, X_train_mat, Y_train_mat, X_val_mat, Y_val_mat;
-            epochs=100, lr=1e-3, geodesics=geos, pf_states=pf_states)
+            epochs=500, lr=1e-3, geodesics=geos, pf_states=pf_states)
 
 println("\nEvaluating on validation data...")
 pred_val, val_loss = evaluate_model(model, X_val_mat, Y_val_mat)
