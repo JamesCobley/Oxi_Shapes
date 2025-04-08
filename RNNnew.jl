@@ -491,33 +491,29 @@ struct GraphRNNCell
 end
 Flux.@functor GraphRNNCell
 
-function (cell::GraphRNNCell)(state::Vector{Float64})
+function (cell::GraphRNNCell)(state::Vector{Float32})
     _, _, C_R_vals, _ = update_geometry_from_rho(state, pf_states, flat_pos, edges)
+    feat = Float32[mean(C_R_vals)]  # <- This is a 1-element vector
+    delta = cell.net(feat)  # now matches Dense(1 => 32)
 
-    # Only use C-Ricci mean
-    feat = Float32.(vcat(state, [mean(C_R_vals)]))
-
-    delta = cell.net(feat)
     state_phys = copy(state)
     oxi_shapes_alive!(state_phys, pf_states, flat_pos, edges; max_moves=10)
 
     new_state = state_phys .+ delta
-    return softmax(new_state)
+    return Flux.softmax(new_state)
 end
 
 # ============================================================================
 # Define the Neural Network
 # ============================================================================
-input_dim = 9  # i-state + mean c-Ricci only
+input_dim = 1
 hidden_dim = 32
-output_dim = 8
+output_dim = 8  # if you want to apply correction to all 8 elements
 
 net = Chain(
     Dense(input_dim, hidden_dim, relu),
-    Dense(hidden_dim, hidden_dim, relu),
     Dense(hidden_dim, output_dim)
 )
-
 cell = GraphRNNCell(net)
 
 # ============================================================================
@@ -554,12 +550,11 @@ for epoch in 1:epochs
     for (x, y) in zip(X, Y)
         x_f32 = Float32.(x)
         y_f32 = Float32.(y)
-        
-        l, back = Flux.withgradient() do
+        grads, loss = Flux.withgradient(params) do
             loss_fn(x_f32, y_f32, cell, T_steps)
         end
-        total_loss += l
-        Flux.Optimise.update!(opt, params, back())
+        total_loss += loss
+        Flux.Optimise.update!(opt, params, grads)
     end
     println("Epoch $epoch: Loss = $(round(total_loss / length(X), digits=6))")
 end
