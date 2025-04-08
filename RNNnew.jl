@@ -483,54 +483,38 @@ println("Finished generating dataset with metadata")
 # Graph RNN Cell Definition
 # ============================================================================
 
-# We define a recurrent cell that uses the alive dynamics as a baseline update,
-# then adds a learned correction term based on both the current state and the geometry.
 struct GraphRNNCell
-    # A simple NN that maps an augmented state vector (i_state concatenated with geometry features)
     net::Chain
 end
-
-# Make the cell behave like a Flux layer:
 Flux.@functor GraphRNNCell
 
-"""
-    (cell::GraphRNNCell)(state::Vector{Float64}) -> new_state::Vector{Float64}
-
-Given the current state (i.e. i-state probability vector) it:
-  1. Computes geometric features (R_vals, C_R_vals, anisotropy) using `update_geometry_from_rho`
-  2. Concatenates these features with the state to form an input feature vector for the NN.
-  3. Applies the NN to compute a correction delta.
-  4. Runs one step of the physics-based alive update.
-  5. Adds the NN correction to the physics update.
-  6. Projects the result back onto the probability simplex using softmax.
-"""
 function (cell::GraphRNNCell)(state::Vector{Float64})
-    # Compute geometric features using your update_geometry_from_rho function.
-    # (We disregard the 3D points here, but keep R_vals, C_R_vals, anisotropy.)
     _, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(state, pf_states, flat_pos, edges)
 
-    # Form a feature vector by concatenating the state with aggregated geometric info.
-    # (For example, you might simply concatenate state and the mean of each geometric quantity.
-    #  Feel free to adjust the feature engineering as desired.)
+    # Concatenate the original state with aggregated geometric features:
     feat = vcat(state,
                 [mean(R_vals)],
                 [mean(C_R_vals)],
                 [mean(anisotropy_vals)])
     
-    # Get the correction term from the neural network.
+    # Get the correction from the NN:
     delta = cell.net(feat)
     
-    # Simulate the physics update via the alive function.
-    # We use a copy (to avoid in-place mutation issues) and run one alive step.
+    # Run a physics-based update using alive:
     state_phys = copy(state)
     oxi_shapes_alive!(state_phys, pf_states, flat_pos, edges; max_moves=10)
     
-    # Combine the physics prediction and the learned correction.
-    # (Here we sum; you could scale the correction if needed.)
+    # Combine the physics update and the learned delta:
     new_state = state_phys .+ delta
 
-    # Ensure the output is a proper distribution (e.g., via softmax)
     return softmax(new_state)
+end
+
+# We define a recurrent cell that uses the alive dynamics as a baseline update,
+# then adds a learned correction term based on both the current state and the geometry.
+struct GraphRNNCell
+    # A simple NN that maps an augmented state vector (i_state concatenated with geometry features)
+    net::Chain
 end
 
 # ============================================================================
@@ -581,12 +565,8 @@ end
 # ============================================================================
 
 # Assume we have a dataset (you generated X and Y earlier)
-# X: list of initial state vectors
-# Y: list of corresponding final state vectors (from simulation)
-# For demonstration, we assume these are already loaded.
+@load "final_dataset.bson" X Y metadata geos
 
-# Convert to a suitable format (e.g., matrices or batches) if desired.
-# Here, we simply iterate over the list.
 T_steps = 100  # number of time steps for unrolling (should match your simulation)
 
 # Setup the optimizer
@@ -621,5 +601,7 @@ test_state = [1.0/8 for _ in 1:8]
 predicted_series = GraphRNN(test_state, cell, T_steps)
 predicted_final = predicted_series[end]
 println("Predicted final i-state: ", predicted_final)
+
+
 
 
