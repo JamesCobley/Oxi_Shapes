@@ -12,7 +12,6 @@ using Distributions
 using Distances
 using DelimitedFiles
 using Flux
-using Flux: Softmax
 using BSON
 using BSON: @save, @load
 using CUDA
@@ -138,81 +137,69 @@ function compute_entropy_cost(i, j, C_R_vals, pf_states)
 end
 
 # --- Alive Function ---
-function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=10)
-    idx = Dict(s => i for (i, s) in enumerate(pf_states))
-    neighbor_indices = Dict(s => Int[] for s in pf_states)
-    for (u, v) in edges
-        push!(neighbor_indices[u], idx[v])
-        push!(neighbor_indices[v], idx[u])
+function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every=250)
+    # If t_span is not provided, create a default range (here T is number of time steps)
+    if isnothing(t_span)
+        t_span = 1:100
     end
+    T = length(t_span)
+    
+    X, Y, Metadata, Geos = [], [], [], []
+    geo_counter = Dict{Vector{String}, Int}()
+    initials = generate_systematic_initials(num_total=50)
+    
+    total_samples = 0
 
-    # Convert to molecule counts
-    counts = round.(ρ * 100)
-    counts[end] = 100 - sum(counts[1:end-1])
-    ρ .= counts / 100
-
-    # Update geometry from current ρ
-    points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
-
-    inflow = zeros(Float64, length(pf_states))
-    outflow = zeros(Float64, length(pf_states))
-
-    total_moves = rand(0:max_moves)
-    candidate_indices = findall(x -> x > 0, counts)
-
-    for _ in 1:total_moves
-        isempty(candidate_indices) && break
-        i = rand(candidate_indices)
-        s = pf_states[i]
-        nbrs = neighbor_indices[s]
-
-        if isempty(nbrs)
-            inflow[i] += 0.01
-            continue
+    for vec in initials
+        # For each systematic initial condition, generate a number of variants if needed.
+        for _ in 1:10
+            rho0 = vec
+            # Run the evolution while capturing metadata at each time step:
+            ρ_series, trajectory, geo, global_metadata = evolve_time_series_metadata!(rho0, T, pf_states, flat_pos, edges; max_moves_per_step=10)
+            
+            # Use the initial and final i-state as inputs/outputs (or modify as needed)
+            final_rho = ρ_series[end]
+            final_rho = final_rho ./ sum(final_rho)  # ensure normalization
+            
+            push!(X, rho0)
+            push!(Y, final_rho)
+            push!(Metadata, global_metadata)
+            
+            if !isnothing(geo)
+                geo_counter[geo] = get(geo_counter, geo, 0) + 1
+                push!(Geos, geo)
+            end
+            
+            total_samples += 1
+            
+            if total_samples % save_every == 0
+                println("Checkpoint: $total_samples samples generated...")
+                # Save interim dataset checkpoint using BSON (or CSV)
+                @save "checkpoint_$total_samples.bson" X Y Metadata Geos
+            end
+            
+            if total_samples >= max_samples
+                break
+            end
         end
-
-        probs = Float64[]
-        for j in nbrs
-            ΔS = compute_entropy_cost(i, j, C_R_vals, pf_states)
-            Δf = exp(ρ[i]) - C_R_vals[i] + ΔS
-            p = exp(-Δf) * exp(-anisotropy_vals[j])
-            push!(probs, p)
-        end
-
-        if sum(probs) < 1e-8
-            inflow[i] += 0.01
-            continue
-        end
-
-        probs ./= sum(probs)
-        chosen = sample(nbrs, Weights(probs))
-        inflow[chosen] += 0.01
-        outflow[i] += 0.01
-    end
-
-    for i in eachindex(pf_states)
-        inflow[i] += (counts[i] / 100.0) - outflow[i]
-    end
-
-    # Step 1: Clamp negatives to zero
-    inflow .= max.(inflow, 0.0)
-    # Step 2: Normalize if needed
-    if sum(inflow) > 0
-        inflow ./= sum(inflow)
-    end
-    # Step 3: Enforce minimum threshold for nonzero entries
-    for i in eachindex(inflow)
-        if inflow[i] > 0.0 && inflow[i] < 0.01
-            inflow[i] = 0.01
+        
+        if total_samples >= max_samples
+            break
         end
     end
-    # Step 4: Final clamp and normalize again
-    inflow .= max.(inflow, 0.0)
-    inflow ./= sum(inflow)
-
-    # Assign back to ρ
-    ρ .= inflow
+    
+    println("Finished generating dataset with $total_samples samples.")
+    println("Most traversed geodesics:")
+    for (path, count) in sort(collect(geo_counter), by=x -> x[2], rev=true)
+        println(join(path, " → "), " | Count: ", count)
+    end
+    
+    # Save final dataset
+    @save "final_dataset.bson" X Y Metadata Geos
+    
+    return X, Y, Metadata, Geos
 end
+
 
 # ============================================================================
 # Geodesics and Tracking Functions
@@ -441,7 +428,7 @@ function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every
             
             total_samples += 1
             
-            if total_samples % save_every == 0
+            if total_samples % save_every == 500
                 println("Checkpoint: $total_samples samples generated...")
                 # Optionally save interim datasets to CSV or BSON
                 # For example:
@@ -489,7 +476,8 @@ T = 100  # number of time steps
 
 ρ_series, trajectory, geo, global_metadata = evolve_time_series_metadata!(ρ0, T, pf_states, flat_pos, edges; max_moves_per_step=10)
 
-# (You can now store global_metadata and ρ_series for training your Graph RNN)
+println("Finished generating dataset with metadata")
+@save "final_dataset.bson" X Y metadata geos
 
 # ============================================================================
 # Graph RNN Cell Definition
@@ -535,7 +523,7 @@ function (cell::GraphRNNCell)(state::Vector{Float64})
     # Simulate the physics update via the alive function.
     # We use a copy (to avoid in-place mutation issues) and run one alive step.
     state_phys = copy(state)
-    oxi_shapes_alive!(state_phys, pf_states, flat_pos, edges; max_moves=5)
+    oxi_shapes_alive!(state_phys, pf_states, flat_pos, edges; max_moves=10)
     
     # Combine the physics prediction and the learned correction.
     # (Here we sum; you could scale the correction if needed.)
