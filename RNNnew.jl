@@ -12,6 +12,9 @@ using Distributions
 using Distances
 using DelimitedFiles
 using Flux
+using Flux:softmax
+using Flux.Losses: mse
+using Optimisers
 using BSON
 using BSON: @save, @load
 using CUDA
@@ -480,7 +483,7 @@ println("Finished generating dataset with metadata")
 @save "final_dataset.bson" X Y metadata geos
 
 # ============================================================================
-# Graph RNN Cell Definition
+# Graph RNN 
 # ============================================================================
 
 struct GraphRNNCell
@@ -489,47 +492,42 @@ end
 Flux.@functor GraphRNNCell
 
 function (cell::GraphRNNCell)(state::Vector{Float64})
-    _, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(state, pf_states, flat_pos, edges)
+    _, _, C_R_vals, _ = update_geometry_from_rho(state, pf_states, flat_pos, edges)
 
-    # Concatenate the original state with aggregated geometric features:
-    feat = vcat(state,
-                [mean(R_vals)],
-                [mean(C_R_vals)],
-                [mean(anisotropy_vals)])
-    
-    # Get the correction from the NN:
+    # Only use C-Ricci mean
+    feat = Float32.(vcat(state, [mean(C_R_vals)]))
+
     delta = cell.net(feat)
-    
-    # Run a physics-based update using alive:
     state_phys = copy(state)
     oxi_shapes_alive!(state_phys, pf_states, flat_pos, edges; max_moves=10)
-    
-    # Combine the physics update and the learned delta:
-    new_state = state_phys .+ delta
 
+    new_state = state_phys .+ delta
     return softmax(new_state)
 end
 
-# We define a recurrent cell that uses the alive dynamics as a baseline update,
-# then adds a learned correction term based on both the current state and the geometry.
-struct GraphRNNCell
-    # A simple NN that maps an augmented state vector (i_state concatenated with geometry features)
-    net::Chain
-end
+# ============================================================================
+# Define the Neural Network
+# ============================================================================
+input_dim = 9  # i-state + mean c-Ricci only
+hidden_dim = 32
+output_dim = 8
+
+net = Chain(
+    Dense(input_dim, hidden_dim, relu),
+    Dense(hidden_dim, hidden_dim, relu),
+    Dense(hidden_dim, output_dim)
+)
+
+cell = GraphRNNCell(net)
 
 # ============================================================================
-# Recurrent Network Unrolling
+# Rollout graph RNN
 # ============================================================================
 
-"""
-    GraphRNN(initial_state::Vector{Float64}, cell::GraphRNNCell, T::Int)
-
-Unrolls the GraphRNNCell for T steps starting from `initial_state` and returns the sequence of states.
-"""
-function GraphRNN(initial_state::Vector{Float64}, cell::GraphRNNCell, T::Int)
+function GraphRNN(initial_state::AbstractVector{<:Real}, cell::GraphRNNCell, T::Int)
     states = Vector{Vector{Float64}}(undef, T+1)
-    states[1] = initial_state
-    current_state = initial_state
+    states[1] = Float64.(initial_state)
+    current_state = Float64.(initial_state)
     for t in 1:T
         current_state = cell(current_state)
         states[t+1] = current_state
@@ -538,70 +536,58 @@ function GraphRNN(initial_state::Vector{Float64}, cell::GraphRNNCell, T::Int)
 end
 
 # ============================================================================
-# Example Network and Loss Function
+# Training
 # ============================================================================
 
-# Let’s define our GraphRNNCell with a simple MLP.
-input_dim = 8 + 3  # original 8-dim state plus three aggregated geometric features
-hidden_dim = 32
-output_dim = 8   # correction vector has the same dimension as the i-state
-net = Chain(
-    Dense(input_dim, hidden_dim, relu),
-    Dense(hidden_dim, hidden_dim, relu),
-    Dense(hidden_dim, output_dim)
-)
-cell = GraphRNNCell(net)
-
-# For training, we define a loss between the predicted final state (after T steps)
-# and the true final state from simulation.
-function loss_fn(initial_state, true_final_state, cell, T)
-    states = GraphRNN(initial_state, cell, T)
-    pred_final_state = states[end]
-    return Flux.Losses.mse(pred_final_state, true_final_state)
-end
-
-# ============================================================================
-# Training Loop
-# ============================================================================
-
-# Assume we have a dataset (you generated X and Y earlier)
 @load "final_dataset.bson" X Y metadata geos
 
-T_steps = 100  # number of time steps for unrolling (should match your simulation)
+T_steps = 100  # number of time steps for unrolling
 
-# Setup the optimizer
+# Optimizer and parameters
 opt = Flux.ADAM(1e-4)
 params = Flux.params(cell)
 
-# Number of epochs
+# Training loop
 epochs = 50
-
 for epoch in 1:epochs
     total_loss = 0.0
     for (x, y) in zip(X, Y)
-        # Use gradient tracking (the cell is differentiable because:
-        # - the alive function is written mostly with differentiable operations;
-        # - our added NN uses standard differentiable layers;
-        # - softmax and vector arithmetic are differentiable).
+        x_f32 = Float32.(x)
+        y_f32 = Float32.(y)
+        
         l, back = Flux.withgradient() do
-            loss_fn(x, y, cell, T_steps)
+            loss_fn(x_f32, y_f32, cell, T_steps)
         end
         total_loss += l
         Flux.Optimise.update!(opt, params, back())
     end
-    println("Epoch $epoch: Loss = $(round(total_loss/length(X), digits=6))")
+    println("Epoch $epoch: Loss = $(round(total_loss / length(X), digits=6))")
 end
 
 # ============================================================================
 # Inference / Evaluation
 # ============================================================================
 
-# Now you can use the trained GraphRNNCell to predict the evolution of new initial states.
-test_state = [1.0/8 for _ in 1:8]
+# Choose a test initial state (e.g., flat or custom)
+test_state = Float32[1.0/8 for _ in 1:8]
+
+# Run the trained GraphRNN for T steps
 predicted_series = GraphRNN(test_state, cell, T_steps)
 predicted_final = predicted_series[end]
-println("Predicted final i-state: ", predicted_final)
 
+# Normalize (optional but usually good)
+predicted_final ./= sum(predicted_final)
 
+# Print predictions
+println("\n--- Inference Result ---")
+println("Initial State: ", round.(test_state, digits=3))
+println("Predicted Final i-State: ", round.(predicted_final, digits=3))
 
+# Optional: Compute metrics
+function percent_oxidation(ρ::AbstractVector{<:Real})
+    oxidation_levels = [(count(==('1'), s) / 3) * 100 for s in pf_states]
+    return sum(ρ .* oxidation_levels)
+end
 
+println("Predicted Percent Oxidation: ", round(percent_oxidation(predicted_final), digits=2))
+println("Shannon Entropy: ", round(shannon_entropy(predicted_final), digits=3))
