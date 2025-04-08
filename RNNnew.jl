@@ -134,3 +134,119 @@ function compute_entropy_cost(i, j, C_R_vals, pf_states)
     degeneracy_penalty = 1.0 / deg
     return mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
 end
+
+function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=10)
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    neighbor_indices = Dict(s => Int[] for s in pf_states)
+    for (u, v) in edges
+        push!(neighbor_indices[u], idx[v])
+        push!(neighbor_indices[v], idx[u])
+    end
+
+    # Convert to molecule counts
+    counts = round.(ρ * 100)
+    counts[end] = 100 - sum(counts[1:end-1])
+    ρ .= counts / 100
+
+    # Update geometry from current ρ
+    points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
+
+    inflow = zeros(Float64, length(pf_states))
+    outflow = zeros(Float64, length(pf_states))
+
+    total_moves = rand(0:max_moves)
+    candidate_indices = findall(x -> x > 0, counts)
+
+    for _ in 1:total_moves
+        isempty(candidate_indices) && break
+        i = rand(candidate_indices)
+        s = pf_states[i]
+        nbrs = neighbor_indices[s]
+
+        if isempty(nbrs)
+            inflow[i] += 0.01
+            continue
+        end
+
+        probs = Float64[]
+        for j in nbrs
+            ΔS = compute_entropy_cost(i, j, C_R_vals, pf_states)
+            Δf = exp(ρ[i]) - C_R_vals[i] + ΔS
+            p = exp(-Δf) * exp(-anisotropy_vals[j])
+            push!(probs, p)
+        end
+
+        if sum(probs) < 1e-8
+            inflow[i] += 0.01
+            continue
+        end
+
+        probs ./= sum(probs)
+        chosen = sample(nbrs, Weights(probs))
+        inflow[chosen] += 0.01
+        outflow[i] += 0.01
+    end
+
+    for i in eachindex(pf_states)
+        inflow[i] += (counts[i] / 100.0) - outflow[i]
+    end
+
+    # Step 1: Clamp negatives to zero
+    inflow .= max.(inflow, 0.0)
+
+    # Step 2: Normalize if needed
+    if sum(inflow) > 0
+        inflow ./= sum(inflow)
+    end
+
+    # Step 3: Enforce minimum threshold for nonzero entries
+    for i in eachindex(inflow)
+        if inflow[i] > 0.0 && inflow[i] < 0.01
+            inflow[i] = 0.01
+        end
+    end
+
+    # Step 4: Final clamp and normalize again
+    inflow .= max.(inflow, 0.0)
+    inflow ./= sum(inflow)
+
+    # Assign back to ρ
+    ρ .= inflow
+end
+
+# === Geodesics and Tracking ===
+geodesics = [
+    ["000", "100", "101", "111"],
+    ["000", "100", "110", "111"],
+    ["000", "010", "110", "111"],
+    ["000", "010", "011", "111"],
+    ["000", "001", "101", "111"],
+    ["000", "001", "011", "111"]
+]
+
+function dominant_geodesic(trajectory::Vector{String}, geodesics::Vector{Vector{String}})
+    best_path, max_score = nothing, 0
+    for path in geodesics
+        score = count(s -> s in trajectory, path)
+        if score > max_score
+            max_score = score
+            best_path = path
+        end
+    end
+    return best_path
+end
+
+function evolve_time_series_and_geodesic!(ρ0::Vector{Float64}, T::Int, pf_states, flat_pos, edges; max_moves_per_step=10)
+    ρ = copy(ρ0)
+    trajectory = String[]
+    ρ_series = [copy(ρ)]
+
+    for t in 1:T
+        oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
+        push!(ρ_series, copy(ρ))
+        push!(trajectory, pf_states[argmax(ρ)])
+    end
+
+    geo = dominant_geodesic(trajectory, geodesics)
+    return ρ_series, trajectory, geo
+end
