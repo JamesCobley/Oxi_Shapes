@@ -633,3 +633,5 @@ test_state = [1.0/8 for _ in 1:8]
 predicted_series = GraphRNN(test_state, cell, T_steps)
 predicted_final = predicted_series[end]
 println("Predicted final i-state: ", predicted_final)
+
+
