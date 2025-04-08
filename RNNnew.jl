@@ -1,3 +1,10 @@
+# ╔═╡ Install required packages (only needs to run once per session)
+using Pkg
+Pkg.activate(".")  # Optional: activate project environment
+Pkg.add(["Flux", "CUDA", "GeometryBasics", "LinearAlgebra",
+         "StatsBase", "DifferentialEquations", "Optimisers", "Random",
+         "Distances", "Interpolations", "CairoMakie", "DelimitedFiles", "Distributions", "ComplexityMeasures", "BSON"])
+
 # ============================================================================
 # Installations and Imports
 # ============================================================================
@@ -491,22 +498,20 @@ struct GraphRNNCell
 end
 Flux.@functor GraphRNNCell
 
-function (cell::GraphRNNCell)(state::Vector{Float32})
-    _, _, C_R_vals, _ = update_geometry_from_rho(state, pf_states, flat_pos, edges)
-    feat = Float32[mean(C_R_vals)]  # <- This is a 1-element vector
-    delta = cell.net(feat)  # now matches Dense(1 => 32)
-
-    state_phys = copy(state)
-    oxi_shapes_alive!(state_phys, pf_states, flat_pos, edges; max_moves=10)
-
-    new_state = state_phys .+ delta
-    return Flux.softmax(new_state)
+function GraphRNN(initial_state::Vector{Float32}, cell::GraphRNNCell, T::Int)
+    states = [initial_state]
+    current_state = initial_state
+    for t in 1:T
+        current_state = cell(current_state)
+        push!(states, current_state)  # ✅ avoids mutation
+    end
+    return states
 end
 
 # ============================================================================
 # Define the Neural Network
 # ============================================================================
-input_dim = 1
+input_dim = 9
 hidden_dim = 32
 output_dim = 8  # if you want to apply correction to all 8 elements
 
@@ -548,13 +553,9 @@ epochs = 50
 for epoch in 1:epochs
     total_loss = 0.0
     for (x, y) in zip(X, Y)
-        x_f32 = Float32.(x)
-        y_f32 = Float32.(y)
-        grads, loss = Flux.withgradient(params) do
-            loss_fn(x_f32, y_f32, cell, T_steps)
-        end
-        total_loss += loss
-        Flux.Optimise.update!(opt, params, grads)
+        gs = Flux.gradient(() -> loss_fn(Float32.(x), Float32.(y), cell, T_steps), params)
+        Flux.Optimise.update!(opt, params, gs)
+        total_loss += loss_fn(Float32.(x), Float32.(y), cell, T_steps)
     end
     println("Epoch $epoch: Loss = $(round(total_loss / length(X), digits=6))")
 end
@@ -586,3 +587,13 @@ end
 
 println("Predicted Percent Oxidation: ", round(percent_oxidation(predicted_final), digits=2))
 println("Shannon Entropy: ", round(shannon_entropy(predicted_final), digits=3))
+
+# ============================================================================
+# Save the Trained Model
+# ============================================================================
+using Dates
+timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
+model_save_path = "trained_graph_rnn_model_$timestamp.bson"
+
+@save model_save_path cell
+println("✅ Trained model saved to '$model_save_path'")
