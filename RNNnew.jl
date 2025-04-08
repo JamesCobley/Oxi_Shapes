@@ -25,6 +25,7 @@ using Optimisers
 using BSON
 using BSON: @save, @load
 using CUDA
+using Dates
 
 # Set device dynamically: use GPU if available, otherwise CPU
 device(x) = CUDA.functional() ? gpu(x) : x
@@ -498,20 +499,15 @@ struct GraphRNNCell
 end
 Flux.@functor GraphRNNCell
 
-function GraphRNN(initial_state::Vector{Float32}, cell::GraphRNNCell, T::Int)
-    states = [initial_state]
+function GraphRNN(initial_state::AbstractVector{<:Real}, cell::GraphRNNCell, T::Int)
     current_state = initial_state
-    for t in 1:T
-        current_state = cell(current_state)
-        push!(states, current_state)  # ✅ avoids mutation
-    end
-    return states
+    return vcat([initial_state], [current_state = cell(current_state) for _ in 1:T])
 end
 
 # ============================================================================
 # Define the Neural Network
 # ============================================================================
-input_dim = 9
+input_dim = 1
 hidden_dim = 32
 output_dim = 8  # if you want to apply correction to all 8 elements
 
@@ -524,16 +520,10 @@ cell = GraphRNNCell(net)
 # ============================================================================
 # Rollout graph RNN
 # ============================================================================
-
-function GraphRNN(initial_state::AbstractVector{<:Real}, cell::GraphRNNCell, T::Int)
-    states = Vector{Vector{Float64}}(undef, T+1)
-    states[1] = Float64.(initial_state)
-    current_state = Float64.(initial_state)
-    for t in 1:T
-        current_state = cell(current_state)
-        states[t+1] = current_state
-    end
-    return states
+function loss_fn(initial_state, true_final_state, cell, T)
+    states = GraphRNN(initial_state, cell, T)
+    pred_final_state = states[end]
+    return Flux.Losses.mse(pred_final_state, true_final_state)
 end
 
 # ============================================================================
@@ -553,8 +543,8 @@ epochs = 50
 for epoch in 1:epochs
     total_loss = 0.0
     for (x, y) in zip(X, Y)
-        gs = Flux.gradient(() -> loss_fn(Float32.(x), Float32.(y), cell, T_steps), params)
-        Flux.Optimise.update!(opt, params, gs)
+        grads, loss = gradient(() -> loss_fn(x, y, cell, T_steps), params)
+        Flux.Optimise.update!(opt, params, grads)
         total_loss += loss_fn(Float32.(x), Float32.(y), cell, T_steps)
     end
     println("Epoch $epoch: Loss = $(round(total_loss / length(X), digits=6))")
@@ -591,7 +581,6 @@ println("Shannon Entropy: ", round(shannon_entropy(predicted_final), digits=3))
 # ============================================================================
 # Save the Trained Model
 # ============================================================================
-using Dates
 timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
 model_save_path = "trained_graph_rnn_model_$timestamp.bson"
 
