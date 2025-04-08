@@ -1,7 +1,6 @@
-#Add installations
-
-# Imports
-
+# ============================================================================
+# Installations and Imports
+# ============================================================================
 using GeometryBasics: Point2, Point3
 using Interpolations
 using Random
@@ -13,15 +12,17 @@ using Distributions
 using Distances
 using DelimitedFiles
 using Flux
+using Flux: Softmax
 using BSON
-using BSON: @save  
+using BSON: @save, @load
 using CUDA
- 
-# Manifold and functions
 
 # Set device dynamically: use GPU if available, otherwise CPU
 device(x) = CUDA.functional() ? gpu(x) : x
 
+# ============================================================================
+# Manifold and Geometry Functions
+# ============================================================================
 # === Proteoform Setup ===
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 flat_pos = Dict(
@@ -35,7 +36,7 @@ edges = [
     ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
 ]
 
-# === Geometry Update ===
+# --- Geometry Update Functions ---
 function lift_to_z_plane(rho, pf_states, flat_pos)
     return [Point3(flat_pos[s][1], flat_pos[s][2], -rho[i]) for (i, s) in enumerate(pf_states)]
 end
@@ -104,7 +105,7 @@ function update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
     return points3D, R_vals, C_R_vals, anisotropy_vals
 end
 
-# === Sheaf Setup ===
+# --- Sheaf Setup Functions ---
 function initialize_sheaf_stalks(flat_pos, pf_states)
     stalks = Dict{String, Vector{Float64}}()
     for s in pf_states
@@ -124,6 +125,7 @@ function sheaf_consistency(stalks, edges; threshold=2.5)
     return inconsistencies
 end
 
+# --- Entropy Cost Function (for transitions) ---
 function compute_entropy_cost(i, j, C_R_vals, pf_states)
     baseline_DeltaE = 1.0
     mass_heat = 0.1
@@ -135,6 +137,7 @@ function compute_entropy_cost(i, j, C_R_vals, pf_states)
     return mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
 end
 
+# --- Alive Function ---
 function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=10)
     idx = Dict(s => i for (i, s) in enumerate(pf_states))
     neighbor_indices = Dict(s => Int[] for s in pf_states)
@@ -193,19 +196,16 @@ function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=10)
 
     # Step 1: Clamp negatives to zero
     inflow .= max.(inflow, 0.0)
-
     # Step 2: Normalize if needed
     if sum(inflow) > 0
         inflow ./= sum(inflow)
     end
-
     # Step 3: Enforce minimum threshold for nonzero entries
     for i in eachindex(inflow)
         if inflow[i] > 0.0 && inflow[i] < 0.01
             inflow[i] = 0.01
         end
     end
-
     # Step 4: Final clamp and normalize again
     inflow .= max.(inflow, 0.0)
     inflow ./= sum(inflow)
@@ -214,7 +214,9 @@ function oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=10)
     ρ .= inflow
 end
 
-# === Geodesics and Tracking ===
+# ============================================================================
+# Geodesics and Tracking Functions
+# ============================================================================
 geodesics = [
     ["000", "100", "101", "111"],
     ["000", "100", "110", "111"],
@@ -240,13 +242,394 @@ function evolve_time_series_and_geodesic!(ρ0::Vector{Float64}, T::Int, pf_state
     ρ = copy(ρ0)
     trajectory = String[]
     ρ_series = [copy(ρ)]
-
     for t in 1:T
         oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
         push!(ρ_series, copy(ρ))
         push!(trajectory, pf_states[argmax(ρ)])
     end
-
     geo = dominant_geodesic(trajectory, geodesics)
     return ρ_series, trajectory, geo
 end
+
+# ============================================================================
+# Metadata Helper Functions
+# ============================================================================
+function compute_k_distribution(ρ, pf_states)
+    k_counts = Dict{Int, Float64}()
+    for (i, s) in enumerate(pf_states)
+        k = count(c -> c == '1', s)
+        k_counts[k] = get(k_counts, k, 0.0) + ρ[i]
+    end
+    return k_counts
+end
+
+function weighted_mean_oxidation(k_dist::Dict{Int, Float64})
+    total = 0.0
+    for (k, p) in k_dist
+        total += k * p
+    end
+    return total
+end
+
+function shannon_entropy(p::Vector{Float64})
+    p_nonzero = filter(x -> x > 0, p)
+    return -sum(x -> x * log2(x), p_nonzero)
+end
+
+function fisher_information(ρ::Vector{Float64})
+    grad = diff(ρ)
+    return sum(grad .^ 2)
+end
+
+function lyapunov_exponent(series::Vector{Vector{Float64}})
+    exponents = Float64[]
+    for t in 2:length(series)
+        norm_prev = norm(series[t-1])
+        norm_diff = norm(series[t] - series[t-1])
+        if norm_prev > 0 && norm_diff > 0
+            push!(exponents, log(norm_diff / norm_prev))
+        end
+    end
+    return mean(exponents)
+end
+
+function evolve_time_series_metadata!(ρ0::Vector{Float64}, T::Int, pf_states, flat_pos, edges; max_moves_per_step=10)
+    ρ = copy(ρ0)
+    ρ_series = [copy(ρ)]
+    metadata = Vector{Dict{String,Any}}(undef, T)
+    trajectory = String[]
+    for t in 1:T
+        ρ_old = copy(ρ)
+        oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
+        push!(ρ_series, copy(ρ))
+        push!(trajectory, pf_states[argmax(ρ)])
+        flux = ρ .- ρ_old
+        k_dist = compute_k_distribution(ρ, pf_states)
+        mean_oxidation = weighted_mean_oxidation(k_dist)
+        entropy = shannon_entropy(ρ)
+        fisher_info = fisher_information(ρ)
+        # You can also grab current c-Ricci values if needed:
+        _, R_vals, C_R_vals, _ = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
+        metadata[t] = Dict(
+            "i_state"          => copy(ρ),
+            "k_state"          => deepcopy(k_dist),
+            "flux"             => copy(flux),
+            "c_Ricci"          => copy(C_R_vals),
+            "mean_oxidation"   => mean_oxidation,
+            "shannon_entropy"  => entropy,
+            "fisher_information" => fisher_info,
+        )
+    end
+    geo = dominant_geodesic(trajectory, geodesics)
+    lyap = lyapunov_exponent(ρ_series)
+    global_metadata = Dict(
+        "initial_i_state" => copy(ρ0),
+        "final_i_state"   => copy(ρ),
+        "i_state_series"  => ρ_series,
+        "step_metadata"   => metadata,
+        "dominant_geodesic" => geo,
+        "lyapunov_exponent" => lyap,
+    )
+    return ρ_series, trajectory, geo, global_metadata
+end
+
+# ============================================================================
+# Dataset Generation Helper: Systematic Initial Conditions
+# ============================================================================
+
+# Function to generate systematic initial conditions
+function generate_systematic_initials(; num_total=100, min_val=0.01)
+    initials = []
+
+    # (1) Single i-state occupancy
+    for i in 1:8
+        vec = zeros(8)
+        vec[i] = 1.0
+        push!(initials, vec)
+    end
+
+    # (2) Flat occupancy
+    push!(initials, fill(1.0 / 8, 8))
+
+    # (3) Curved within k=1 (e.g., 010 peak)
+    curved_k1 = [0.0, 0.15, 0.7, 0.15, 0.0, 0.0, 0.0, 0.0]
+    push!(initials, curved_k1 / sum(curved_k1))
+
+    # (4) Curved within k=2 (e.g., 101 peak)
+    curved_k2 = [0.0, 0.0, 0.0, 0.0, 0.15, 0.7, 0.15, 0.0]
+    push!(initials, curved_k2 / sum(curved_k2))
+
+    # (5) Flat in k=0 & k=1, peaked in k=2
+    hybrid = [0.05, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.05]
+    push!(initials, hybrid / sum(hybrid))
+
+    # (6) Bell shape across k
+    bell = [0.05, 0.1, 0.1, 0.1, 0.15, 0.15, 0.15, 0.2]
+    push!(initials, bell / sum(bell))
+
+    # (7) Geometric gradient (left to right in flat_pos)
+    gradient = collect(range(0.1, stop=0.9, length=8))
+    push!(initials, gradient / sum(gradient))
+
+    # (8) Add safe random distributions
+    function generate_safe_random_initials(n::Int)
+        safe = []
+        while length(safe) < n
+            vec = rand(8)
+            vec ./= sum(vec)
+            if all(x -> x >= min_val || isapprox(x, 0.0; atol=1e-8), vec)
+                push!(safe, vec)
+            end
+        end
+        return safe
+    end
+
+    num_random = num_total - length(initials)
+    append!(initials, generate_safe_random_initials(num_random))
+
+    return initials
+end
+
+# ============================================================================
+# 2. Define the Data Generation Function (with Metadata Logging)
+# ============================================================================
+
+# We assume that the following functions are already defined:
+# - oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=10)
+# - update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
+# - dominant_geodesic(trajectory, geodesics)
+# - evolve_time_series_metadata!(ρ0, T, pf_states, flat_pos, edges; max_moves_per_step=10)
+#
+# Also, the metadata helper functions such as:
+# compute_k_distribution, weighted_mean_oxidation, shannon_entropy,
+# fisher_information, lyapunov_exponent, etc.
+
+function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every=250)
+    # If t_span is not provided, create a default range (here T is number of time steps)
+    if isnothing(t_span)
+        t_span = 1:100
+    end
+    T = length(t_span)
+
+    X, Y, Metadata, Geos = [], [], [], []
+    geo_counter = Dict{Vector{String}, Int}()
+    initials = generate_systematic_initials(num_total=50)
+
+    total_samples = 0
+
+    for vec in initials
+        # For each systematic initial condition, generate a number of variants if needed.
+        # You can change the inner loop count if you want to perturb the initial condition multiple times.
+        for _ in 1:10
+            rho0 = vec
+            # Run the evolution while capturing metadata at each time step:
+            ρ_series, trajectory, geo, global_metadata = evolve_time_series_metadata!(rho0, T, pf_states, flat_pos, edges; max_moves_per_step=10)
+            
+            # Use the initial and final i-state as inputs/outputs (or modify as needed)
+            final_rho = ρ_series[end]
+            # Re-normalize final_rho if necessary
+            final_rho = final_rho ./ sum(final_rho)
+            
+            push!(X, rho0)
+            push!(Y, final_rho)
+            push!(Metadata, global_metadata)
+            
+            if !isnothing(geo)
+                geo_counter[geo] = get(geo_counter, geo, 0) + 1
+                push!(Geos, geo)
+            end
+            
+            total_samples += 1
+            
+            if total_samples % save_every == 0
+                println("Checkpoint: $total_samples samples generated...")
+                # Optionally save interim datasets to CSV or BSON
+                # For example:
+                # writedlm("X_partial_$total_samples.csv", X, ',')
+                # writedlm("Y_partial_$total_samples.csv", Y, ',')
+            end
+            
+            if total_samples >= max_samples
+                break
+            end
+        end
+        
+        if total_samples >= max_samples
+            break
+        end
+    end
+    
+    println("Finished generating dataset with $total_samples samples.")
+    println("Most traversed geodesics:")
+    for (path, count) in sort(collect(geo_counter), by=x->x[2], rev=true)
+        println(join(path, " → "), " | Count: ", count)
+    end
+    
+    return X, Y, Metadata, Geos
+end
+
+# ============================================================================
+# Example: Generate the Dataset
+# ============================================================================
+
+println("Simulating Oxi-Shape evolution with metadata...")
+X, Y, metadata, geos = create_dataset_ODE_alive(t_span=1:100, max_samples=500, save_every=100)
+
+# You can now inspect or save the dataset:
+println("Number of samples in X: ", length(X))
+println("Number of metadata records: ", length(metadata))
+
+# ============================================================================
+# Data Generation and Training Calls
+# ============================================================================
+# Example: Generate a dataset using our metadata evolution
+println("Simulating with metadata recording...")
+ρ0 = [1.0/8 for _ in 1:8]  # initial flat occupancy
+T = 100  # number of time steps
+
+ρ_series, trajectory, geo, global_metadata = evolve_time_series_metadata!(ρ0, T, pf_states, flat_pos, edges; max_moves_per_step=10)
+
+# (You can now store global_metadata and ρ_series for training your Graph RNN)
+
+# ============================================================================
+# Graph RNN Cell Definition
+# ============================================================================
+
+# We define a recurrent cell that uses the alive dynamics as a baseline update,
+# then adds a learned correction term based on both the current state and the geometry.
+struct GraphRNNCell
+    # A simple NN that maps an augmented state vector (i_state concatenated with geometry features)
+    net::Chain
+end
+
+# Make the cell behave like a Flux layer:
+Flux.@functor GraphRNNCell
+
+"""
+    (cell::GraphRNNCell)(state::Vector{Float64}) -> new_state::Vector{Float64}
+
+Given the current state (i.e. i-state probability vector) it:
+  1. Computes geometric features (R_vals, C_R_vals, anisotropy) using `update_geometry_from_rho`
+  2. Concatenates these features with the state to form an input feature vector for the NN.
+  3. Applies the NN to compute a correction delta.
+  4. Runs one step of the physics-based alive update.
+  5. Adds the NN correction to the physics update.
+  6. Projects the result back onto the probability simplex using softmax.
+"""
+function (cell::GraphRNNCell)(state::Vector{Float64})
+    # Compute geometric features using your update_geometry_from_rho function.
+    # (We disregard the 3D points here, but keep R_vals, C_R_vals, anisotropy.)
+    _, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(state, pf_states, flat_pos, edges)
+
+    # Form a feature vector by concatenating the state with aggregated geometric info.
+    # (For example, you might simply concatenate state and the mean of each geometric quantity.
+    #  Feel free to adjust the feature engineering as desired.)
+    feat = vcat(state,
+                [mean(R_vals)],
+                [mean(C_R_vals)],
+                [mean(anisotropy_vals)])
+    
+    # Get the correction term from the neural network.
+    delta = cell.net(feat)
+    
+    # Simulate the physics update via the alive function.
+    # We use a copy (to avoid in-place mutation issues) and run one alive step.
+    state_phys = copy(state)
+    oxi_shapes_alive!(state_phys, pf_states, flat_pos, edges; max_moves=5)
+    
+    # Combine the physics prediction and the learned correction.
+    # (Here we sum; you could scale the correction if needed.)
+    new_state = state_phys .+ delta
+
+    # Ensure the output is a proper distribution (e.g., via softmax)
+    return softmax(new_state)
+end
+
+# ============================================================================
+# Recurrent Network Unrolling
+# ============================================================================
+
+"""
+    GraphRNN(initial_state::Vector{Float64}, cell::GraphRNNCell, T::Int)
+
+Unrolls the GraphRNNCell for T steps starting from `initial_state` and returns the sequence of states.
+"""
+function GraphRNN(initial_state::Vector{Float64}, cell::GraphRNNCell, T::Int)
+    states = Vector{Vector{Float64}}(undef, T+1)
+    states[1] = initial_state
+    current_state = initial_state
+    for t in 1:T
+        current_state = cell(current_state)
+        states[t+1] = current_state
+    end
+    return states
+end
+
+# ============================================================================
+# Example Network and Loss Function
+# ============================================================================
+
+# Let’s define our GraphRNNCell with a simple MLP.
+input_dim = 8 + 3  # original 8-dim state plus three aggregated geometric features
+hidden_dim = 32
+output_dim = 8   # correction vector has the same dimension as the i-state
+net = Chain(
+    Dense(input_dim, hidden_dim, relu),
+    Dense(hidden_dim, hidden_dim, relu),
+    Dense(hidden_dim, output_dim)
+)
+cell = GraphRNNCell(net)
+
+# For training, we define a loss between the predicted final state (after T steps)
+# and the true final state from simulation.
+function loss_fn(initial_state, true_final_state, cell, T)
+    states = GraphRNN(initial_state, cell, T)
+    pred_final_state = states[end]
+    return Flux.Losses.mse(pred_final_state, true_final_state)
+end
+
+# ============================================================================
+# Training Loop
+# ============================================================================
+
+# Assume we have a dataset (you generated X and Y earlier)
+# X: list of initial state vectors
+# Y: list of corresponding final state vectors (from simulation)
+# For demonstration, we assume these are already loaded.
+
+# Convert to a suitable format (e.g., matrices or batches) if desired.
+# Here, we simply iterate over the list.
+T_steps = 100  # number of time steps for unrolling (should match your simulation)
+
+# Setup the optimizer
+opt = Flux.ADAM(1e-4)
+params = Flux.params(cell)
+
+# Number of epochs
+epochs = 50
+
+for epoch in 1:epochs
+    total_loss = 0.0
+    for (x, y) in zip(X, Y)
+        # Use gradient tracking (the cell is differentiable because:
+        # - the alive function is written mostly with differentiable operations;
+        # - our added NN uses standard differentiable layers;
+        # - softmax and vector arithmetic are differentiable).
+        l, back = Flux.withgradient() do
+            loss_fn(x, y, cell, T_steps)
+        end
+        total_loss += l
+        Flux.Optimise.update!(opt, params, back())
+    end
+    println("Epoch $epoch: Loss = $(round(total_loss/length(X), digits=6))")
+end
+
+# ============================================================================
+# Inference / Evaluation
+# ============================================================================
+
+# Now you can use the trained GraphRNNCell to predict the evolution of new initial states.
+test_state = [1.0/8 for _ in 1:8]
+predicted_series = GraphRNN(test_state, cell, T_steps)
+predicted_final = predicted_series[end]
+println("Predicted final i-state: ", predicted_final)
