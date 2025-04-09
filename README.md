@@ -14,5 +14,7 @@ This repository contains the white paper, where the detailed mathematical basis 
 This repository contains the published data, and their metadata, used to compute the Oxi-Shapes displayed in the preprint. They include data files [1](https://github.com/JamesCobley/Oxi_Shapes/blob/main/Data%20File%201%20allowed%20and%20barred%20r%2010.xlsx), [2](https://github.com/JamesCobley/Oxi_Shapes/blob/main/Data%20File%202.xlsx), and 3. 
 # Further Reading
 Background reading: [oxiforms](https://onlinelibrary.wiley.com/doi/full/10.1002/bies.202200248), [the unmapped cysteine proteoform space](https://journals.physiology.org/doi/abs/10.1152/ajpcell.00152.2024), and the [nonlinear dynamics of cysteine proteoforms](https://www.sciencedirect.com/science/article/pii/S2213231725000369).
+# License
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
 # Contact
 For further information contact James Cobley (jcobley001@dundee.ac.uk) or (j_cobley@yahoo.com)
