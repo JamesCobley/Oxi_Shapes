@@ -593,17 +593,25 @@ points3D, R_vals, C_R_vals, _ = update_geometry_from_rho(ρ0, pf_states, flat_po
 fg = FeaturedGraph(g)  # g already created from edges
 
 geo_brain_model = Chain(
-    WithGraph(fg, GCNConv(1 => 16, relu)),  # 1 input feature (C_R), 16 hidden
-    WithGraph(fg, GCNConv(16 => 8)),        # output: 1 scalar per node (ρ̂)
-    Flux.flatten                            # output vector of shape (8,)
+    WithGraph(fg, GCNConv(1 => 16, relu)),  # input: 1 feature per node
+    WithGraph(fg, GCNConv(16 => 1)),        # output: 1 value per node (ρ̂)
+    x -> reshape(x, :)                      # flatten (8, 1) → (8,)
 )
 
 function GNN_update(ρ_t::Vector{Float32}, model, pf_states, flat_pos, edges)
+    # Compute current C-Ricci values (1 per node)
     _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, pf_states, flat_pos, edges)
-    x_feat = reshape(Float32.(C_R_vals), 1, :)
-    ρ_hat_next = model(x_feat)
+
+    # Format input as node features (8 nodes × 1 feature)
+    x_feat = reshape(Float32.(C_R_vals), :, 1)  # shape: (8, 1)
+
+    # Forward pass through the model
+    ρ_hat_next = model(x_feat)  # output shape: (8,)
+
+    # Post-processing: clamp negatives and normalize
     ρ_hat_next = max.(ρ_hat_next, 0.0f0)
     ρ_hat_next ./= sum(ρ_hat_next)
+
     return ρ_hat_next
 end
 
@@ -635,7 +643,7 @@ function train_with_alive!(
         end
 
         # Compute gradients and update weights
-        grads = gradient(step_loss, ps)
+        grads = Flux.gradient(step_loss, ps)
         Flux.Optimise.update!(opt, ps, grads)
 
         # Update state for next round
