@@ -606,3 +606,55 @@ function GNN_update(ρ_t::Vector{Float32}, model, pf_states, flat_pos, edges)
     ρ_hat_next ./= sum(ρ_hat_next)
     return ρ_hat_next
 end
+
+# ============================================================================
+# Training
+# ============================================================================
+
+function train_with_alive!(
+    model, ρ0::Vector{Float32}, T::Int,
+    pf_states, flat_pos, edges;
+    opt=ADAM(1e-3), verbose=true
+)
+    ρ_t = copy(ρ0)
+    ps = Flux.params(model)
+    total_loss = 0.0
+
+    for t in 1:T
+        # Copy current state for model input
+        ρ_input = copy(ρ_t)
+
+        # Simulate ground truth update using the real field dynamics
+        ρ_gt = copy(ρ_t)
+        oxi_shapes_alive!(ρ_gt, pf_states, flat_pos, edges; max_moves=10)
+
+        # Define the loss function for this step
+        function step_loss()
+            ρ_pred = GNN_update(ρ_input, model, pf_states, flat_pos, edges)
+            return Flux.Losses.mse(ρ_pred, ρ_gt)
+        end
+
+        # Compute gradients and update weights
+        grads = gradient(step_loss, ps)
+        Flux.Optimise.update!(opt, ps, grads)
+
+        # Update state for next round
+        oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=10)
+        l = step_loss()
+        total_loss += l
+        verbose && println("Step $t: Loss = ", round(l, digits=6))
+    end
+
+    avg_loss = total_loss / T
+    verbose && println("✅ Average training loss over $T steps: ", round(avg_loss, digits=6))
+    return avg_loss
+end
+
+println("🚀 Starting GeoBrain training...")
+
+ρ0 = Float32[1/8 for _ in 1:8]  # uniform initial occupancy
+T = 100  # number of training steps
+
+train_with_alive!(geo_brain_model, ρ0, T, pf_states, flat_pos, edges)
+
+@save "geo_brain_trained.bson" geo_brain_model
