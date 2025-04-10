@@ -575,43 +575,34 @@ println("Finished generating dataset with metadata")
 # Build ML model
 # ============================================================================
 
-# Build Graph from your edge list
+# ============================================================================
+# Build ML model using direct curvature as field input
+# ============================================================================
+
+# Build Graph
 g = DiGraph(length(pf_states))
 state_to_idx = Dict(s => i for (i, s) in enumerate(pf_states))
-
 for (u, v) in edges
     add_edge!(g, state_to_idx[u], state_to_idx[v])
 end
 
-function build_feature_matrix(ρ::Vector{<:Real}, C_R_vals::Vector{<:Real})
-    return Float32.(hcat(ρ, C_R_vals)')  # shape: (2, num_nodes)
-end
+fg = FeaturedGraph(g)
 
-# Generate geometric quantities from initial ρ0
-points3D, R_vals, C_R_vals, _ = update_geometry_from_rho(ρ0, pf_states, flat_pos, edges)
-
-fg = FeaturedGraph(g)  # g already created from edges
-
+# Model with 1 input feature per node (C_R)
 geo_brain_model = Chain(
-    WithGraph(fg, GCNConv(1 => 16, relu)),  # input: 1 feature per node
-    WithGraph(fg, GCNConv(16 => 1)),        # output: 1 value per node (ρ̂)
-    x -> reshape(x, :)                      # flatten (8, 1) → (8,)
+    WithGraph(fg, GCNConv(1 => 16, relu)),
+    WithGraph(fg, GCNConv(16 => 1)),
+    x -> reshape(x, :)  # Output shape: (8,)
 )
 
-function GNN_update(ρ_t::Vector{Float32}, model, pf_states, flat_pos, edges)
-    # Compute current C-Ricci values (1 per node)
+# Updated GNN inference using just C_R
+function GNN_update(ρ_t::Vector{Float32}, model, fg, pf_states, flat_pos, edges)
     _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, pf_states, flat_pos, edges)
-
-    # Format input as node features (8 nodes × 1 feature)
-    x_feat = reshape(Float32.(C_R_vals), :, 1)  # shape: (8, 1)
-
-    # Forward pass through the model
-    ρ_hat_next = model(x_feat)  # output shape: (8,)
-
-    # Post-processing: clamp negatives and normalize
+    node_input = reshape(Float32.(C_R_vals), 1, :)  # shape: (1, 8)
+    fg.x = node_input
+    ρ_hat_next = model(node_input)
     ρ_hat_next = max.(ρ_hat_next, 0.0f0)
     ρ_hat_next ./= sum(ρ_hat_next)
-
     return ρ_hat_next
 end
 
@@ -620,7 +611,7 @@ end
 # ============================================================================
 
 function train_with_alive!(
-    model, ρ0::Vector{Float32}, T::Int,
+    model, fg, ρ0::Vector{Float32}, T::Int,
     pf_states, flat_pos, edges;
     opt=ADAM(1e-3), verbose=true
 )
@@ -629,24 +620,18 @@ function train_with_alive!(
     total_loss = 0.0
 
     for t in 1:T
-        # Copy current state for model input
         ρ_input = copy(ρ_t)
-
-        # Simulate ground truth update using the real field dynamics
         ρ_gt = copy(ρ_t)
         oxi_shapes_alive!(ρ_gt, pf_states, flat_pos, edges; max_moves=10)
 
-        # Define the loss function for this step
         function step_loss()
-            ρ_pred = GNN_update(ρ_input, model, pf_states, flat_pos, edges)
+            ρ_pred = GNN_update(ρ_input, model, fg, pf_states, flat_pos, edges)
             return Flux.Losses.mse(ρ_pred, ρ_gt)
         end
 
-        # Compute gradients and update weights
         grads = Flux.gradient(step_loss, ps)
         Flux.Optimise.update!(opt, ps, grads)
 
-        # Update state for next round
         oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=10)
         l = step_loss()
         total_loss += l
@@ -658,11 +643,15 @@ function train_with_alive!(
     return avg_loss
 end
 
+# ============================================================================
+# Run Training
+# ============================================================================
+
 println("🚀 Starting GeoBrain training...")
 
 ρ0 = Float32[1/8 for _ in 1:8]  # uniform initial occupancy
 T = 100  # number of training steps
 
-train_with_alive!(geo_brain_model, ρ0, T, pf_states, flat_pos, edges)
+train_with_alive!(geo_brain_model, fg, ρ0, T, pf_states, flat_pos, edges)
 
 @save "geo_brain_trained.bson" geo_brain_model
