@@ -17,7 +17,7 @@ using Statistics
 using ComplexityMeasures
 using Distributions
 using Graphs
-using Geometric.Flux
+using GeometricFlux
 using Distances
 using DelimitedFiles
 using Flux
@@ -235,11 +235,11 @@ function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every
         t_span = 1:100
     end
     T = length(t_span)
-    
+
     X, Y, Metadata, Geos = [], [], [], []
     geo_counter = Dict{Vector{String}, Int}()
     initials = generate_systematic_initials(num_total=50)
-    
+
     total_samples = 0
 
     for vec in initials
@@ -248,47 +248,47 @@ function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every
             rho0 = vec
             # Run the evolution while capturing metadata at each time step:
             ρ_series, trajectory, geo, global_metadata = evolve_time_series_metadata!(rho0, T, pf_states, flat_pos, edges; max_moves_per_step=10)
-            
+
             # Use the initial and final i-state as inputs/outputs (or modify as needed)
             final_rho = ρ_series[end]
             final_rho = final_rho ./ sum(final_rho)  # ensure normalization
-            
+
             push!(X, rho0)
             push!(Y, final_rho)
             push!(Metadata, global_metadata)
-            
+
             if !isnothing(geo)
                 geo_counter[geo] = get(geo_counter, geo, 0) + 1
                 push!(Geos, geo)
             end
-            
+
             total_samples += 1
-            
+
             if total_samples % save_every == 0
                 println("Checkpoint: $total_samples samples generated...")
                 # Save interim dataset checkpoint using BSON (or CSV)
                 @save "checkpoint_$total_samples.bson" X Y Metadata Geos
             end
-            
+
             if total_samples >= max_samples
                 break
             end
         end
-        
+
         if total_samples >= max_samples
             break
         end
     end
-    
+
     println("Finished generating dataset with $total_samples samples.")
     println("Most traversed geodesics:")
     for (path, count) in sort(collect(geo_counter), by=x -> x[2], rev=true)
         println(join(path, " → "), " | Count: ", count)
     end
-    
+
     # Save final dataset
     @save "final_dataset.bson" X Y Metadata Geos
-    
+
     return X, Y, Metadata, Geos
 end
 
@@ -503,23 +503,23 @@ function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every
             rho0 = vec
             # Run the evolution while capturing metadata at each time step:
             ρ_series, trajectory, geo, global_metadata = evolve_time_series_metadata!(rho0, T, pf_states, flat_pos, edges; max_moves_per_step=10)
-            
+
             # Use the initial and final i-state as inputs/outputs (or modify as needed)
             final_rho = ρ_series[end]
             # Re-normalize final_rho if necessary
             final_rho = final_rho ./ sum(final_rho)
-            
+
             push!(X, rho0)
             push!(Y, final_rho)
             push!(Metadata, global_metadata)
-            
+
             if !isnothing(geo)
                 geo_counter[geo] = get(geo_counter, geo, 0) + 1
                 push!(Geos, geo)
             end
-            
+
             total_samples += 1
-            
+
             if total_samples % save_every == 500
                 println("Checkpoint: $total_samples samples generated...")
                 # Optionally save interim datasets to CSV or BSON
@@ -527,23 +527,23 @@ function create_dataset_ODE_alive(; t_span=nothing, max_samples=1000, save_every
                 # writedlm("X_partial_$total_samples.csv", X, ',')
                 # writedlm("Y_partial_$total_samples.csv", Y, ',')
             end
-            
+
             if total_samples >= max_samples
                 break
             end
         end
-        
+
         if total_samples >= max_samples
             break
         end
     end
-    
+
     println("Finished generating dataset with $total_samples samples.")
     println("Most traversed geodesics:")
     for (path, count) in sort(collect(geo_counter), by=x->x[2], rev=true)
         println(join(path, " → "), " | Count: ", count)
     end
-    
+
     return X, Y, Metadata, Geos
 end
 
@@ -583,9 +583,9 @@ for (u, v) in edges
     add_edge!(g, state_to_idx[u], state_to_idx[v])
 end
 
-function build_feature_matrix(ρ::Vector{<:Real}, C_R::Vector{<:Real})
-    return Float32.(hcat(ρ, C_R)')  # shape: (2, num_nodes)
+function build_feature_matrix(ρ::Vector{<:Real}, C_R_vals::Vector{<:Real})
+    return Float32.(hcat(ρ, C_R_vals)')  # shape: (2, num_nodes)
 end
 
-x_feat = build_feature_matrix(Float32.(ρ0), Float32.(C_R))
-
+# Generate geometric quantities from initial ρ0
+points3D, R_vals, C_R_vals, _ = update_geometry_from_rho(ρ0, pf_states, flat_pos, edges)
