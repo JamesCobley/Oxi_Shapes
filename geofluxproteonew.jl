@@ -589,3 +589,20 @@ end
 
 # Generate geometric quantities from initial ρ0
 points3D, R_vals, C_R_vals, _ = update_geometry_from_rho(ρ0, pf_states, flat_pos, edges)
+
+fg = FeaturedGraph(g)  # g already created from edges
+
+geo_brain_model = Chain(
+    WithGraph(fg, GCNConv(1 => 16, relu)),  # 1 input feature (C_R), 16 hidden
+    WithGraph(fg, GCNConv(16 => 8)),        # output: 1 scalar per node (ρ̂)
+    Flux.flatten                            # output vector of shape (8,)
+)
+
+function GNN_update(ρ_t::Vector{Float32}, model, pf_states, flat_pos, edges)
+    _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, pf_states, flat_pos, edges)
+    x_feat = reshape(Float32.(C_R_vals), 1, :)
+    ρ_hat_next = model(x_feat)
+    ρ_hat_next = max.(ρ_hat_next, 0.0f0)
+    ρ_hat_next ./= sum(ρ_hat_next)
+    return ρ_hat_next
+end
