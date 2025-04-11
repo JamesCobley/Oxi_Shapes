@@ -572,10 +572,6 @@ println("Finished generating dataset with metadata")
 @save "final_dataset.bson" X Y metadata geos
 
 # ============================================================================
-# Build ML model
-# ============================================================================
-
-# ============================================================================
 # Build ML model using direct curvature as field input
 # ============================================================================
 
@@ -586,32 +582,36 @@ for (u, v) in edges
     add_edge!(g, state_to_idx[u], state_to_idx[v])
 end
 
-fg = FeaturedGraph(g)
+# === Add this helper ===
+function make_featured_graph(g::SimpleDiGraph, x_feat::AbstractMatrix)
+    A = Float32.(adjacency_matrix(g))
+    sg = GraphSignals.SparseGraph(A; is_directed=true)
+    return FeaturedGraph(sg, x_feat)
+end
 
-# Model with 1 input feature per node (C_R)
+# === Define the model ===
 geo_brain_model = Chain(
-    WithGraph(fg, GCNConv(1 => 16, relu)),
-    WithGraph(fg, GCNConv(16 => 1)),
+    GCNConv(1 => 16, relu),
+    GCNConv(16 => 1),
     x -> reshape(x, :)  # Output shape: (8,)
 )
 
-# Updated GNN inference using just C_R
-function GNN_update(ρ_t::Vector{Float32}, model, fg, pf_states, flat_pos, edges)
+# === GNN step update using live geometry ===
+function GNN_update(ρ_t::Vector{Float32}, model, g, pf_states, flat_pos, edges)
     _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, pf_states, flat_pos, edges)
-    node_input = reshape(Float32.(C_R_vals), 1, :)  # shape: (1, 8)
-    fg.x = node_input
-    ρ_hat_next = model(node_input)
+    x_feat = reshape(Float32.(C_R_vals), 1, :)  # shape: (1, 8)
+    fg = make_featured_graph(g, x_feat)
+    ρ_hat_next = model(fg)
     ρ_hat_next = max.(ρ_hat_next, 0.0f0)
     ρ_hat_next ./= sum(ρ_hat_next)
     return ρ_hat_next
 end
 
 # ============================================================================
-# Training
+# Training Loop
 # ============================================================================
-
 function train_with_alive!(
-    model, fg, ρ0::Vector{Float32}, T::Int,
+    model, g, ρ0::Vector{Float32}, T::Int,
     pf_states, flat_pos, edges;
     opt=ADAM(1e-3), verbose=true
 )
@@ -625,7 +625,7 @@ function train_with_alive!(
         oxi_shapes_alive!(ρ_gt, pf_states, flat_pos, edges; max_moves=10)
 
         function step_loss()
-            ρ_pred = GNN_update(ρ_input, model, fg, pf_states, flat_pos, edges)
+            ρ_pred = GNN_update(ρ_input, model, g, pf_states, flat_pos, edges)
             return Flux.Losses.mse(ρ_pred, ρ_gt)
         end
 
@@ -644,14 +644,13 @@ function train_with_alive!(
 end
 
 # ============================================================================
-# Run Training
+# Execute Training
 # ============================================================================
-
 println("🚀 Starting GeoBrain training...")
 
-ρ0 = Float32[1/8 for _ in 1:8]  # uniform initial occupancy
-T = 100  # number of training steps
+ρ0 = Float32[1/8 for _ in 1:8]  # Uniform initial occupancy
+T = 100  # Number of training steps
 
-train_with_alive!(geo_brain_model, fg, ρ0, T, pf_states, flat_pos, edges)
+train_with_alive!(geo_brain_model, g, ρ0, T, pf_states, flat_pos, edges)
 
 @save "geo_brain_trained.bson" geo_brain_model
