@@ -577,43 +577,78 @@ println("Finished generating dataset with metadata")
 # Build ML model using direct curvature as field input
 # ============================================================================
 
-# === Graph construction ===
+# --- Build the base DiGraph and adjacency sparse graph once ---
 g = DiGraph(length(pf_states))
 state_to_idx = Dict(s => i for (i, s) in enumerate(pf_states))
 for (u, v) in edges
     add_edge!(g, state_to_idx[u], state_to_idx[v])
 end
 
-function make_featured_graph(g::SimpleDiGraph, x_feat::AbstractMatrix)
-    A = Float32.(adjacency_matrix(g))
-    A_sparse = sparse(A)
-    sg = GraphSignals.SparseGraph(A_sparse, true)
-    return GraphSignals.FeaturedGraph(sg; nf = x_feat)
-end
+A = Float32.(adjacency_matrix(g))
+A_sparse = sparse(A)
+# construct the SparseGraph only once
+sg = GraphSignals.SparseGraph(A_sparse, true, Float32)
 
-# === Define the GNN model ===
+# create a “template” FeaturedGraph fg0 without re‑calling SparseGraph
+# Determine node- and edge-count from the original DiGraph
+graph_n = nv(g)
+graph_e = ne(g)
+
+# Build the SparseGraph once (already defined above as `sg`)
+# Now instantiate fg0 with explicit empty edge/positional features:
+fg0 = FeaturedGraph(
+    sg,
+    zeros(Float32, 1, graph_n),   # nf: (1 × #nodes) => (1 × 8)
+    zeros(Float32, 0, graph_e),    # ef: (0 × #edges) => (0 × 12)
+    nothing,                       # gf: no global features
+    zeros(Float32, 0, graph_e),    # pf: (0 × #edges)
+    :adjm                          # adjacency mat type for GCNConv
+)
+num_edges = ne(sg)
+# Node-features dim=1, no edge or positional features
+fg0 = FeaturedGraph(
+    sg,
+    zeros(Float32, 1, num_nodes),      # nf: (1 × #nodes)
+    zeros(Float32, 0, num_edges),      # ef: (0 × #edges)
+    nothing,                            # gf: global features (none)
+    zeros(Float32, 0, num_edges),      # pf: positional features per edge (none)
+    :adjm                               # matrix type for GCNConv
+)(Float32, 1, nv(sg)), nothing, nothing, nothing, :adjm)
+
+# --- Define the GNN model ---
 geo_brain_model = Chain(
     GCNConv(1 => 16, relu),
     GCNConv(16 => 1),
-    x -> reshape(x, :)  # Output shape: (8,)
+    x -> reshape(x, :)
 )
 
-# === GNN inference update using live curvature ===
-function GNN_update(ρ_t::Vector{Float32}, model, g, pf_states, flat_pos, edges)
+# --- Option 2: Rebuild FeaturedGraph from fg0 inside update ---
+function GNN_update(ρ_t::Vector{Float32}, model, fg0)
+    # compute curved Ricci features
     _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, pf_states, flat_pos, edges)
-    x_feat = reshape(Float32.(C_R_vals), 1, :)  # shape: (1, 8)
-    fg = make_featured_graph(g, x_feat)         # Create FeaturedGraph
-    ρ_hat_next = model(fg)                      # Forward pass
-    ρ_hat_next = max.(ρ_hat_next, 0.0f0)
+    x_feat = reshape(Float32.(C_R_vals), 1, :)  # new node features
+
+    # rebuild FeaturedGraph from the fg0 template
+    fg = FeaturedGraph(fg0; nf = x_feat)
+
+    # forward pass
+    ρ_hat_next = model(fg)
+    ρ_hat_next .= max.(ρ_hat_next, 0.0f0)
     ρ_hat_next ./= sum(ρ_hat_next)
     return ρ_hat_next
 end
 
-# === GNN training function ===
+# --- Example call inside training ---
+# ρ_next = GNN_update(current_ρ, geo_brain_model, fg0)
+
+# === GNN training function (updated to use fg0 template) ===
 function train_with_alive!(
-    model, g, ρ0::Vector{Float32}, T::Int,
-    pf_states, flat_pos, edges;
-    opt=ADAM(1e-3), verbose=true
+    model,
+    fg0::GraphSignals.FeaturedGraph,
+    ρ0::Vector{Float32},
+    T::Int;
+    opt=ADAM(1e-3),
+    verbose=true
 )
     ρ_t = copy(ρ0)
     ps = Flux.params(model)
@@ -625,13 +660,14 @@ function train_with_alive!(
         oxi_shapes_alive!(ρ_gt, pf_states, flat_pos, edges; max_moves=10)
 
         function step_loss()
-            ρ_pred = GNN_update(ρ_input, model, g, pf_states, flat_pos, edges)
+            ρ_pred = GNN_update(ρ_input, model, fg0)
             return Flux.Losses.mse(ρ_pred, ρ_gt)
         end
 
         grads = Flux.gradient(step_loss, ps)
         Flux.Optimise.update!(opt, ps, grads)
 
+        # evolve the true trajectory
         oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=10)
         l = step_loss()
         total_loss += l
@@ -641,6 +677,9 @@ function train_with_alive!(
     avg_loss = total_loss / T
     verbose && println("✅ Average training loss over $T steps: ", round(avg_loss, digits=6))
     return avg_loss
+end
+# ρ_next = GNN_update(current_ρ, geo_brain_model, fg0)
+
 end
 
 # === Execute Training ===
