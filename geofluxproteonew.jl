@@ -3,7 +3,7 @@ using Pkg
 Pkg.activate(".")  # Optional: activate project environment
 Pkg.add(["Flux", "CUDA", "GeometryBasics", "LinearAlgebra",
          "StatsBase", "DifferentialEquations", "Optimisers", "Random",
-         "Distances", "Interpolations", "DelimitedFiles", "Distributions", "ComplexityMeasures", "BSON", "Dates", "Graphs", "Geometric.Flux"])
+         "Distances", "Interpolations", "DelimitedFiles", "Distributions", "ComplexityMeasures", "BSON", "Dates", "Graphs", "SparseArrays", "Geometric.Flux"])
 
 # ============================================================================
 # Installations and Imports
@@ -20,6 +20,8 @@ using Graphs
 using GeometricFlux
 using Distances
 using DelimitedFiles
+using GraphSignals
+using SparseArrays
 using Flux
 using Flux:softmax
 using Flux.Losses: mse
@@ -575,41 +577,39 @@ println("Finished generating dataset with metadata")
 # Build ML model using direct curvature as field input
 # ============================================================================
 
-# Build Graph
+# === Graph construction ===
 g = DiGraph(length(pf_states))
 state_to_idx = Dict(s => i for (i, s) in enumerate(pf_states))
 for (u, v) in edges
     add_edge!(g, state_to_idx[u], state_to_idx[v])
 end
 
-# === Add this helper ===
 function make_featured_graph(g::SimpleDiGraph, x_feat::AbstractMatrix)
     A = Float32.(adjacency_matrix(g))
-    sg = GraphSignals.SparseGraph(A; is_directed=true)
-    return FeaturedGraph(sg, x_feat)
+    A_sparse = sparse(A)
+    sg = GraphSignals.SparseGraph(A_sparse, true)
+    return GraphSignals.FeaturedGraph(sg; nf = x_feat)
 end
 
-# === Define the model ===
+# === Define the GNN model ===
 geo_brain_model = Chain(
     GCNConv(1 => 16, relu),
     GCNConv(16 => 1),
     x -> reshape(x, :)  # Output shape: (8,)
 )
 
-# === GNN step update using live geometry ===
+# === GNN inference update using live curvature ===
 function GNN_update(ρ_t::Vector{Float32}, model, g, pf_states, flat_pos, edges)
     _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, pf_states, flat_pos, edges)
     x_feat = reshape(Float32.(C_R_vals), 1, :)  # shape: (1, 8)
-    fg = make_featured_graph(g, x_feat)
-    ρ_hat_next = model(fg)
+    fg = make_featured_graph(g, x_feat)         # Create FeaturedGraph
+    ρ_hat_next = model(fg)                      # Forward pass
     ρ_hat_next = max.(ρ_hat_next, 0.0f0)
     ρ_hat_next ./= sum(ρ_hat_next)
     return ρ_hat_next
 end
 
-# ============================================================================
-# Training Loop
-# ============================================================================
+# === GNN training function ===
 function train_with_alive!(
     model, g, ρ0::Vector{Float32}, T::Int,
     pf_states, flat_pos, edges;
@@ -643,9 +643,7 @@ function train_with_alive!(
     return avg_loss
 end
 
-# ============================================================================
-# Execute Training
-# ============================================================================
+# === Execute Training ===
 println("🚀 Starting GeoBrain training...")
 
 ρ0 = Float32[1/8 for _ in 1:8]  # Uniform initial occupancy
