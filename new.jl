@@ -7,6 +7,8 @@ using SparseArrays
 using GeometryBasics
 using Graphs
 using Statistics: mean
+using Flux
+using Flux: Dense, relu
 
 # ============================================================================
 # Part A: Define the Geometry 
