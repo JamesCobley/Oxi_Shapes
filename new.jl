@@ -152,17 +152,17 @@ geo_brain_model = Chain(
 )
 
 # === Define the update function using the geometry ===
-function GNN_update_custom(ρ_t::Vector{Float64}, model, geo::GeoGraphStruct)
-    # Recompute curvature features from current ρ
-    _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, geo)
+function GNN_update_custom(ρ_t::Vector{Float32}, model, geo::GeoGraphStruct)
+    # Step 1: Recompute geometry using Float32 density
+    pts, R_vals, C_R_vals, anisotropy = update_geometry_from_rho(ρ_t, geo)
 
-    # Reshape C_R_vals into input format for the model (8×1)
-    x = reshape(Float32.(C_R_vals), :, 1)
+    # Step 2: Convert C_R_vals to Float32 and reshape to (8, 1)
+    x_input = reshape(Float32.(C_R_vals), :, 1)
 
-    # Run forward pass through model
-    ρ_pred = model(x) |> relu
+    # Step 3: Forward pass through the model
+    ρ_pred = model(x_input) |> relu
 
-    # Flatten and normalize
+    # Step 4: Normalize output to sum to 1
     ρ_vec = vec(ρ_pred)
     ρ_vec ./= sum(ρ_vec)
 
