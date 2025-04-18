@@ -9,6 +9,9 @@ using Graphs
 using Statistics: mean
 using Flux
 using Flux: Dense, relu
+using Random
+using BSON: @save
+using Dates
 
 # ============================================================================
 # Part A: Define the Geometry 
