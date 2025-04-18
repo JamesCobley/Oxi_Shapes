@@ -151,20 +151,19 @@ geo_brain_model = Chain(
     Dense(16, 1)          # Output: predicted occupancy (per node)
 )
 
-# === Define the update function using the geometry ===
 function GNN_update_custom(ρ_t::Vector{Float32}, model, geo::GeoGraphStruct)
-    # Step 1: Recompute geometry using Float32 density
-    pts, R_vals, C_R_vals, anisotropy = update_geometry_from_rho(ρ_t, geo)
+    _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, geo)
+    x_input = transpose(reshape(Float32.(C_R_vals), :, 1))  # (1, 8)
 
-    # Step 2: Convert C_R_vals to Float32 and reshape to (8, 1)
-    x_input = reshape(Float32.(C_R_vals), :, 1)
-
-    # Step 3: Forward pass through the model
     ρ_pred = model(x_input) |> relu
-
-    # Step 4: Normalize output to sum to 1
     ρ_vec = vec(ρ_pred)
-    ρ_vec ./= sum(ρ_vec)
+
+    total = sum(ρ_vec)
+    if total == 0.0f0 || isnan(total)
+        ρ_vec .= 1.0f0 / length(ρ_vec)  # fallback to uniform
+    else
+        ρ_vec ./= total
+    end
 
     return ρ_vec
 end
