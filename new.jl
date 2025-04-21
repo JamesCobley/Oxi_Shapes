@@ -13,7 +13,6 @@ using Optimisers
 using BSON: @save
 using Dates
 
-
 # ============================================================================
 # Part A: Define the Geometry (with Float32)
 # ============================================================================
@@ -326,7 +325,7 @@ loss_fn(y_pred, y_true) = Flux.Losses.mse(y_pred, y_true)
 
 # Initialize the optimizer
 opt = Optimisers.Adam(0.001)
-opt_state = Optimisers.setup(opt, model)
+opt_state = Optimisers.setup(opt, geo_brain_model)
 
 # Training parameters
 epochs = 10
@@ -344,13 +343,13 @@ for epoch in 1:epochs
         oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
 
         # Compute gradients
-        grads = gradient(Flux.params(model)) do
-            ρ_pred = GNN_update_custom(ρ0, model, build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges))
+        grads = gradient(Flux.params(geo_brain_model)) do
+            ρ_pred = GNN_update_custom(ρ0, geo_brain_model, build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges))
             loss_fn(ρ_pred, ρ_t)
         end
 
         # Update the model parameters
-        opt_state, model = Optimisers.update(opt_state, model, grads)
+        opt_state, model = Optimisers.update(opt_state, geo_brain_model, grads)
     end
 end
 
