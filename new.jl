@@ -1,7 +1,6 @@
 # ============================================================================
 # 1. Load packages
 # ============================================================================
-
 using LinearAlgebra
 using SparseArrays
 using GeometryBasics
@@ -9,12 +8,14 @@ using Graphs
 using Statistics: mean
 using Flux
 using Flux: Dense, relu
-using Random
+using Flux.Losses: mse
+using Optimisers
 using BSON: @save
 using Dates
 
+
 # ============================================================================
-# Part A: Define the Geometry 
+# Part A: Define the Geometry (with Float32)
 # ============================================================================
 
 function lift_to_z_plane(rho::Vector{Float32}, pf_states, flat_pos)
@@ -144,10 +145,6 @@ edges = [
     ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
 ]
 
-# ============================================================================
-# Part B: Custom GNN for Predicting Updated Occupancy from Curvature
-# ============================================================================
-
 # === Define the GNN model ===
 geo_brain_model = Chain(
     Dense(1, 16, relu),   # Input: scalar curvature → hidden layer
@@ -170,10 +167,6 @@ function GNN_update_custom(ρ_t::Vector{Float32}, model, geo::GeoGraphStruct)
 
     return ρ_vec
 end
-
-# ============================================================================
-# Part C: oxi_shapes_alive!
-# ============================================================================
 
 function compute_entropy_cost(i::Int, j::Int, C_R_vals::Vector{Float32}, pf_states::Vector{String})
     baseline_DeltaE = 1.0f0
@@ -268,23 +261,32 @@ end
 # Part D: Recurrent GNN Rollout (Pure model-based prediction)
 # ============================================================================
 
-"""
-    GNN_recurrent_step!(ρ_t, model, geo)
+function integrated_recurrent_update!(
+    ρ_t::Vector{Float32},
+    model,
+    geo::GeoGraphStruct,
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}};
+    max_moves::Int = 10
+)
+    # Step 1: Simulation Update
+    oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=max_moves)
 
-Perform a single step GNN update:
-- Uses geometry-derived curvature from `ρ_t`
-- Predicts next state `ρ̂ₜ₊₁`
-"""
-function GNN_recurrent_step!(ρ_t::Vector{Float32}, model, geo::GeoGraphStruct)
+    # Step 2: Model Prediction
+    # Recompute geometry from the updated ρ_t
     _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, geo)
-    x_input = transpose(reshape(C_R_vals, :, 1))  # (1, 8)
+    # Reshape to ensure the input has shape (1, N): one feature per node, N nodes.
+    x_input = transpose(reshape(C_R_vals, :, 1))  # Expected shape: (1, 8)
 
+    # Forward pass through the model
     ρ_pred = model(x_input) |> relu
     ρ_vec = vec(ρ_pred)
 
+    # Step 3: Normalize the predicted state
     total = sum(ρ_vec)
     if total == 0.0f0 || isnan(total)
-        ρ_vec .= 1.0f0 / length(ρ_vec)  # fallback to uniform
+        ρ_vec .= 1.0f0 / length(ρ_vec)  # fallback to uniform if unstable
     else
         ρ_vec ./= total
     end
@@ -292,22 +294,79 @@ function GNN_recurrent_step!(ρ_t::Vector{Float32}, model, geo::GeoGraphStruct)
     ρ_t .= ρ_vec  # Update in-place
 end
 
-"""
-    rollout_GNN(ρ0, model, geo, T)
-
-Run pure GNN rollout for T steps starting from `ρ0`
-Returns matrix of shape (T+1, N)
-"""
-function rollout_GNN(ρ0::Vector{Float32}, model, geo::GeoGraphStruct, T::Int)
+function rollout_integrated_GNN(
+    ρ0::Vector{Float32},
+    model,
+    geo::GeoGraphStruct,
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    T::Int;
+    max_moves_per_step::Int = 10
+)
     N = length(ρ0)
     history = zeros(Float32, T+1, N)
     ρ_t = copy(ρ0)
     history[1, :] .= ρ_t
 
     for t in 1:T
-        GNN_recurrent_step!(ρ_t, model, geo)
+        integrated_recurrent_update!(ρ_t, model, geo, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
         history[t+1, :] .= ρ_t
     end
 
     return history
 end
+
+# ============================================================================
+# Part E: Practice
+# ============================================================================
+
+# Define the loss function
+loss_fn(y_pred, y_true) = Flux.Losses.mse(y_pred, y_true)
+
+# Initialize the optimizer
+opt = Optimisers.Adam(0.001)
+opt_state = Optimisers.setup(opt, model)
+
+# Training parameters
+epochs = 10
+steps_per_epoch = 100
+max_moves_per_step = 10
+
+# Training loop
+for epoch in 1:epochs
+    for step in 1:steps_per_epoch
+        # Generate a safe random initial state
+        ρ0 = Float32[0.7, 0.1, 0.0, 0.0, 0.1, 0.0, 0.0, 0.1]
+        ρ_t = copy(ρ0)
+
+        # Perform a simulation step
+        oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
+
+        # Compute gradients
+        grads = gradient(Flux.params(model)) do
+            ρ_pred = GNN_update_custom(ρ0, model, build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges))
+            loss_fn(ρ_pred, ρ_t)
+        end
+
+        # Update the model parameters
+        opt_state, model = Optimisers.update(opt_state, model, grads)
+    end
+end
+
+# Train the model
+losses = train_model!(
+    geo_brain_model,
+    ρ0,
+    pf_states,
+    flat_pos,
+    edges;
+    epochs = 10,
+    steps_per_epoch = 100,
+    max_moves_per_step = 10,
+    learning_rate = 0.01f0
+)
+
+# Save the trained model
+timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
+@save "trained_model_$timestamp.bson" model
