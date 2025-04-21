@@ -339,26 +339,30 @@ opt = Adam(0.001)
 ps  = Flux.params(geo_brain_model)
 
 # Training settings
-epochs            = 10
+epochs            = 100
 steps_per_epoch   = 100
 max_moves_per_step = 10
 
 for epoch in 1:epochs
+  total_loss = 0.0f0
+
   for step in 1:steps_per_epoch
     ρ0 = Float32[0.7, 0.1, 0.0, 0.0, 0.1, 0.0, 0.0, 0.1]
     ρ_t = copy(ρ0)
     oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
 
-    grads = gradient(ps) do
+    function compute_loss()
       ρ_pred = GNN_update_custom(ρ0, geo_brain_model,
                    build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges))
-      loss_fn(ρ_pred, ρ_t)
+      return loss_fn(ρ_pred, ρ_t)
     end
 
+    grads = gradient(compute_loss, ps)
     update!(opt, ps, grads)
+    total_loss += compute_loss()
   end
 
-  @info "Completed epoch $epoch"
+  println("Epoch $epoch — Loss: $(total_loss / steps_per_epoch)")
 end
 
 # Save the trained model
