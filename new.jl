@@ -6,6 +6,7 @@ using SparseArrays
 using GeometryBasics
 using Graphs
 using Statistics: mean
+using Statsbase
 using Flux
 using Flux: Dense, relu
 using Flux.Losses: mse
