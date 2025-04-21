@@ -13,8 +13,9 @@ using Optimisers
 using BSON: @save
 using Dates
 
+
 # ============================================================================
-# Part A: Define the Geometry 
+# Part A: Define the Geometry (with Float32)
 # ============================================================================
 
 function lift_to_z_plane(rho::Vector{Float32}, pf_states, flat_pos)
@@ -144,10 +145,7 @@ edges = [
     ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
 ]
 
-# ============================================================================
-# Part B: Define the GNN model
-# ============================================================================
-
+# === Define the GNN model ===
 geo_brain_model = Chain(
     Dense(1, 16, relu),   # Input: scalar curvature → hidden layer
     Dense(16, 1)          # Output: predicted occupancy (per node)
@@ -169,10 +167,6 @@ function GNN_update_custom(ρ_t::Vector{Float32}, model, geo::GeoGraphStruct)
 
     return ρ_vec
 end
-
-# ============================================================================
-# Part C: Define the ALIVE-RFEE-GMM function
-# ============================================================================
 
 function compute_entropy_cost(i::Int, j::Int, C_R_vals::Vector{Float32}, pf_states::Vector{String})
     baseline_DeltaE = 1.0f0
@@ -231,7 +225,7 @@ function oxi_shapes_alive!(
             push!(probs, p)
         end
 
-        if sum(probs) < 1e-8f0
+        if sum(probs) < 1f-8
             inflow[i] += 0.01f0
             continue
         end
@@ -248,7 +242,7 @@ function oxi_shapes_alive!(
 
     # Step 3: Clamp, normalize, threshold
     inflow .= max.(inflow, 0.0f0)
-    if sum(inflow) > 0
+    if sum(inflow) > 0.0f0
         inflow ./= sum(inflow)
     end
 
@@ -264,7 +258,7 @@ function oxi_shapes_alive!(
 end
 
 # ============================================================================
-# Part D: Recurrent GNN Rollout 
+# Part D: Recurrent GNN Rollout (Pure model-based prediction)
 # ============================================================================
 
 function integrated_recurrent_update!(
