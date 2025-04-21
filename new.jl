@@ -5,15 +5,15 @@ using LinearAlgebra
 using SparseArrays
 using GeometryBasics
 using Graphs
+using StatsBase
 using Statistics: mean
-using Statsbase
 using Flux
 using Flux: Dense, relu
 using Flux.Losses: mse
-using Optimisers
+using Flux.Optimise: Adam, update!
 using BSON: @save
 using Dates
-
+using Zygote: @nograd
 
 # ============================================================================
 # Part A: Define the Geometry (with Float32)
@@ -52,27 +52,33 @@ function compute_c_ricci_dirichlet(R::Vector{Float32}, pf_states, edges)
     return C_R
 end
 
-function compute_anisotropy(C_R_vals::Vector{Float32}, pf_states, flat_pos, edges)
+function build_neighbor_indices(pf_states::Vector{String}, edges::Vector{Tuple{String, String}}, idx::Dict{String, Int})
+    return Dict(s => [idx[v] for (u, v) in edges if u == s] ∪ [idx[u] for (u, v) in edges if v == s] for s in pf_states)
+end
+
+function compute_anisotropy_pure(
+    C_R_vals::Vector{Float32},
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}}
+)
     idx = Dict(s => i for (i, s) in enumerate(pf_states))
-    neighbor_indices = Dict(s => Int[] for s in pf_states)
-    for (u, v) in edges
-        push!(neighbor_indices[u], idx[v])
-        push!(neighbor_indices[v], idx[u])
+    neighbor_indices = build_neighbor_indices(pf_states, edges, idx)
+
+    # Compute anisotropy values using vectorized / functional style
+    anisotropy = map(pf_states) do s
+        i = idx[s]
+        grads = map(neighbor_indices[s]) do j
+            dx = Float32(flat_pos[s][1] - flat_pos[pf_states[j]][1])
+            dy = Float32(flat_pos[s][2] - flat_pos[pf_states[j]][2])
+            dist = sqrt(dx^2 + dy^2)
+            dist > 1f-6 ? abs(C_R_vals[i] - C_R_vals[j]) / dist : 0.0f0
+        end
+        grads_nonzero = filter(x -> x > 0, grads)
+        isempty(grads_nonzero) ? 0.0f0 : mean(grads_nonzero)
     end
-    anisotropy = zeros(Float32, length(pf_states))
-    for (i, s) in enumerate(pf_states)
-        grad_vals = Float32[
-            abs(C_R_vals[i] - C_R_vals[j]) / norm(Float32[
-                flat_pos[s][1] - flat_pos[pf_states[j]][1],
-                flat_pos[s][2] - flat_pos[pf_states[j]][2]
-            ]) for j in neighbor_indices[s] if norm(Float32[
-                flat_pos[s][1] - flat_pos[pf_states[j]][1],
-                flat_pos[s][2] - flat_pos[pf_states[j]][2]
-            ]) > 1e-6
-        ]
-        anisotropy[i] = isempty(grad_vals) ? 0.0f0 : mean(grad_vals)
-    end
-    return anisotropy
+
+    return collect(anisotropy)  # Convert from generator to Vector
 end
 
 function initialize_sheaf_stalks(flat_pos, pf_states)
@@ -102,7 +108,7 @@ function build_GeoGraphStruct(ρ::Vector{Float32}, pf_states, flat_pos, edges)
     points3D = lift_to_z_plane(ρ, pf_states, flat_pos)
     R_vals = compute_R(points3D, flat_pos, pf_states, edges)
     C_R_vals = compute_c_ricci_dirichlet(R_vals, pf_states, edges)
-    anisotropy = compute_anisotropy(C_R_vals, pf_states, flat_pos, edges)
+    anisotropy = compute_anisotropy_pure(C_R_vals, pf_states, flat_pos, edges)
 
     g = SimpleDiGraph(length(pf_states))
     for (u, v) in edges
@@ -128,7 +134,7 @@ function update_geometry_from_rho(ρ::Vector{Float32}, geo::GeoGraphStruct)
     points3D = lift_to_z_plane(ρ, pf_states, flat_pos)
     R_vals = compute_R(points3D, flat_pos, pf_states, edges)
     C_R_vals = compute_c_ricci_dirichlet(R_vals, pf_states, edges)
-    anisotropy_vals = compute_anisotropy(C_R_vals, pf_states, flat_pos, edges)
+    anisotropy_vals = compute_anisotropy_pure(C_R_vals, pf_states, flat_pos, edges)
 
     return points3D, R_vals, C_R_vals, anisotropy_vals
 end
@@ -154,19 +160,17 @@ geo_brain_model = Chain(
 
 function GNN_update_custom(ρ_t::Vector{Float32}, model, geo::GeoGraphStruct)
     _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, geo)
-    x_input = transpose(reshape(Float32.(C_R_vals), :, 1))  # (1, 8)
+    x_input = transpose(reshape(C_R_vals, :, 1))  # (1, 8)
 
     ρ_pred = model(x_input) |> relu
     ρ_vec = vec(ρ_pred)
 
     total = sum(ρ_vec)
-    if total == 0.0f0 || isnan(total)
-        ρ_vec .= 1.0f0 / length(ρ_vec)  # fallback to uniform
+    return if total == 0.0f0 || isnan(total)
+        fill(1.0f0 / length(ρ_vec), length(ρ_vec))  # New vector
     else
-        ρ_vec ./= total
+        ρ_vec / total  # New vector
     end
-
-    return ρ_vec
 end
 
 function compute_entropy_cost(i::Int, j::Int, C_R_vals::Vector{Float32}, pf_states::Vector{String})
@@ -258,11 +262,23 @@ function oxi_shapes_alive!(
     ρ .= inflow
 end
 
+# none of our geometry/sheaf building routines should be
+# autodiff’d by Zygote — they only depend on ρ, never on model parameters.
+@nograd lift_to_z_plane
+@nograd compute_R
+@nograd compute_c_ricci_dirichlet
+@nograd build_neighbor_indices
+@nograd compute_anisotropy_pure
+@nograd initialize_sheaf_stalks
+@nograd sheaf_consistency
+@nograd build_GeoGraphStruct
+@nograd update_geometry_from_rho
+@nograd oxi_shapes_alive!
 # ============================================================================
 # Part D: Recurrent GNN Rollout (Pure model-based prediction)
 # ============================================================================
 
-function integrated_recurrent_update!(
+function integrated_recurrent_update(
     ρ_t::Vector{Float32},
     model,
     geo::GeoGraphStruct,
@@ -271,28 +287,23 @@ function integrated_recurrent_update!(
     edges::Vector{Tuple{String, String}};
     max_moves::Int = 10
 )
-    # Step 1: Simulation Update
-    oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=max_moves)
+    # Step 1: Simulation Update (mutates internally but not ρ_t externally)
+    ρ_sim = copy(ρ_t)
+    oxi_shapes_alive!(ρ_sim, pf_states, flat_pos, edges; max_moves=max_moves)
 
     # Step 2: Model Prediction
-    # Recompute geometry from the updated ρ_t
-    _, _, C_R_vals, _ = update_geometry_from_rho(ρ_t, geo)
-    # Reshape to ensure the input has shape (1, N): one feature per node, N nodes.
-    x_input = transpose(reshape(C_R_vals, :, 1))  # Expected shape: (1, 8)
+    _, _, C_R_vals, _ = update_geometry_from_rho(ρ_sim, geo)
+    x_input = transpose(reshape(C_R_vals, :, 1))  # (1, 8)
 
-    # Forward pass through the model
     ρ_pred = model(x_input) |> relu
     ρ_vec = vec(ρ_pred)
 
-    # Step 3: Normalize the predicted state
     total = sum(ρ_vec)
-    if total == 0.0f0 || isnan(total)
-        ρ_vec .= 1.0f0 / length(ρ_vec)  # fallback to uniform if unstable
+    return if total == 0.0f0 || isnan(total)
+        fill(1.0f0 / length(ρ_vec), length(ρ_vec))  # New vector
     else
-        ρ_vec ./= total
+        ρ_vec / total  # New vector
     end
-
-    ρ_t .= ρ_vec  # Update in-place
 end
 
 function rollout_integrated_GNN(
@@ -306,13 +317,13 @@ function rollout_integrated_GNN(
     max_moves_per_step::Int = 10
 )
     N = length(ρ0)
-    history = zeros(Float32, T+1, N)
-    ρ_t = copy(ρ0)
-    history[1, :] .= ρ_t
+    history = Matrix{Float32}(undef, T+1, N)
+    history[1, :] = copy(ρ0)
 
+    ρ_t = copy(ρ0)
     for t in 1:T
-        integrated_recurrent_update!(ρ_t, model, geo, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
-        history[t+1, :] .= ρ_t
+        ρ_t = integrated_recurrent_update(ρ_t, model, geo, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
+        history[t+1, :] = ρ_t
     end
 
     return history
@@ -322,52 +333,34 @@ end
 # Part E: Practice
 # ============================================================================
 
-# Define the loss function
-loss_fn(y_pred, y_true) = Flux.Losses.mse(y_pred, y_true)
+# Define loss and params
+loss_fn(ŷ, y) = mse(ŷ, y)
+opt = Adam(0.001)
+ps  = Flux.params(geo_brain_model)
 
-# Initialize the optimizer
-opt = Optimisers.Adam(0.001)
-opt_state = Optimisers.setup(opt, geo_brain_model)
-
-# Training parameters
-epochs = 10
-steps_per_epoch = 100
+# Training settings
+epochs            = 10
+steps_per_epoch   = 100
 max_moves_per_step = 10
 
-# Training loop
 for epoch in 1:epochs
-    for step in 1:steps_per_epoch
-        # Generate a safe random initial state
-        ρ0 = Float32[0.7, 0.1, 0.0, 0.0, 0.1, 0.0, 0.0, 0.1]
-        ρ_t = copy(ρ0)
+  for step in 1:steps_per_epoch
+    ρ0 = Float32[0.7, 0.1, 0.0, 0.0, 0.1, 0.0, 0.0, 0.1]
+    ρ_t = copy(ρ0)
+    oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
 
-        # Perform a simulation step
-        oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
-
-        # Compute gradients
-        grads = gradient(Flux.params(geo_brain_model)) do
-            ρ_pred = GNN_update_custom(ρ0, geo_brain_model, build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges))
-            loss_fn(ρ_pred, ρ_t)
-        end
-
-        # Update the model parameters
-        opt_state, model = Optimisers.update(opt_state, geo_brain_model, grads)
+    grads = gradient(ps) do
+      ρ_pred = GNN_update_custom(ρ0, geo_brain_model,
+                   build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges))
+      loss_fn(ρ_pred, ρ_t)
     end
-end
 
-# Train the model
-losses = train_model!(
-    geo_brain_model,
-    ρ0,
-    pf_states,
-    flat_pos,
-    edges;
-    epochs = 10,
-    steps_per_epoch = 100,
-    max_moves_per_step = 10,
-    learning_rate = 0.01f0
-)
+    update!(opt, ps, grads)
+  end
+
+  @info "Completed epoch $epoch"
+end
 
 # Save the trained model
 timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
-@save "trained_model_$timestamp.bson" model
+@save "trained_model_$timestamp.bson" geo_brain_model
