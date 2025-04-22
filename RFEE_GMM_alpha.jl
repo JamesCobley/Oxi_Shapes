@@ -155,9 +155,8 @@ edges = [
 
 # === Define the GNN model ===
 geo_brain_model = Chain(
-    Dense(1, 16, relu),     # Nonlinear transformation
-    Dense(16, 16, relu),    # Deeper feature extraction
-    Dense(16, 1)            # Output scalar per node
+    Dense(1, 32, relu),
+    Dense(32, 1)           
 )
 
 function GNN_update_custom(ρ_t::Vector{Float32}, model, geo::GeoGraphStruct)
