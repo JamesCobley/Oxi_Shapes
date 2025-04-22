@@ -347,7 +347,7 @@ for epoch in 1:epochs
   total_loss = 0.0f0
 
   for step in 1:steps_per_epoch
-    ρ0 = Float32[0.7, 0.1, 0.0, 0.0, 0.1, 0.0, 0.0, 0.1]
+    ρ0 = Float32[0.5, 0.1, 0.0, 0.0, 0.1, 0.0, 0.1, 0.2]
     ρ_t = copy(ρ0)
     oxi_shapes_alive!(ρ_t, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
 
@@ -363,6 +363,13 @@ for epoch in 1:epochs
   end
 
   println("Epoch $epoch — Loss: $(total_loss / steps_per_epoch)")
+end
+
+for (i, layer) in enumerate(geo_brain_model)
+    println("Layer $i weights:")
+    println(layer.weight)
+    println("Layer $i bias:")
+    println(layer.bias)
 end
 
 # Save the trained model
