@@ -11,9 +11,7 @@ using Statistics: mean
 using Random
 using UUIDs
 using Flux
-using Flux: Dense, relu
-using Flux.Losses: mse
-using Flux.Optimise: Adam, update!
+using Flux.Optimise: update!
 using BSON: @save
 using Dates
 using Zygote: @nograd
