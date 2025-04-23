@@ -262,6 +262,10 @@ end
 # ============================================================================
 # Define the IMAGINARY Model & Complex functions
 # ============================================================================
+# ============================================================================
+# Define the IMAGINARY Model & Differentiable Complex Flow
+# ============================================================================
+
 struct ComplexField
     real::Vector{Float32}
     imag::Vector{Float32}
@@ -275,35 +279,46 @@ function init_complex_field_from_graph(real::Vector{Float32}, geo::GeoGraphStruc
     return ComplexField(real, imag, memory)
 end
 
-function recall_weights(field::ComplexField, geo::GeoGraphStruct)
-    _, _, C_R_vals, _ = update_geometry_from_rho(field.real, geo)
+"Compute normalized recall weights from memory + curvature"
+function recall_weights(field::ComplexField, C_R_vals::Vector{Float32})
     W = field.memory .+ C_R_vals
     W = exp.(W .- maximum(W))
     return W ./ sum(W)
 end
 
-function dynamic_lambda(field::ComplexField; β=10.0f0)
-    divergence = norm(field.imag .- field.memory)
-    return 1.0f0 / (1.0f0 + exp(β * divergence))  # sigmoid(-β * divergence)
+"β is derived from curvature — no arbitrary constants"
+function beta_from_c_ricci(C_R_vals::Vector{Float32})
+    return mean(C_R_vals)  # or std(C_R_vals) for sharper slope
 end
 
-function updated_imaginary_field(field::ComplexField, geo::GeoGraphStruct; β=10.0f0)
-    λ = dynamic_lambda(field; β=β)
-    W = recall_weights(field, geo)
+"λ is a flow-dependent occupancy gate"
+function dynamic_lambda(field::ComplexField, C_R_vals::Vector{Float32})
+    β = beta_from_c_ricci(C_R_vals)
+    divergence = norm(field.imag .- field.memory)
+    return 1.0f0 / (1.0f0 + exp(β * divergence))
+end
+
+"Compute updated imaginary field (epistemic learning step)"
+function updated_imaginary_field(field::ComplexField, geo::GeoGraphStruct)
+    _, _, C_R_vals, _ = update_geometry_from_rho(field.real, geo)
+    λ = dynamic_lambda(field, C_R_vals)
+    W = recall_weights(field, C_R_vals)
     imag_new = (1 - λ) .* field.imag .+ λ .* W
     imag_new = max.(imag_new, 0.0f0)
     imag_new ./= sum(imag_new)
     return imag_new, λ
 end
 
+"Update memory as geometric trace of real field"
 function updated_memory_field(field::ComplexField)
     mem = (field.memory .+ field.real) ./ 2f0
     mem ./= sum(mem)
     return mem
 end
 
-function evolve_complex_field(field::ComplexField, geo::GeoGraphStruct; β=10.0f0)
-    imag_new, λ = updated_imaginary_field(field, geo; β=β)
+"Evolve the full complex field (real stays externally updated)"
+function evolve_complex_field(field::ComplexField, geo::GeoGraphStruct)
+    imag_new, λ = updated_imaginary_field(field, geo)
     mem_new = updated_memory_field(field)
     return ComplexField(field.real, imag_new, mem_new), λ
 end
