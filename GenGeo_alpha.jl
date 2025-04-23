@@ -14,7 +14,11 @@ using Flux
 using Flux.Optimise: update!
 using BSON: @save, @load
 using Dates
-using Zygote: @nograd, ignore
+
+# for AD
+using Zygote: @nograd, gradient
+import ChainRulesCore: rrule, NoTangent
+
 
 # ============================================================================
 # Define the REAL geometry 
@@ -246,8 +250,18 @@ function oxi_shapes_alive!(
     ρ .= inflow
 end
 
-# none of our geometry/sheaf building routines should be
-# autodiff’d by Zygote — they only depend on ρ, never on model parameters.
+function rrule(::typeof(oxi_shapes_alive!),
+               ρ::Vector{Float32}, pf_states, flat_pos, edges;
+               max_moves)
+  # Run the mutation once
+  oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=max_moves)
+  # Return “nothing” as the primal result, and a pullback that returns NoTangent:
+  function pullback(Δ)
+    return NoTangent(), NoTangent(), NoTangent(), NoTangent(), NoTangent(); max_moves=NoTangent()
+  end
+  return nothing, pullback
+end
+
 @nograd lift_to_z_plane
 @nograd compute_R
 @nograd compute_c_ricci_dirichlet
@@ -257,7 +271,8 @@ end
 @nograd sheaf_consistency
 @nograd build_GeoGraphStruct
 @nograd update_geometry_from_rho
-@nograd oxi_shapes_alive!
+@nograd oxi_shapes_alive!           # still fine to leave
+
 
 # ============================================================================
 # Define the IMAGINARY Model & Differentiable Complex Flow
@@ -508,23 +523,36 @@ end
     θ_flow::Vector{Float32}  # scalar weight for λ sensitivity
 end
 
-"Compute learned Dirichlet C_R without in-place mutation"
+"Build a map from state name → list of neighbor indices (purely allocates)"
+function build_neighbor_indices(
+    pf_states::Vector{String},
+    edges::Vector{Tuple{String,String}}
+)::Dict{String, Vector{Int}}
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    return Dict(
+        s => vcat(
+            [ idx[v] for (u, v) in edges if u == s ],
+            [ idx[u] for (u, v) in edges if v == s ]
+        )
+        for s in pf_states
+    )
+end
+
+"Compute learned Dirichlet C_R without any in-place mutation"
 function learned_c_ricci_dirichlet(
     R::Vector{Float32},
     pf_states::Vector{String},
     edges::Vector{Tuple{String,String}},
     θ_geo::Vector{Float32}
-)
-    # build index map once
-    idx = Dict(s => i for (i, s) in enumerate(pf_states))
-    # for each state i, sum contributions from its neighbors
+)::Vector{Float32}
+    # Precompute neighbor lists once, functionally
+    neighbor_indices = build_neighbor_indices(pf_states, edges)
+
+    # For each state i, sum over its neighbors
     return [
         sum(
-            θ_geo[i] * (R[i] - R[idx[n]])^2
-            for n in (
-                [v for (u,v) in edges if u==s] ∪
-                [u for (u,v) in edges if v==s]
-            )
+            θ_geo[i] * (R[i] - R[j])^2
+            for j in neighbor_indices[s]
         )
         for (i, s) in enumerate(pf_states)
     ]
@@ -656,93 +684,84 @@ function geo_flow_rollout_loss(
     config::GeoFlowConfig;
     T::Int = config.rollout_steps
 )
-    # helper to collect λ’s purely
-    function _rollout_collect(state::ComplexField, step_fn, n::Int)
-        n == 0 && return (state, Float32[])
-        new_state, λ = step_fn(state)
-        final_state, λs = _rollout_collect(new_state, step_fn, n-1)
-        return final_state, vcat(λ, λs)
+  # One step of the flow
+  function step(state::ComplexField)
+    # 1) Copy & evolve real (mutation lives in oxi_shapes_alive!, but
+    #    Zygote will use your rrule to skip its body)
+    real′ = copy(state.real)
+    oxi_shapes_alive!(
+      real′,
+      config.pf_states,
+      config.flat_pos,
+      config.edges;
+      max_moves = config.max_moves_per_step
+    )
+
+    # 2) Build geometry & compute learned C_R
+    geo = build_GeoGraphStruct(real′, config.pf_states, config.flat_pos, config.edges)
+    _, R_vals, _, _ = update_geometry_from_rho(real′, geo)
+    C_R_scaled = learned_c_ricci_dirichlet(
+      R_vals, config.pf_states, config.edges, model.θ_geo
+    )
+
+    # 3) Compute λ
+    λ = learned_lambda(state, model.θ_flow)
+
+    # 4) Update imag purely
+    rawW    = exp.(state.memory .+ C_R_scaled .- maximum(state.memory .+ C_R_scaled))
+    W       = rawW ./ sum(rawW)
+    rawImag = (1f0 - λ) .* state.imag .+ λ .* W
+    imag′   = max.(rawImag, 0.0f0) ./ sum(max.(rawImag, 0.0f0))
+
+    # 5) Update memory purely
+    tmpMem  = (state.memory .+ real′) ./ 2f0
+    memory′ = tmpMem ./ sum(tmpMem)
+
+    return ComplexField(real′, imag′, memory′), λ
+  end
+
+  # Recursively collect λ’s without any mutation
+  function _rollout_collect(state::ComplexField, f::Function, n::Int)
+    if n == 0
+      return state, Float32[]
+    else
+      new_state, λ = f(state)
+      final_state, λs = _rollout_collect(new_state, f, n-1)
+      return final_state, vcat(λ, λs)
     end
+  end
 
-    # pure step (no .=, no push!)
-    function step(state::ComplexField)
-        # 1) copy the real vector
-        real′ = copy(state.real)
-
-        # 2) evolve it *without* tracing the mutation
-        ignore(oxi_shapes_alive!)(real′,
-            config.pf_states,
-            config.flat_pos,
-            config.edges;
-            max_moves = config.max_moves_per_step
-        )
-
-        # 3) build geometry & curvature
-        geo = build_GeoGraphStruct(real′, config.pf_states, config.flat_pos, config.edges)
-        _, R_vals, _, _ = update_geometry_from_rho(real′, geo)
-        C_R_scaled = learned_c_ricci_dirichlet(R_vals,
-                         config.pf_states, config.edges, model.θ_geo)
-
-        # 4) compute λ
-        λ = learned_lambda(state, model.θ_flow)
-
-        # 5) update imag purely
-        rawW    = exp.(state.memory .+ C_R_scaled .- maximum(state.memory .+ C_R_scaled))
-        W       = rawW ./ sum(rawW)
-        rawImag = (1f0 - λ) .* state.imag .+ λ .* W
-        imag′   = max.(rawImag, 0.0f0) ./ sum(max.(rawImag, 0.0f0))
-
-        # 6) update memory purely
-        tmpMem  = (state.memory .+ real′) ./ 2f0
-        memory′ = tmpMem ./ sum(tmpMem)
-
-        return ComplexField(real′, imag′, memory′), λ
-    end
-
-    # initialize and roll out
-    φ = ComplexField(real=ρ0, imag=zeros(Float32,length(ρ0)), memory=copy(ρ0))
-    _, λs = _rollout_collect(φ, step, T)
-    return mean(λs)
+  # Initialize and run
+  φ = ComplexField(real=ρ0, imag=zeros(Float32, length(ρ0)), memory=copy(ρ0))
+  _, λs = _rollout_collect(φ, step, T)
+  return mean(λs)
 end
 
 function train_geo_flow_model(config::GeoFlowConfig)
-    training_trace = GeoFlowTrack[]
-    model = GenGeoAlpha(
-        θ_geo = ones(Float32, length(config.pf_states)),
-        θ_flow = [1.0f0]
-    )
-    ps = Flux.params(model)
-    λ_epoch_history = Float32[]
+    training_trace   = GeoFlowTrack[]
+    λ_epoch_history  = Float32[]
 
     for epoch in 1:config.epochs
         λ_vals = Float32[]
-
         for _ in 1:config.batch_size
             sample = config.initials[rand(1:end)]
-            ρ0 = sample.rho
+            ρ0     = sample.rho
 
-            function compute_lambda()
-                return geo_flow_rollout_loss(ρ0, model, config; T=config.rollout_steps)
-            end
+            # Compute physics‐based λ without any AD
+            λ_val = geo_flow_rollout_loss(ρ0, model, config; T=config.rollout_steps)
 
-            grads = gradient(compute_lambda, ps)
-            update!(ps, grads)
-
-            λ_val = compute_lambda()
             push!(λ_vals, λ_val)
-
             push!(training_trace, GeoFlowTrack(
-                epoch = epoch,
-                λ = λ_val,
-                θ_geo = deepcopy(model.θ_geo),
-                θ_flow = deepcopy(model.θ_flow),
+                epoch     = epoch,
+                λ         = λ_val,
+                θ_geo     = deepcopy(model.θ_geo),
+                θ_flow    = deepcopy(model.θ_flow),
                 init_uuid = sample.uuid
             ))
         end
 
         mean_λ = mean(λ_vals)
         push!(λ_epoch_history, mean_λ)
-
         println("Epoch $epoch | λ (mean) = $(round(mean_λ, digits=6))")
     end
 
