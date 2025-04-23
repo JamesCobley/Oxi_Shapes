@@ -246,6 +246,19 @@ function oxi_shapes_alive!(
     ρ .= inflow
 end
 
+# none of our geometry/sheaf building routines should be
+# autodiff’d by Zygote — they only depend on ρ, never on model parameters.
+@nograd lift_to_z_plane
+@nograd compute_R
+@nograd compute_c_ricci_dirichlet
+@nograd build_neighbor_indices
+@nograd compute_anisotropy_pure
+@nograd initialize_sheaf_stalks
+@nograd sheaf_consistency
+@nograd build_GeoGraphStruct
+@nograd update_geometry_from_rho
+@nograd oxi_shapes_alive!
+
 # ============================================================================
 # Define the IMAGINARY Model & Complex functions
 # ============================================================================
