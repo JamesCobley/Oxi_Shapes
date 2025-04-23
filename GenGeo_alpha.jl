@@ -247,12 +247,7 @@ function oxi_shapes_alive!(
 end
 
 # ============================================================================
-# Define the "Flow" Path recorder functions and logging
-# ============================================================================
-
-
-# ============================================================================
-# Define the Model 
+# Define the IMAGINARY Model & Complex functions
 # ============================================================================
 struct ComplexField
     real::Vector{Float32} # the real alive-dependent evolution of the graph
@@ -287,3 +282,7 @@ function update_imaginary_field_epistemic!(field::ComplexField, geo::GeoGraphStr
     field.imag ./= sum(field.imag)
     return λ  # return for logging
 end
+
+# ============================================================================
+# Define the "Flow" Path recorder functions and logging
+# ============================================================================
