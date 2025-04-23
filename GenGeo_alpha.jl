@@ -14,7 +14,7 @@ using Flux
 using Flux.Optimise: update!
 using BSON: @save, @load
 using Dates
-using Zygote: @nograd
+using Zygote: @nograd, ignore
 
 # ============================================================================
 # Define the REAL geometry 
@@ -634,51 +634,74 @@ end
     θ_flow::Vector{Float32}
 end
 
+# helper: roll out T steps, returning (final_state, λs_vector)
+function _rollout_collect(
+    state::ComplexField,
+    step_fn::Function,
+    T::Int
+)::Tuple{ComplexField, Vector{Float32}}
+    if T == 0
+        return state, Float32[]           # empty λ list
+    else
+        new_state, λ = step_fn(state)
+        final_state, λs_tail = _rollout_collect(new_state, step_fn, T-1)
+        # vcat builds a fresh array [λ; λs_tail]
+        return final_state, vcat(λ, λs_tail)
+    end
+end
+
 function geo_flow_rollout_loss(
     ρ0::Vector{Float32},
     model::GenGeoAlpha,
     config::GeoFlowConfig;
     T::Int = config.rollout_steps
 )
-    # one step of the learned flow, purely functional
+    # helper to collect λ’s purely
+    function _rollout_collect(state::ComplexField, step_fn, n::Int)
+        n == 0 && return (state, Float32[])
+        new_state, λ = step_fn(state)
+        final_state, λs = _rollout_collect(new_state, step_fn, n-1)
+        return final_state, vcat(λ, λs)
+    end
+
+    # pure step (no .=, no push!)
     function step(state::ComplexField)
-        # 1) evolve the real field in place-free style
+        # 1) copy the real vector
         real′ = copy(state.real)
-        oxi_shapes_alive!(real′, config.pf_states, config.flat_pos, config.edges;
-                          max_moves = config.max_moves_per_step)
 
-        # 2) compute learned curvature C_R
-        geo   = build_GeoGraphStruct(real′, config.pf_states, config.flat_pos, config.edges)
-        _, R_vals, _, _ = update_geometry_from_rho(real′, config.pf_states, config.flat_pos, config.edges)
-        C_R_scaled = learned_c_ricci_dirichlet(R_vals, config.pf_states, config.edges, model.θ_geo)
+        # 2) evolve it *without* tracing the mutation
+        ignore(oxi_shapes_alive!)(real′,
+            config.pf_states,
+            config.flat_pos,
+            config.edges;
+            max_moves = config.max_moves_per_step
+        )
 
-        # 3) compute λ from the old state
+        # 3) build geometry & curvature
+        geo = build_GeoGraphStruct(real′, config.pf_states, config.flat_pos, config.edges)
+        _, R_vals, _, _ = update_geometry_from_rho(real′, geo)
+        C_R_scaled = learned_c_ricci_dirichlet(R_vals,
+                         config.pf_states, config.edges, model.θ_geo)
+
+        # 4) compute λ
         λ = learned_lambda(state, model.θ_flow)
 
-        # 4) build new imag field without any .= or ./=
-        rawW      = exp.(state.memory .+ C_R_scaled .- maximum(state.memory .+ C_R_scaled))
-        W         = rawW ./ sum(rawW)
-        rawImag   = (1f0 - λ) .* state.imag .+ λ .* W
-        clamped   = max.(rawImag, 0.0f0)
-        imag′     = clamped ./ sum(clamped)
+        # 5) update imag purely
+        rawW    = exp.(state.memory .+ C_R_scaled .- maximum(state.memory .+ C_R_scaled))
+        W       = rawW ./ sum(rawW)
+        rawImag = (1f0 - λ) .* state.imag .+ λ .* W
+        imag′   = max.(rawImag, 0.0f0) ./ sum(max.(rawImag, 0.0f0))
 
-        # 5) build new memory without mutation
-        tmpMem    = (state.memory .+ real′) ./ 2f0
-        memory′   = tmpMem ./ sum(tmpMem)
+        # 6) update memory purely
+        tmpMem  = (state.memory .+ real′) ./ 2f0
+        memory′ = tmpMem ./ sum(tmpMem)
 
         return ComplexField(real′, imag′, memory′), λ
     end
 
-    # initialize the complex field
-    φ = ComplexField(real=ρ0, imag=zeros(Float32, length(ρ0)), memory=copy(ρ0))
-
-    # run T steps, collecting λ
-    λs = Float32[]
-    for _ in 1:T
-        φ, λ = step(φ)
-        push!(λs, λ)
-    end
-
+    # initialize and roll out
+    φ = ComplexField(real=ρ0, imag=zeros(Float32,length(ρ0)), memory=copy(ρ0))
+    _, λs = _rollout_collect(φ, step, T)
     return mean(λs)
 end
 
