@@ -12,7 +12,7 @@ using Random
 using UUIDs
 using Flux
 using Flux.Optimise: update!
-using BSON: @save
+using BSON: @save, @load
 using Dates
 using Zygote: @nograd
 
@@ -260,9 +260,6 @@ end
 @nograd oxi_shapes_alive!
 
 # ============================================================================
-# Define the IMAGINARY Model & Complex functions
-# ============================================================================
-# ============================================================================
 # Define the IMAGINARY Model & Differentiable Complex Flow
 # ============================================================================
 
@@ -412,8 +409,6 @@ end
     on_geodesic::Bool
 end
 
-trace = PathTrace(i_state=ρ, transition_class=:oxidizing)
-
 function record_path_trajectory_struct!(
     ρ0::Vector{Float32}, T::Int, pf_states, flat_pos, edges;
     max_moves_per_step=10, run_id::String="default_run"
@@ -497,12 +492,12 @@ function save_path_metadata(global_metadata::Dict{String, Any}; prefix="path_run
     timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
     run_id = get(global_metadata, "run_id", "run")
     filename = "$(prefix)_$(run_id)_$(timestamp).bson"
-    BSON.@save filename global_metadata
+    @save filename global_metadata
     println("🧠 Metadata saved to: $filename")
 end
 
 # ============================================================================
-# Random Initial Generator with UUIDs
+# Rollout
 # ============================================================================
 
 @kwdef mutable struct GenGeoAlpha
@@ -574,34 +569,19 @@ function generate_safe_random_initials(n::Int; min_val=0.0f0)
     return batch_id, samples
 end
 
-batch_id, initials = generate_safe_random_initials(100)
-
 # ============================================================================
-# λ-Based Dynamic Loss Function
-# ============================================================================
-
-function geo_flow_divergence_loss(ρ0, model::GenGeoAlpha, pf_states, flat_pos, edges)
-    geo = build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges)
-    geo.C_R_vals .= geo.C_R_vals .* model.θ_geo
-
-    φ = ComplexField(real=ρ0, imag=zeros(Float32, length(ρ0)), memory=copy(ρ0))
-    λ = dynamic_lambda(φ; β=model.θ_flow[1])  # Loss = epistemic flow divergence
-
-    return λ
-end
-
-# ============================================================================
-# Training Loop
+# λ-Based Dynamic Loss Function with Multi-Step Rollout
 # ============================================================================
 
 @kwdef struct GeoFlowConfig
     pf_states::Vector{String}
     flat_pos::Dict{String, Tuple{Float64, Float64}}
     edges::Vector{Tuple{String, String}}
-    initials::Vector{Vector{Float32}}
+    initials::Vector{NamedTuple{(:uuid, :rho), Tuple{UUID, Vector{Float32}}}}  # 👈 Important
     epochs::Int = 100
     batch_size::Int = 10
     max_moves_per_step::Int = 10
+    rollout_steps::Int = 5
     model_id::String = "geo_flow"
 end
 
@@ -610,6 +590,33 @@ end
     λ::Float32
     θ_geo::Vector{Float32}
     θ_flow::Vector{Float32}
+    init_uuid::UUID
+end
+
+@kwdef mutable struct GenGeoAlpha
+    θ_geo::Vector{Float32}
+    θ_flow::Vector{Float32}
+end
+
+function geo_flow_rollout_loss(ρ0, model::GenGeoAlpha, config::GeoFlowConfig; T::Int = 5)
+    φ = ComplexField(real = ρ0, imag = zeros(Float32, length(ρ0)), memory = copy(ρ0))
+    λ_vals = Float32[]
+
+    for _ in 1:T
+        oxi_shapes_alive!(φ.real, config.pf_states, config.flat_pos, config.edges;
+                          max_moves = config.max_moves_per_step)
+
+        geo = build_GeoGraphStruct(φ.real, config.pf_states, config.flat_pos, config.edges)
+        geo.C_R_vals .= geo.C_R_vals .* model.θ_geo
+
+        φ.imag, λ = updated_imag_field(geo, φ, model.θ_flow)
+        φ.memory = (φ.memory .+ φ.real) ./ 2f0
+        φ.memory ./= sum(φ.memory)
+
+        push!(λ_vals, λ)
+    end
+
+    return mean(λ_vals)
 end
 
 function train_geo_flow_model(config::GeoFlowConfig)
@@ -625,26 +632,30 @@ function train_geo_flow_model(config::GeoFlowConfig)
         λ_vals = Float32[]
 
         for _ in 1:config.batch_size
-            ρ0 = config.initials[rand(1:end)]
-            λ_val, back = Flux.withgradient(() ->
-                geo_flow_divergence_loss(ρ0, model, config.pf_states, config.flat_pos, config.edges), ps)
+            sample = config.initials[rand(1:end)]
+            ρ0 = sample.rho
 
-            for p in ps
-                p .-= back[p]
+            function compute_lambda()
+                return geo_flow_rollout_loss(ρ0, model, config; T=config.rollout_steps)
             end
 
+            grads = gradient(compute_lambda, ps)
+            update!(ps, grads)
+
+            λ_val = compute_lambda()
             push!(λ_vals, λ_val)
+
+            push!(training_trace, GeoFlowTrack(
+                epoch = epoch,
+                λ = λ_val,
+                θ_geo = deepcopy(model.θ_geo),
+                θ_flow = deepcopy(model.θ_flow),
+                init_uuid = sample.uuid
+            ))
         end
 
         mean_λ = mean(λ_vals)
         push!(λ_epoch_history, mean_λ)
-
-        push!(training_trace, GeoFlowTrack(
-            epoch = epoch,
-            λ = mean_λ,
-            θ_geo = deepcopy(model.θ_geo),
-            θ_flow = deepcopy(model.θ_flow)
-        ))
 
         println("Epoch $epoch | λ (mean) = $(round(mean_λ, digits=6))")
     end
@@ -652,9 +663,34 @@ function train_geo_flow_model(config::GeoFlowConfig)
     return model, training_trace, λ_epoch_history
 end
 
-# ============================================================================
-# Save Trained GeoFlow Model
-# ============================================================================
-model, trace = train_geo_flow_model(config)
-timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
-@save "trained_$(config.model_id)_$timestamp.bson" model trace config
+function save_path_metadata(global_metadata::Dict{String, Any}; prefix="path_run")
+    timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
+    run_id = get(global_metadata, "run_id", "run")
+    filename = "$(prefix)_$(run_id)_$(timestamp).bson"
+    @save filename global_metadata
+    println("🧠 Metadata saved to: $filename")
+end
+
+batch_id, samples = generate_safe_random_initials(10)
+
+config = GeoFlowConfig(
+    pf_states = pf_states,
+    flat_pos = flat_pos,
+    edges = edges,
+    initials = samples,         # 👈 Don't filter out .rho here!
+    epochs = 100,
+    batch_size = 10,
+    rollout_steps = 5,
+    model_id = batch_id
+)
+
+model, training_trace, λ_epoch_history = train_geo_flow_model(config)
+
+global_metadata = Dict(
+    "run_id" => config.model_id,
+    "config" => config,
+    "training_trace" => training_trace,
+    "λ_epoch_history" => λ_epoch_history
+)
+
+save_path_metadata(global_metadata; prefix="geo_flow")
