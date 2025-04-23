@@ -17,7 +17,7 @@ using Dates
 using Zygote: @nograd
 
 # ============================================================================
-# Part A: Define the Geometry (with Float32)
+# Define the Geometry 
 # ============================================================================
 
 function lift_to_z_plane(rho::Vector{Float32}, pf_states, flat_pos)
@@ -153,3 +153,39 @@ edges = [
     ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
 ]
 
+# ============================================================================
+# Define the Model 
+# ============================================================================
+struct ComplexField
+    real::Vector{Float32} # the real alive-dependent evolution of the graph
+    imag::Vector{Float32} # the imagined, predicted, evoltion of the graph 
+    memory::Vector{Float32}  # interpreted as synaptic strength / recall weight
+end
+
+function init_complex_field_from_graph(real::Vector{Float32}, geo::GeoGraphStruct)
+    degree_vec = vec(sum(geo.adjacency, dims=2))
+    memory = degree_vec ./ sum(degree_vec)
+    imag = zeros(Float32, length(real))
+    return ComplexField(real, imag, memory)
+end
+
+function recall_weights(field::ComplexField, geo::GeoGraphStruct)
+    _, _, C_R_vals, _ = update_geometry_from_rho(field.real, geo)
+    W = field.memory .+ C_R_vals
+    W = exp.(W .- maximum(W))
+    return W ./ sum(W)
+end
+
+function dynamic_lambda(field::ComplexField; β=10.0f0)
+    divergence = norm(field.imag .- field.memory)
+    return 1.0f0 / (1.0f0 + exp(β * divergence))  # sigmoid(-β * divergence)
+end
+
+function update_imaginary_field_epistemic!(field::ComplexField, geo::GeoGraphStruct; β=10.0f0)
+    λ = dynamic_lambda(field; β=β)
+    W = recall_weights(field, geo)
+    field.imag .= (1 - λ) .* field.imag .+ λ .* W
+    field.imag .= max.(field.imag, 0.0f0)
+    field.imag ./= sum(field.imag)
+    return λ  # return for logging
+end
