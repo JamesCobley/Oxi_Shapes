@@ -600,18 +600,17 @@ end
     edges::Vector{Tuple{String, String}}
     initials::Vector{Vector{Float32}}
     epochs::Int = 100
+    batch_size::Int = 10
     max_moves_per_step::Int = 10
     model_id::String = "geo_flow"
 end
 
-config = GeoFlowConfig(
-    pf_states = pf_states,
-    flat_pos = flat_pos,
-    edges = edges,
-    initials = initials,
-    epochs = 100,
-    model_id = "test_0423"
-)
+@kwdef mutable struct GeoFlowTrack
+    epoch::Int
+    λ::Float32
+    θ_geo::Vector{Float32}
+    θ_flow::Vector{Float32}
+end
 
 function train_geo_flow_model(config::GeoFlowConfig)
     training_trace = GeoFlowTrack[]
@@ -620,34 +619,42 @@ function train_geo_flow_model(config::GeoFlowConfig)
         θ_flow = [1.0f0]
     )
     ps = Flux.params(model)
+    λ_epoch_history = Float32[]
 
     for epoch in 1:config.epochs
-        ρ0 = config.initials[rand(1:end)]
-        λ_val, back = Flux.withgradient(() ->
-            geo_flow_divergence_loss(ρ0, model, config.pf_states, config.flat_pos, config.edges), ps)
+        λ_vals = Float32[]
 
-        for p in ps
-            p .-= back[p]
+        for _ in 1:config.batch_size
+            ρ0 = config.initials[rand(1:end)]
+            λ_val, back = Flux.withgradient(() ->
+                geo_flow_divergence_loss(ρ0, model, config.pf_states, config.flat_pos, config.edges), ps)
+
+            for p in ps
+                p .-= back[p]
+            end
+
+            push!(λ_vals, λ_val)
         end
+
+        mean_λ = mean(λ_vals)
+        push!(λ_epoch_history, mean_λ)
 
         push!(training_trace, GeoFlowTrack(
             epoch = epoch,
-            λ = λ_val,
+            λ = mean_λ,
             θ_geo = deepcopy(model.θ_geo),
             θ_flow = deepcopy(model.θ_flow)
         ))
 
-        println("Epoch $epoch | λ = $(round(λ_val, digits=6))")
+        println("Epoch $epoch | λ (mean) = $(round(mean_λ, digits=6))")
     end
 
-    return model, training_trace
+    return model, training_trace, λ_epoch_history
 end
 
 # ============================================================================
 # Save Trained GeoFlow Model
 # ============================================================================
 model, trace = train_geo_flow_model(config)
-
 timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
 @save "trained_$(config.model_id)_$timestamp.bson" model trace confi
-
