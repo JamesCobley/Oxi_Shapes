@@ -285,7 +285,7 @@ end
 
 "β is derived from curvature — no arbitrary constants"
 function beta_from_c_ricci(C_R_vals::Vector{Float32})
-    return mean(C_R_vals)  # or std(C_R_vals) for sharper slope
+    return mean(C_R_vals)
 end
 
 "λ is a flow-dependent occupancy gate"
@@ -300,23 +300,26 @@ function updated_imaginary_field(field::ComplexField, geo::GeoGraphStruct)
     _, _, C_R_vals, _ = update_geometry_from_rho(field.real, geo)
     λ = dynamic_lambda(field, C_R_vals)
     W = recall_weights(field, C_R_vals)
-    imag_new = (1 - λ) .* field.imag .+ λ .* W
-    imag_new = max.(imag_new, 0.0f0)
-    imag_new ./= sum(imag_new)
+
+    # no in-place mutation: build, clamp, and normalize in pure expressions
+    raw     = (1f0 - λ) .* field.imag .+ λ .* W
+    clamped = max.(raw,  0.0f0)
+    imag_new = clamped ./ sum(clamped)
+
     return imag_new, λ
 end
 
 "Update memory as geometric trace of real field"
 function updated_memory_field(field::ComplexField)
-    mem = (field.memory .+ field.real) ./ 2f0
-    mem ./= sum(mem)
+    tmp = (field.memory .+ field.real) ./ 2f0
+    mem = tmp ./ sum(tmp)
     return mem
 end
 
 "Evolve the full complex field (real stays externally updated)"
 function evolve_complex_field(field::ComplexField, geo::GeoGraphStruct)
-    imag_new, λ = updated_imaginary_field(field, geo)
-    mem_new = updated_memory_field(field)
+    imag_new, λ  = updated_imaginary_field(field, geo)
+    mem_new      = updated_memory_field(field)
     return ComplexField(field.real, imag_new, mem_new), λ
 end
 
@@ -497,7 +500,7 @@ function save_path_metadata(global_metadata::Dict{String, Any}; prefix="path_run
 end
 
 # ============================================================================
-# Rollout
+# Rollout (non-mutating)
 # ============================================================================
 
 @kwdef mutable struct GenGeoAlpha
@@ -505,46 +508,79 @@ end
     θ_flow::Vector{Float32}  # scalar weight for λ sensitivity
 end
 
-function learned_c_ricci_dirichlet(R::Vector{Float32}, pf_states, edges, θ_geo::Vector{Float32})
+"Compute learned Dirichlet C_R without in-place mutation"
+function learned_c_ricci_dirichlet(
+    R::Vector{Float32},
+    pf_states::Vector{String},
+    edges::Vector{Tuple{String,String}},
+    θ_geo::Vector{Float32}
+)
+    # build index map once
     idx = Dict(s => i for (i, s) in enumerate(pf_states))
-    C_R = zeros(Float32, length(pf_states))
-    for (i, s) in enumerate(pf_states)
-        neighbors = [v for (u, v) in edges if u == s] ∪ [u for (u, v) in edges if v == s]
-        for n in neighbors
-            j = idx[n]
-            C_R[i] += θ_geo[i] * (R[i] - R[j])^2
-        end
-    end
-    return C_R
+    # for each state i, sum contributions from its neighbors
+    return [
+        sum(
+            θ_geo[i] * (R[i] - R[idx[n]])^2
+            for n in (
+                [v for (u,v) in edges if u==s] ∪
+                [u for (u,v) in edges if v==s]
+            )
+        )
+        for (i, s) in enumerate(pf_states)
+    ]
 end
 
+"λ derived from divergence of imag vs memory"
 function learned_lambda(field::ComplexField, θ_flow::Vector{Float32})
     divergence = norm(field.imag .- field.memory)
     β = θ_flow[1]
     return 1.0f0 / (1.0f0 + exp(β * divergence))
 end
 
-function updated_imag_field(geo::GeoGraphStruct, field::ComplexField, θ_flow)
+"Update imaginary field purely functionally"
+function updated_imag_field(
+    geo::GeoGraphStruct,
+    field::ComplexField,
+    θ_flow::Vector{Float32}
+)
     λ = learned_lambda(field, θ_flow)
+
+    # compute curvature
     _, _, C_R_vals, _ = update_geometry_from_rho(field.real, geo)
-    W = exp.(field.memory .+ C_R_vals .- maximum(field.memory .+ C_R_vals))
-    W ./= sum(W)
-    imag = (1 - λ) .* field.imag .+ λ .* W
-    imag .= max.(imag, 0.0f0)
-    imag ./= sum(imag)
-    return imag, λ
+
+    # functional softmax-style weights
+    rawW = exp.(field.memory .+ C_R_vals .- maximum(field.memory .+ C_R_vals))
+    W    = rawW ./ sum(rawW)
+
+    # blend old imag with W, then clamp & normalize
+    rawImag = (1f0 - λ) .* field.imag .+ λ .* W
+    clamped = max.(rawImag, 0.0f0)
+    imag_new = clamped ./ sum(clamped)
+
+    return imag_new, λ
 end
 
-function evolve_step_loss(ρ0::Vector{Float32}, model::GenGeoAlpha, pf_states, flat_pos, edges)
-    geo = build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges)
-    points3D, R_vals, _, _ = update_geometry_from_rho(ρ0, geo)
-    C_R = learned_c_ricci_dirichlet(R_vals, pf_states, edges, model.θ_geo)
+"One-step loss for evolving the complex field"
+function evolve_step_loss(
+    ρ0::Vector{Float32},
+    model::GenGeoAlpha,
+    pf_states,
+    flat_pos,
+    edges
+)
+    # build geometry & curvature
+    geo          = build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges)
+    _, R_vals, _, _ = update_geometry_from_rho(ρ0, geo)
+    C_R          = learned_c_ricci_dirichlet(R_vals, pf_states, edges, model.θ_geo)
 
+    # init complex field (pure, no mutation here)
     φ = ComplexField(real=ρ0, imag=zeros(Float32, length(ρ0)), memory=copy(ρ0))
-    φ.imag, λ = updated_imag_field(geo, φ, model.θ_flow)
 
-    loss = sum(C_R) + λ * shannon_entropy(φ.imag)
-    return loss
+    # update its imag part
+    φ_imag_new, λ = updated_imag_field(geo, φ, model.θ_flow)
+
+    # compute loss
+    return sum(C_R) + λ * shannon_entropy(φ_imag_new)
 end
 
 # ============================================================================
@@ -598,28 +634,52 @@ end
     θ_flow::Vector{Float32}
 end
 
-function geo_flow_rollout_loss(ρ0, model::GenGeoAlpha, config::GeoFlowConfig; T::Int = 5)
+function geo_flow_rollout_loss(
+    ρ0::Vector{Float32},
+    model::GenGeoAlpha,
+    config::GeoFlowConfig;
+    T::Int = config.rollout_steps
+)
+    # one step of the learned flow, purely functional
     function step(state::ComplexField)
-        oxi_shapes_alive!(state.real, config.pf_states, config.flat_pos, config.edges;
+        # 1) evolve the real field in place-free style
+        real′ = copy(state.real)
+        oxi_shapes_alive!(real′, config.pf_states, config.flat_pos, config.edges;
                           max_moves = config.max_moves_per_step)
 
-        geo = build_GeoGraphStruct(state.real, config.pf_states, config.flat_pos, config.edges)
-        geo.C_R_vals .= geo.C_R_vals .* model.θ_geo
+        # 2) compute learned curvature C_R
+        geo   = build_GeoGraphStruct(real′, config.pf_states, config.flat_pos, config.edges)
+        _, R_vals, _, _ = update_geometry_from_rho(real′, config.pf_states, config.flat_pos, config.edges)
+        C_R_scaled = learned_c_ricci_dirichlet(R_vals, config.pf_states, config.edges, model.θ_geo)
 
-        imag_new, λ = updated_imag_field(geo, state, model.θ_flow)
-        memory_new = (state.memory .+ state.real) ./ 2f0
-        memory_new ./= sum(memory_new)
+        # 3) compute λ from the old state
+        λ = learned_lambda(state, model.θ_flow)
 
-        return ComplexField(state.real, imag_new, memory_new), λ
+        # 4) build new imag field without any .= or ./=
+        rawW      = exp.(state.memory .+ C_R_scaled .- maximum(state.memory .+ C_R_scaled))
+        W         = rawW ./ sum(rawW)
+        rawImag   = (1f0 - λ) .* state.imag .+ λ .* W
+        clamped   = max.(rawImag, 0.0f0)
+        imag′     = clamped ./ sum(clamped)
+
+        # 5) build new memory without mutation
+        tmpMem    = (state.memory .+ real′) ./ 2f0
+        memory′   = tmpMem ./ sum(tmpMem)
+
+        return ComplexField(real′, imag′, memory′), λ
     end
 
+    # initialize the complex field
     φ = ComplexField(real=ρ0, imag=zeros(Float32, length(ρ0)), memory=copy(ρ0))
-    λ_vals = map(1:T) do _
+
+    # run T steps, collecting λ
+    λs = Float32[]
+    for _ in 1:T
         φ, λ = step(φ)
-        return λ
+        push!(λs, λ)
     end
 
-    return mean(λ_vals)
+    return mean(λs)
 end
 
 function train_geo_flow_model(config::GeoFlowConfig)
