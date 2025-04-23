@@ -263,7 +263,7 @@ end
 # Define the IMAGINARY Model & Differentiable Complex Flow
 # ============================================================================
 
-struct ComplexField
+@kwdef mutable struct ComplexField
     real::Vector{Float32}
     imag::Vector{Float32}
     memory::Vector{Float32}
@@ -599,21 +599,24 @@ end
 end
 
 function geo_flow_rollout_loss(ρ0, model::GenGeoAlpha, config::GeoFlowConfig; T::Int = 5)
-    φ = ComplexField(real = ρ0, imag = zeros(Float32, length(ρ0)), memory = copy(ρ0))
-    λ_vals = Float32[]
-
-    for _ in 1:T
-        oxi_shapes_alive!(φ.real, config.pf_states, config.flat_pos, config.edges;
+    function step(state::ComplexField)
+        oxi_shapes_alive!(state.real, config.pf_states, config.flat_pos, config.edges;
                           max_moves = config.max_moves_per_step)
 
-        geo = build_GeoGraphStruct(φ.real, config.pf_states, config.flat_pos, config.edges)
+        geo = build_GeoGraphStruct(state.real, config.pf_states, config.flat_pos, config.edges)
         geo.C_R_vals .= geo.C_R_vals .* model.θ_geo
 
-        φ.imag, λ = updated_imag_field(geo, φ, model.θ_flow)
-        φ.memory = (φ.memory .+ φ.real) ./ 2f0
-        φ.memory ./= sum(φ.memory)
+        imag_new, λ = updated_imag_field(geo, state, model.θ_flow)
+        memory_new = (state.memory .+ state.real) ./ 2f0
+        memory_new ./= sum(memory_new)
 
-        push!(λ_vals, λ)
+        return ComplexField(state.real, imag_new, memory_new), λ
+    end
+
+    φ = ComplexField(real=ρ0, imag=zeros(Float32, length(ρ0)), memory=copy(ρ0))
+    λ_vals = map(1:T) do _
+        φ, λ = step(φ)
+        return λ
     end
 
     return mean(λ_vals)
