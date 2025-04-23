@@ -1,6 +1,7 @@
 # ============================================================================
-# 1. Load packages
+# Load the packages
 # ============================================================================
+
 using LinearAlgebra
 using SparseArrays
 using GeometryBasics
@@ -8,6 +9,7 @@ using Graphs
 using StatsBase
 using Statistics: mean
 using Random
+using UUIDs
 using Flux
 using Flux: Dense, relu
 using Flux.Losses: mse
@@ -324,5 +326,205 @@ function evolve_complex_field(field::ComplexField, geo::GeoGraphStruct)
 end
 
 # ============================================================================
-# Define the "Flow" Path recorder functions and logging
+# Define the "Flow" Path Trace Module
 # ============================================================================
+
+# Define geodesics for classification
+geodesics = [
+    ["000", "100", "101", "111"],
+    ["000", "100", "110", "111"],
+    ["000", "010", "110", "111"],
+    ["000", "010", "011", "111"],
+    ["000", "001", "101", "111"],
+    ["000", "001", "011", "111"]
+]
+
+# --- Geodesic classifier
+function dominant_geodesic(trajectory::Vector{String}, geodesics::Vector{Vector{String}})
+    best_path, max_score = nothing, 0
+    for path in geodesics
+        score = count(s -> s in trajectory, path)
+        if score > max_score
+            max_score = score
+            best_path = path
+        end
+    end
+    return best_path
+end
+
+function compute_k_distribution(ρ::Vector{Float32}, pf_states::Vector{String})
+    k_counts = Dict{Int, Float32}()
+    for (i, s) in enumerate(pf_states)
+        k = count(==('1'), s)
+        k_counts[k] = get(k_counts, k, 0.0f0) + ρ[i]
+    end
+    return k_counts
+end
+
+function weighted_mean_oxidation(k_dist::Dict{Int, Float32})
+    return sum(Float32(k) * v for (k, v) in k_dist)
+end
+
+function shannon_entropy(p::Vector{Float32})
+    p_nonzero = filter(x -> x > 0f0, p)
+    return -sum(x -> x * log2(x), p_nonzero)
+end
+
+function fisher_information(ρ::Vector{Float32})
+    grad = diff(ρ)
+    return sum(grad .^ 2)
+end
+
+function lyapunov_exponent(series::Vector{Vector{Float32}})
+    exponents = Float32[]
+    for t in 2:length(series)
+        norm_prev = norm(series[t-1])
+        norm_diff = norm(series[t] .- series[t-1])
+        if norm_prev > 0f0 && norm_diff > 0f0
+            push!(exponents, log(norm_diff / norm_prev))
+        end
+    end
+    return isempty(exponents) ? 0f0 : mean(exponents)
+end
+
+function classify_transition(prev::Vector{Float32}, curr::Vector{Float32})
+    k_prev = sum(Float32(count(==('1'), pf_states[i])) * prev[i] for i in 1:length(prev)) / 3f0
+    k_curr = sum(Float32(count(==('1'), pf_states[i])) * curr[i] for i in 1:length(curr)) / 3f0
+
+    if k_curr > k_prev + 1f-4
+        return :oxidizing
+    elseif k_curr < k_prev - 1f-4
+        return :reducing
+    else
+        return :neutral
+    end
+end
+
+@kwdef struct PathTrace
+    run_id::String
+    step::Int
+    i_state::Vector{Float32}
+    k_state::Dict{Int, Float32}
+    flux::Vector{Float32}
+    c_Ricci::Vector{Float32}
+    mean_oxidation::Float32
+    shannon_entropy::Float32
+    fisher_information::Float32
+    transition_class::Symbol
+    on_geodesic::Bool
+end
+
+trace = PathTrace(i_state=ρ, transition_class=:oxidizing)
+
+function record_path_trajectory_struct!(
+    ρ0::Vector{Float32}, T::Int, pf_states, flat_pos, edges;
+    max_moves_per_step=10, run_id::String="default_run"
+)
+    ρ = copy(ρ0)
+    ρ_series = [copy(ρ)]
+    metadata = Vector{PathTrace}(undef, T)
+    trajectory = String[]
+
+    ox_moves = 0
+    red_moves = 0
+    total_moves = 0
+    cumulative_entropy = 0.0f0
+
+    for t in 1:T
+        ρ_old = copy(ρ)
+        oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=max_moves_per_step)
+
+        push!(ρ_series, copy(ρ))
+        curr_state = pf_states[argmax(ρ)]
+        push!(trajectory, curr_state)
+
+        flux = ρ .- ρ_old
+        k_dist = compute_k_distribution(ρ, pf_states)
+        mean_oxidation = Float32(weighted_mean_oxidation(k_dist))
+        entropy = Float32(shannon_entropy(ρ))
+        fisher_info = Float32(fisher_information(ρ))
+        cumulative_entropy += entropy
+
+        _, _, C_R_vals, _ = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
+        c_R_vec = Float32.(C_R_vals)
+
+        class = classify_transition(ρ_old, ρ)
+        class == :oxidizing && (ox_moves += 1)
+        class == :reducing && (red_moves += 1)
+        total_moves += 1
+
+        metadata[t] = PathTrace(
+            run_id=run_id,
+            step=t,
+            i_state=copy(ρ),
+            k_state=deepcopy(k_dist),
+            flux=copy(flux),
+            c_Ricci=copy(c_R_vec),
+            mean_oxidation=mean_oxidation,
+            shannon_entropy=entropy,
+            fisher_information=fisher_info,
+            transition_class=class,
+            on_geodesic=false  # will update later
+        )
+    end
+
+    # === Post-process dominant geodesic label
+    geo_path = dominant_geodesic(trajectory, geodesics)
+    for (t, state) in enumerate(trajectory)
+        metadata[t].on_geodesic = state in geo_path
+    end
+
+    lyap = Float32(lyapunov_exponent(ρ_series))
+    action_cost = cumulative_entropy / Float32(total_moves)
+
+    global_metadata = Dict(
+        "run_id" => run_id,
+        "initial_i_state" => copy(ρ0),
+        "final_i_state" => copy(ρ),
+        "i_state_series" => ρ_series,
+        "step_metadata" => metadata,
+        "dominant_geodesic" => geo_path,
+        "lyapunov_exponent" => lyap,
+        "total_moves" => total_moves,
+        "oxidizing_moves" => ox_moves,
+        "reducing_moves" => red_moves,
+        "cumulative_entropy" => cumulative_entropy,
+        "action_cost" => action_cost
+    )
+
+    return ρ_series, trajectory, geo_path, global_metadata
+end
+
+function save_path_metadata(global_metadata::Dict{String, Any}; prefix="path_run")
+    timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
+    run_id = get(global_metadata, "run_id", "run")
+    filename = "$(prefix)_$(run_id)_$(timestamp).bson"
+    BSON.@save filename global_metadata
+    println("🧠 Metadata saved to: $filename")
+end
+
+# ============================================================================
+# Random Initial Generator with UUIDs
+# ============================================================================
+
+function generate_safe_random_initials(n::Int; min_val=0.0f0)
+    batch_id = "batch_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
+    samples = []
+
+    while length(samples) < n
+        vec = rand(Float32, 8)
+        norm_vec = vec / sum(vec)
+        is_safe = all(x -> x ≥ min_val || isapprox(x, 0.0f0; atol=1e-8f0), norm_vec)
+
+        if is_safe
+            sample_id = uuid4()
+            push!(samples, (uuid=sample_id, rho=norm_vec))
+        end
+    end
+
+    return batch_id, samples
+end
+
+batch_id, initials = generate_safe_random_initials(100)
+
+
