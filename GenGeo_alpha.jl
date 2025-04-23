@@ -657,4 +657,4 @@ end
 # ============================================================================
 model, trace = train_geo_flow_model(config)
 timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
-@save "trained_$(config.model_id)_$timestamp.bson" model trace confi
+@save "trained_$(config.model_id)_$timestamp.bson" model trace config
