@@ -275,6 +275,7 @@ end
 @nograd build_GeoGraphStruct
 @nograd update_geometry_from_rho
 @nograd oxi_shapes_alive!
+
 # ============================================================================
 # Part D: Recurrent GNN Rollout (Pure model-based prediction)
 # ============================================================================
