@@ -17,7 +17,7 @@ using Dates
 using Zygote: @nograd
 
 # ============================================================================
-# Define the Geometry 
+# Define the REAL geometry 
 # ============================================================================
 
 function lift_to_z_plane(rho::Vector{Float32}, pf_states, flat_pos)
@@ -152,6 +152,104 @@ edges = [
     ("001", "011"), ("001", "101"), ("010", "011"), ("010", "110"),
     ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
 ]
+
+# ============================================================================
+# Define the ALIVE function
+# ============================================================================
+
+function compute_entropy_cost(i::Int, j::Int, C_R_vals::Vector{Float32}, pf_states::Vector{String})
+    baseline_DeltaE = 1.0f0
+    mass_heat = 0.1f0
+    reaction_heat = 0.01f0 * baseline_DeltaE
+    conformational_cost = abs(C_R_vals[j])
+
+    degeneracy_map = Dict(0 => 1, 1 => 3, 2 => 3, 3 => 1)
+    deg = degeneracy_map[count(c -> c == '1', pf_states[j])]
+    degeneracy_penalty = 1.0f0 / deg
+
+    return mass_heat + reaction_heat + conformational_cost + degeneracy_penalty
+end
+
+function oxi_shapes_alive!(
+    ρ::Vector{Float32},
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}};
+    max_moves::Int = 10
+)
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    neighbor_indices = Dict(s => Int[] for s in pf_states)
+    for (u, v) in edges
+        push!(neighbor_indices[u], idx[v])
+        push!(neighbor_indices[v], idx[u])
+    end
+
+    # Step 1: Integer molecule approximation
+    counts = round.(Int, ρ .* 100)
+    counts[end] = 100 - sum(counts[1:end-1])
+    ρ .= Float32.(counts) ./ 100
+
+    # Step 2: Update curvature
+    points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(ρ, build_GeoGraphStruct(ρ, pf_states, flat_pos, edges))
+
+    inflow = zeros(Float32, length(pf_states))
+    outflow = zeros(Float32, length(pf_states))
+
+    total_moves = rand(0:max_moves)
+    candidate_indices = findall(x -> x > 0, counts)
+
+    for _ in 1:total_moves
+        isempty(candidate_indices) && break
+        i = rand(candidate_indices)
+        s = pf_states[i]
+        nbrs = neighbor_indices[s]
+        isempty(nbrs) && continue
+
+        # Build transition probabilities
+        probs = Float32[]
+        for j in nbrs
+            ΔS = compute_entropy_cost(i, j, C_R_vals, pf_states)
+            Δf = exp(ρ[i]) - C_R_vals[i] + ΔS
+            p = exp(-Δf) * exp(-anisotropy_vals[j])
+            push!(probs, p)
+        end
+
+        if sum(probs) < 1f-8
+            inflow[i] += 0.01f0
+            continue
+        end
+
+        probs ./= sum(probs)
+        chosen = sample(nbrs, Weights(probs))
+        inflow[chosen] += 0.01f0
+        outflow[i] += 0.01f0
+    end
+
+    for i in eachindex(pf_states)
+        inflow[i] += (counts[i] / 100.0f0) - outflow[i]
+    end
+
+    # Step 3: Clamp, normalize, threshold
+    inflow .= max.(inflow, 0.0f0)
+    if sum(inflow) > 0.0f0
+        inflow ./= sum(inflow)
+    end
+
+    for i in eachindex(inflow)
+        if inflow[i] > 0.0f0 && inflow[i] < 0.01f0
+            inflow[i] = 0.01f0
+        end
+    end
+
+    inflow .= max.(inflow, 0.0f0)
+    inflow ./= sum(inflow)
+    ρ .= inflow
+end
+
+# ============================================================================
+# Define the "Flow" Path recorder functions and logging
+# ============================================================================
+
 
 # ============================================================================
 # Define the Model 
