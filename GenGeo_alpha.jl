@@ -738,16 +738,24 @@ function geo_flow_rollout_loss(
 end
 
 function train_geo_flow_model(config::GeoFlowConfig)
-    training_trace   = GeoFlowTrack[]
-    λ_epoch_history  = Float32[]
+    # 1) Instantiate the model *inside* the training function
+    model = GenGeoAlpha(
+      θ_geo  = ones(Float32, length(config.pf_states)),
+      θ_flow = [1.0f0]
+    )
 
+    training_trace  = GeoFlowTrack[]
+    λ_epoch_history = Float32[]
+
+    # 2) Loop over epochs and batches
     for epoch in 1:config.epochs
         λ_vals = Float32[]
+
         for _ in 1:config.batch_size
             sample = config.initials[rand(1:end)]
             ρ0     = sample.rho
 
-            # Compute physics‐based λ without any AD
+            # 3) Compute physics‐based λ
             λ_val = geo_flow_rollout_loss(ρ0, model, config; T=config.rollout_steps)
 
             push!(λ_vals, λ_val)
@@ -765,6 +773,7 @@ function train_geo_flow_model(config::GeoFlowConfig)
         println("Epoch $epoch | λ (mean) = $(round(mean_λ, digits=6))")
     end
 
+    # 4) Return the *same* model you instantiated above
     return model, training_trace, λ_epoch_history
 end
 
