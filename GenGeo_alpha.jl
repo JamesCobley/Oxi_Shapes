@@ -250,9 +250,9 @@ end
 # Define the IMAGINARY Model & Complex functions
 # ============================================================================
 struct ComplexField
-    real::Vector{Float32} # the real alive-dependent evolution of the graph
-    imag::Vector{Float32} # the imagined, predicted, evoltion of the graph 
-    memory::Vector{Float32}  # interpreted as synaptic strength / recall weight
+    real::Vector{Float32}
+    imag::Vector{Float32}
+    memory::Vector{Float32}
 end
 
 function init_complex_field_from_graph(real::Vector{Float32}, geo::GeoGraphStruct)
@@ -274,13 +274,25 @@ function dynamic_lambda(field::ComplexField; β=10.0f0)
     return 1.0f0 / (1.0f0 + exp(β * divergence))  # sigmoid(-β * divergence)
 end
 
-function update_imaginary_field_epistemic!(field::ComplexField, geo::GeoGraphStruct; β=10.0f0)
+function updated_imaginary_field(field::ComplexField, geo::GeoGraphStruct; β=10.0f0)
     λ = dynamic_lambda(field; β=β)
     W = recall_weights(field, geo)
-    field.imag .= (1 - λ) .* field.imag .+ λ .* W
-    field.imag .= max.(field.imag, 0.0f0)
-    field.imag ./= sum(field.imag)
-    return λ  # return for logging
+    imag_new = (1 - λ) .* field.imag .+ λ .* W
+    imag_new = max.(imag_new, 0.0f0)
+    imag_new ./= sum(imag_new)
+    return imag_new, λ
+end
+
+function updated_memory_field(field::ComplexField)
+    mem = (field.memory .+ field.real) ./ 2f0
+    mem ./= sum(mem)
+    return mem
+end
+
+function evolve_complex_field(field::ComplexField, geo::GeoGraphStruct; β=10.0f0)
+    imag_new, λ = updated_imaginary_field(field, geo; β=β)
+    mem_new = updated_memory_field(field)
+    return ComplexField(field.real, imag_new, mem_new), λ
 end
 
 # ============================================================================
