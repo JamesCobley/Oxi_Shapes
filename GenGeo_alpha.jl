@@ -507,6 +507,57 @@ end
 # Random Initial Generator with UUIDs
 # ============================================================================
 
+@kwdef mutable struct GenGeoAlpha
+    θ_geo::Vector{Float32}   # per-node geometry weights
+    θ_flow::Vector{Float32}  # scalar weight for λ sensitivity
+end
+
+function learned_c_ricci_dirichlet(R::Vector{Float32}, pf_states, edges, θ_geo::Vector{Float32})
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    C_R = zeros(Float32, length(pf_states))
+    for (i, s) in enumerate(pf_states)
+        neighbors = [v for (u, v) in edges if u == s] ∪ [u for (u, v) in edges if v == s]
+        for n in neighbors
+            j = idx[n]
+            C_R[i] += θ_geo[i] * (R[i] - R[j])^2
+        end
+    end
+    return C_R
+end
+
+function learned_lambda(field::ComplexField, θ_flow::Vector{Float32})
+    divergence = norm(field.imag .- field.memory)
+    β = θ_flow[1]
+    return 1.0f0 / (1.0f0 + exp(β * divergence))
+end
+
+function updated_imag_field(geo::GeoGraphStruct, field::ComplexField, θ_flow)
+    λ = learned_lambda(field, θ_flow)
+    _, _, C_R_vals, _ = update_geometry_from_rho(field.real, geo)
+    W = exp.(field.memory .+ C_R_vals .- maximum(field.memory .+ C_R_vals))
+    W ./= sum(W)
+    imag = (1 - λ) .* field.imag .+ λ .* W
+    imag .= max.(imag, 0.0f0)
+    imag ./= sum(imag)
+    return imag, λ
+end
+
+function evolve_step_loss(ρ0::Vector{Float32}, model::GenGeoAlpha, pf_states, flat_pos, edges)
+    geo = build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges)
+    points3D, R_vals, _, _ = update_geometry_from_rho(ρ0, geo)
+    C_R = learned_c_ricci_dirichlet(R_vals, pf_states, edges, model.θ_geo)
+
+    φ = ComplexField(real=ρ0, imag=zeros(Float32, length(ρ0)), memory=copy(ρ0))
+    φ.imag, λ = updated_imag_field(geo, φ, model.θ_flow)
+
+    loss = sum(C_R) + λ * shannon_entropy(φ.imag)
+    return loss
+end
+
+# ============================================================================
+# Random Initial Generator with UUIDs
+# ============================================================================
+
 function generate_safe_random_initials(n::Int; min_val=0.0f0)
     batch_id = "batch_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
     samples = []
@@ -527,4 +578,78 @@ end
 
 batch_id, initials = generate_safe_random_initials(100)
 
+# ============================================================================
+# λ-Based Dynamic Loss Function
+# ============================================================================
+
+function geo_flow_divergence_loss(ρ0, model::GenGeoAlpha, pf_states, flat_pos, edges)
+    geo = build_GeoGraphStruct(ρ0, pf_states, flat_pos, edges)
+    geo.C_R_vals .= geo.C_R_vals .* model.θ_geo
+
+    φ = ComplexField(real=ρ0, imag=zeros(Float32, length(ρ0)), memory=copy(ρ0))
+    λ = dynamic_lambda(φ; β=model.θ_flow[1])  # Loss = epistemic flow divergence
+
+    return λ
+end
+
+# ============================================================================
+# Training Loop
+# ============================================================================
+
+@kwdef struct GeoFlowConfig
+    pf_states::Vector{String}
+    flat_pos::Dict{String, Tuple{Float64, Float64}}
+    edges::Vector{Tuple{String, String}}
+    initials::Vector{Vector{Float32}}
+    epochs::Int = 100
+    max_moves_per_step::Int = 10
+    model_id::String = "geo_flow"
+end
+
+config = GeoFlowConfig(
+    pf_states = pf_states,
+    flat_pos = flat_pos,
+    edges = edges,
+    initials = initials,
+    epochs = 100,
+    model_id = "test_0423"
+)
+
+function train_geo_flow_model(config::GeoFlowConfig)
+    training_trace = GeoFlowTrack[]
+    model = GenGeoAlpha(
+        θ_geo = ones(Float32, length(config.pf_states)),
+        θ_flow = [1.0f0]
+    )
+    ps = Flux.params(model)
+
+    for epoch in 1:config.epochs
+        ρ0 = config.initials[rand(1:end)]
+        λ_val, back = Flux.withgradient(() ->
+            geo_flow_divergence_loss(ρ0, model, config.pf_states, config.flat_pos, config.edges), ps)
+
+        for p in ps
+            p .-= back[p]
+        end
+
+        push!(training_trace, GeoFlowTrack(
+            epoch = epoch,
+            λ = λ_val,
+            θ_geo = deepcopy(model.θ_geo),
+            θ_flow = deepcopy(model.θ_flow)
+        ))
+
+        println("Epoch $epoch | λ = $(round(λ_val, digits=6))")
+    end
+
+    return model, training_trace
+end
+
+# ============================================================================
+# Save Trained GeoFlow Model
+# ============================================================================
+model, trace = train_geo_flow_model(config)
+
+timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
+@save "trained_$(config.model_id)_$timestamp.bson" model trace confi
 
