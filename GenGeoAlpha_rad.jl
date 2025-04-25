@@ -13,10 +13,6 @@ using UUIDs
 using BSON: @save, @load
 using Dates
 
-# for AD
-using Zygote: @nograd, gradient
-import ChainRulesCore: rrule, NoTangent
-
 # ============================================================================
 # Define the REAL geometry
 # ============================================================================
@@ -245,20 +241,6 @@ function oxi_shapes_alive!(
     inflow ./= sum(inflow)
     ρ .= inflow
 end
-
-function rrule(::typeof(oxi_shapes_alive!),
-               ρ::Vector{Float32}, pf_states, flat_pos, edges;
-               max_moves)
-  # Run the mutation once
-  oxi_shapes_alive!(ρ, pf_states, flat_pos, edges; max_moves=max_moves)
-  # Return “nothing” as the primal result, and a pullback that returns NoTangent:
-  function pullback(Δ)
-    return NoTangent(), NoTangent(), NoTangent(), NoTangent(), NoTangent(); max_moves=NoTangent()
-  end
-  return nothing, pullback
-end
-
-@nograd oxi_shapes_alive!           # still fine to leave
 
 # ============================================================================
 # Define the "Flow" 
@@ -614,4 +596,150 @@ function generate_safe_random_initials(n::Int; min_val=0.0f0)
     return batch_id, samples
 end
 
+# ============================================================================
+# λ-Based Dynamic Loss Function with Multi-Step Rollout (GeoFlow Engine)
+# ============================================================================
 
+@kwdef struct GeoFlowConfig
+    pf_states::Vector{String}
+    flat_pos::Dict{String, Tuple{Float64, Float64}}
+    edges::Vector{Tuple{String, String}}
+    initials::Vector{NamedTuple{(:uuid, :rho), Tuple{UUID, Vector{Float32}}}}
+    epochs::Int = 100
+    batch_size::Int = 10
+    max_moves_per_step::Int = 10
+    rollout_steps::Int = 5
+    model_id::String = "geo_flow"
+end
+
+@kwdef mutable struct GeoFlowLog
+    epoch::Int
+    λ::Float32
+    θ_geo::Vector{Float32}
+    θ_flow::Vector{Float32}
+    init_uuid::UUID
+end
+
+@kwdef mutable struct GeoFlowModel
+    θ_geo::Vector{Float32}
+    θ_flow::Vector{Float32}
+end
+
+# Updated step function with lambda-aware geometric evolution
+function step(
+    field::ComplexField,
+    model::GeoFlowModel,
+    config::GeoFlowConfig
+)::Tuple{ComplexField, Float32}
+    real′ = copy(field.real)
+    oxi_shapes_alive!(real′, config.pf_states, config.flat_pos, config.edges;
+                      max_moves=config.max_moves_per_step)
+
+    geo = build_GeoGraphStruct(real′, config.pf_states, config.flat_pos, config.edges)
+    R_vals = geo.R_vals
+    Δ = field.imag .- field.memory
+    λ = 1.0f0 / (1.0f0 + exp(model.θ_flow[1] * norm(Δ)))
+
+    W = exp.(field.memory .+ R_vals .- maximum(field.memory .+ R_vals))
+    W ./= sum(W)
+    imag′ = (1f0 - λ) .* field.imag .+ λ .* W
+    imag′ = max.(imag′, 0.0f0)
+    imag′ ./= sum(imag′)
+
+    mem′ = (field.memory .+ real′) ./ 2f0
+    mem′ ./= sum(mem′)
+
+    return ComplexField(real′, imag′, mem′), λ
+end
+
+# Record MSE and mean lambda over T steps
+function geo_flow_rollout_monitor(
+    ρ0::Vector{Float32},
+    model::GeoFlowModel,
+    config::GeoFlowConfig;
+    T::Int = config.rollout_steps
+)
+    field = ComplexField(real=ρ0,
+                         imag=zeros(Float32, length(ρ0)),
+                         memory=copy(ρ0))
+    total_mse = 0f0
+    total_λ = 0f0
+
+    for _ in 1:T
+        field, λ = step(field, model, config)
+        total_λ += λ
+        total_mse += mean((field.imag .- field.real).^2)
+    end
+
+    return total_mse / T, total_λ / T
+end
+
+function train_geo_flow_model(config::GeoFlowConfig)
+    model = GeoFlowModel(ones(Float32, length(config.pf_states)), [1.0f0])
+    training_trace = GeoFlowLog[]
+    λ_epoch_history = Float32[]
+    mse_epoch_history = Float32[]
+
+    for epoch in 1:config.epochs
+        λ_vals = Float32[]
+        mse_vals = Float32[]
+
+        for _ in 1:config.batch_size
+            ρ0 = config.initials[rand(1:end)].rho
+            mse, λ = geo_flow_rollout_monitor(ρ0, model, config; T=config.rollout_steps)
+
+            push!(λ_vals, λ)
+            push!(mse_vals, mse)
+
+            push!(training_trace, GeoFlowLog(
+                epoch     = epoch,
+                λ         = λ,
+                θ_geo     = deepcopy(model.θ_geo),
+                θ_flow    = deepcopy(model.θ_flow),
+                init_uuid = rand(config.initials).uuid
+            ))
+        end
+
+        mean_λ = mean(λ_vals)
+        mean_mse = mean(mse_vals)
+        push!(λ_epoch_history, mean_λ)
+        push!(mse_epoch_history, mean_mse)
+
+        println("Epoch $epoch | λ (mean) = $(round(mean_λ, digits=6)) | MSE = $(round(mean_mse, digits=6))")
+    end
+
+    return model, training_trace, λ_epoch_history, mse_epoch_history
+end
+
+function save_path_metadata(global_metadata::Dict{String, Any}; prefix="path_run")
+    timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
+    run_id = get(global_metadata, "run_id", "run")
+    filename = "$(prefix)_$(run_id)_$(timestamp).bson"
+    @save filename global_metadata
+    println("🧐 Metadata saved to: $filename")
+end
+
+batch_id, samples = generate_safe_random_initials(100)
+
+config = GeoFlowConfig(
+    pf_states = pf_states,
+    flat_pos = flat_pos,
+    edges = edges,
+    initials = samples,
+    epochs = 1000,
+    batch_size = 100,
+    rollout_steps = 100,
+    model_id = batch_id
+)
+
+model, training_trace, λ_epoch_history, mse_epoch_history = train_geo_flow_model(config)
+
+global_metadata = Dict(
+    "run_id" => config.model_id,
+    "config" => config,
+    "training_trace" => training_trace,
+    "λ_epoch_history" => λ_epoch_history,
+    "mse_epoch_history" => mse_epoch_history
+)
+
+save_path_metadata(global_metadata; prefix="geo_flow")
