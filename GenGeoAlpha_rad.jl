@@ -133,7 +133,7 @@ function update_geometry_from_rho(ρ::Vector{Float32}, geo::GeoGraphStruct)
     C_R_vals = compute_c_ricci_dirichlet(R_vals, pf_states, edges)
     anisotropy = compute_anisotropy_from_curvature(R_vals, pf_states, flat_pos, edges)
 
-    return points3D, R_vals, C_R_vals, anisotropy_vals
+    return points3D, R_vals, C_R_vals, anisotropy
 end
 
 # === Initialize and test ===
