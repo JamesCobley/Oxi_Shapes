@@ -335,27 +335,38 @@ function classify_transition(prev::Vector{Float32}, curr::Vector{Float32})
     end
 end
 
-@kwdef struct PathTrace
+struct FlowTrace
     run_id::String
-    step::Int
-    i_state::Vector{Float32}
-    k_state::Dict{Int, Float32}
-    flux::Vector{Float32}
-    c_Ricci::Vector{Float32}
-    mean_oxidation::Float32
-    shannon_entropy::Float32
-    fisher_information::Float32
-    transition_class::Symbol
-    on_geodesic::Bool
+    ρ_series::Vector{Vector{Float32}}
+    flux_series::Vector{Vector{Float32}}
+    curvature_series::Vector{Vector{Float32}}  # C_Ricci
+    R_series::Vector{Vector{Float32}}          # Raw R(x)
+    k_states::Vector{Dict{Int, Float32}}
+    mean_oxidation_series::Vector{Float32}
+    shannon_entropy_series::Vector{Float32}
+    fisher_info_series::Vector{Float32}
+    transition_classes::Vector{Symbol}
+    on_geodesic_flags::Vector{Bool}
+    geodesic_path::Vector{String}
+    lyapunov::Float32
+    action_cost::Float32
 end
 
-function record_path_trajectory_struct!(
+function record_flow_trace!(
     ρ0::Vector{Float32}, T::Int, pf_states, flat_pos, edges;
     max_moves_per_step=10, run_id::String="default_run"
 )
     ρ = copy(ρ0)
     ρ_series = [copy(ρ)]
-    metadata = Vector{PathTrace}(undef, T)
+    flux_series = Vector{Vector{Float32}}()
+    curvature_series = Vector{Vector{Float32}}()
+    R_series = Vector{Vector{Float32}}()
+    k_states = Vector{Dict{Int, Float32}}()
+    mean_oxidation_series = Float32[]
+    shannon_entropy_series = Float32[]
+    fisher_info_series = Float32[]
+    transition_classes = Symbol[]
+    on_geodesic_flags = Bool[]
     trajectory = String[]
 
     ox_moves = 0
@@ -372,58 +383,53 @@ function record_path_trajectory_struct!(
         push!(trajectory, curr_state)
 
         flux = ρ .- ρ_old
+        push!(flux_series, copy(flux))
+
         k_dist = compute_k_distribution(ρ, pf_states)
-        mean_oxidation = Float32(weighted_mean_oxidation(k_dist))
+        push!(k_states, deepcopy(k_dist))
+
+        mean_ox = Float32(weighted_mean_oxidation(k_dist))
         entropy = Float32(shannon_entropy(ρ))
         fisher_info = Float32(fisher_information(ρ))
         cumulative_entropy += entropy
 
-        _, _, C_R_vals, _ = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
-        c_R_vec = Float32.(C_R_vals)
+        push!(mean_oxidation_series, mean_ox)
+        push!(shannon_entropy_series, entropy)
+        push!(fisher_info_series, fisher_info)
+
+        _, _, R_vals, C_R_vals = update_geometry_from_rho(ρ, pf_states, flat_pos, edges)
+        push!(R_series, Float32.(R_vals))
+        push!(curvature_series, Float32.(C_R_vals))
 
         class = classify_transition(ρ_old, ρ)
+        push!(transition_classes, class)
         class == :oxidizing && (ox_moves += 1)
         class == :reducing && (red_moves += 1)
         total_moves += 1
-
-        metadata[t] = PathTrace(
-            run_id=run_id,
-            step=t,
-            i_state=copy(ρ),
-            k_state=deepcopy(k_dist),
-            flux=copy(flux),
-            c_Ricci=copy(c_R_vec),
-            mean_oxidation=mean_oxidation,
-            shannon_entropy=entropy,
-            fisher_information=fisher_info,
-            transition_class=class,
-            on_geodesic=false  # will update later
-        )
     end
 
-    # === Post-process dominant geodesic label
     geo_path = dominant_geodesic(trajectory, geodesics)
-    for (t, state) in enumerate(trajectory)
-        metadata[t].on_geodesic = state in geo_path
+    for state in trajectory
+        push!(on_geodesic_flags, state in geo_path)
     end
 
     lyap = Float32(lyapunov_exponent(ρ_series))
     action_cost = cumulative_entropy / Float32(total_moves)
 
-    global_metadata = Dict(
-        "run_id" => run_id,
-        "initial_i_state" => copy(ρ0),
-        "final_i_state" => copy(ρ),
-        "i_state_series" => ρ_series,
-        "step_metadata" => metadata,
-        "dominant_geodesic" => geo_path,
-        "lyapunov_exponent" => lyap,
-        "total_moves" => total_moves,
-        "oxidizing_moves" => ox_moves,
-        "reducing_moves" => red_moves,
-        "cumulative_entropy" => cumulative_entropy,
-        "action_cost" => action_cost
+    return FlowTrace(
+        run_id,
+        ρ_series,
+        flux_series,
+        curvature_series,
+        R_series,
+        k_states,
+        mean_oxidation_series,
+        shannon_entropy_series,
+        fisher_info_series,
+        transition_classes,
+        on_geodesic_flags,
+        geo_path,
+        lyap,
+        action_cost
     )
-
-    return ρ_series, trajectory, geo_path, global_metadata
 end
