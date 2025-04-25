@@ -496,3 +496,122 @@ function evolve_complex_field(field::ComplexField, geo::GeoGraphStruct)
     mem_new = updated_memory_field(field)
     return ComplexField(field.real, imag_new, mem_new), λ
 end
+
+# ============================================================================
+# Complex Flow Prediction from FlowTrace
+# ============================================================================
+
+@kwdef mutable struct ComplexField
+    real::Vector{Float32}
+    imag::Vector{Float32}
+    memory::Vector{Float32}
+end
+
+"""
+    init_complex_field_from_flowtrace(flow::FlowTrace)
+
+Initialize a ComplexField using the first real i-state from FlowTrace.
+"""
+function init_complex_field_from_flowtrace(flow::FlowTrace)
+    real = flow.ρ_series[1]
+    memory = real ./ sum(real)
+    imag = zeros(Float32, length(real))
+    return ComplexField(real, imag, memory)
+end
+
+"""
+    shape_prediction_loss(imag::Vector{Float32}, real_next::Vector{Float32})
+
+Mean squared error between imaginary prediction and real next i-state.
+"""
+function shape_prediction_loss(imag::Vector{Float32}, real_next::Vector{Float32})
+    return mean((imag .- real_next).^2)
+end
+
+"""
+    dynamic_lambda(field, R_vals, Δ)
+
+Flow-geometry modulation: λ is a soft gate influenced by curvature and divergence.
+"""
+function dynamic_lambda(field::ComplexField, R_vals::Vector{Float32}, Δ::Vector{Float32})
+    β = mean(R_vals)
+    divergence = norm(Δ)
+    return 1.0f0 / (1.0f0 + exp(β * divergence))
+end
+
+"""
+    recall_weights(memory, R_vals)
+
+Return normalized weights from memory and raw curvature.
+"""
+function recall_weights(memory::Vector{Float32}, R_vals::Vector{Float32})
+    W = memory .+ R_vals
+    W = exp.(W .- maximum(W))
+    return W ./ sum(W)
+end
+
+"""
+    evolve_complex_from_flowtrace(field, flow, t, pf_states, flat_pos, edges)
+
+Evolves the complex field using timepoint t from flowtrace.
+Returns (updated_field, predicted_rho, loss, lambda).
+"""
+function evolve_complex_from_flowtrace(
+    field::ComplexField,
+    flow::FlowTrace,
+    t::Int,
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}}
+)
+    # Use real state from t as anchor
+    field.real = flow.ρ_series[t]
+    real_next = flow.ρ_series[t+1]
+
+    # Rebuild geometry from real
+    geo = build_GeoGraphStruct(field.real, pf_states, flat_pos, edges)
+    R_vals = flow.R_series[t]  # use stored R_vals
+
+    # Compute dynamic weights and lambda
+    Δ = field.imag .- field.memory
+    λ = dynamic_lambda(field, R_vals, Δ)
+    W = recall_weights(field.memory, R_vals)
+
+    raw = (1f0 - λ) .* field.imag .+ λ .* W
+    imag_new = max.(raw, 0.0f0)
+    imag_new ./= sum(imag_new)
+
+    # Update memory
+    mem_new = (field.memory .+ field.real) ./ 2f0
+    mem_new ./= sum(mem_new)
+
+    # Loss (difference from real next step)
+    loss = shape_prediction_loss(imag_new, real_next)
+
+    updated_field = ComplexField(field.real, imag_new, mem_new)
+    return updated_field, imag_new, loss, λ
+end
+
+# ============================================================================
+# Random Initial Generator with UUIDs
+# ============================================================================
+
+function generate_safe_random_initials(n::Int; min_val=0.0f0)
+    batch_id = "batch_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
+    samples = []
+
+    while length(samples) < n
+        vec = rand(Float32, 8)
+        norm_vec = vec / sum(vec)
+        is_safe = all(x -> x ≥ min_val || isapprox(x, 0.0f0; atol=1e-8f0), norm_vec)
+
+        if is_safe
+            sample_id = uuid4()
+            push!(samples, (uuid=sample_id, rho=norm_vec))
+        end
+    end
+
+    return batch_id, samples
+end
+
+
