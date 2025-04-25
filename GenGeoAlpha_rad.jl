@@ -433,3 +433,66 @@ function record_flow_trace!(
         action_cost
     )
 end
+
+# ============================================================================
+# Define the IMAGINARY Model & Differentiable Complex Flow (GeoFlow)
+# ============================================================================
+
+@kwdef mutable struct ComplexField
+    real::Vector{Float32}       # Real occupancy (ρ)
+    imag::Vector{Float32}       # Imagined geometry (prediction)
+    memory::Vector{Float32}     # History of real (learning memory)
+end
+
+function init_complex_field_from_graph(real::Vector{Float32}, geo::GeoGraphStruct)
+    degree_vec = vec(sum(geo.adjacency, dims=2))
+    memory = degree_vec ./ sum(degree_vec)
+    imag = zeros(Float32, length(real))
+    return ComplexField(real, imag, memory)
+end
+
+"Compute normalized recall weights from memory and R(x) curvature"
+function recall_weights(field::ComplexField, R_vals::Vector{Float32})
+    W = field.memory .+ R_vals
+    W = exp.(W .- maximum(W))  # softmax form
+    return W ./ sum(W)
+end
+
+"Derive geometric sharpness from Ricci"
+function beta_from_c_ricci(R_vals::Vector{Float32})
+    return mean(R_vals)
+end
+
+"Define λ as a learned, differentiable shape-matching interface"
+function dynamic_lambda(field::ComplexField, R_vals::Vector{Float32})
+    β = beta_from_c_ricci(R_vals)
+    Δshape = field.imag .- field.memory
+    Δmag = sum(abs2, Δshape)  # squared shape error
+    return 1.0f0 / (1.0f0 + exp(β * sqrt(Δmag)))
+end
+
+"Update imaginary prediction from geometric learning"
+function updated_imaginary_field(field::ComplexField, geo::GeoGraphStruct)
+    _, R_vals, _, _ = update_geometry_from_rho(field.real, geo)
+    λ = dynamic_lambda(field, R_vals)
+    W = recall_weights(field, R_vals)
+
+    raw = (1f0 - λ) .* field.imag .+ λ .* W
+    clamped = max.(raw, 0.0f0)
+    imag_new = clamped ./ sum(clamped)
+
+    return imag_new, λ
+end
+
+"Memory evolves from real field (self-updating manifold trace)"
+function updated_memory_field(field::ComplexField)
+    mixed = (field.memory .+ field.real) ./ 2f0
+    return mixed ./ sum(mixed)
+end
+
+"Main complex evolution function — predicts next geometry"
+function evolve_complex_field(field::ComplexField, geo::GeoGraphStruct)
+    imag_new, λ = updated_imaginary_field(field, geo)
+    mem_new = updated_memory_field(field)
+    return ComplexField(field.real, imag_new, mem_new), λ
+end
