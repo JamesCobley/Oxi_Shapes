@@ -715,4 +715,28 @@ function build_adjacency_matrix(pf_states::Vector{String}, edges::Vector{Tuple{S
     return adj
 end
 
-@save "brain_snapshot.bson" trajectory
+batch_id, samples = generate_safe_random_initials(100)
+
+config = LivingFlowConfig(
+    pf_states = pf_states,
+    flat_pos = flat_pos,
+    edges = edges,
+    initials = samples,
+    epochs = 50,          # 🔥 however many you want
+    batch_size = 5,       # 🔥 however many you want
+    rollout_steps = 100,   # 🔥 steps of evolution
+    model_id = batch_id
+)
+
+training_trace, mse_epoch_history = train_living_flow_model(config)
+
+global_metadata = Dict(
+    "run_id" => config.model_id,
+    "config" => config,
+    "training_trace" => training_trace,
+    "mse_epoch_history" => mse_epoch_history
+)
+
+@save "living_field_$(config.model_id).bson" global_metadata
+
+@save "brain_snapshot.bson" 
