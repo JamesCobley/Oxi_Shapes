@@ -472,16 +472,22 @@ end
 # Basic Update Rules (Core Brain Evolution)
 # ============================================================================
 
+"Safely get integer neighbors from adjacency matrix."
+function get_neighbors(adjacency::SparseMatrixCSC{Float32, Int}, i::Int)
+    _, nzcols = findnz(adjacency[i, :])
+    return Int[nzcols...]   # force them to be Int, not Float32
+end
+
 "Update real field using local memory + tension feedback."
 function update_real_field!(field::LivingFieldSimplex)
     for i in eachindex(field.real)
-        neighbors = findnz(field.adjacency[i, :])[2]
+        neighbors = get_neighbors(field.adjacency, i)
         if isempty(neighbors)
             continue
         end
         local_flux = sum(field.imag[neighbors]) / length(neighbors)
         adjustment = (local_flux - field.real[i]) * field.real_confidence[i]
-        field.real[i] += 0.05f0 * adjustment  # Small adjustment
+        field.real[i] += 0.05f0 * adjustment
     end
     normalize!(field.real)
 end
@@ -509,15 +515,16 @@ end
 "Update curvature memory based on real geometry."
 function update_curvature_memory!(field::LivingFieldSimplex)
     for i in eachindex(field.curvature_memory)
-        local_neighbors = findnz(field.adjacency[i, :])[2]
-        if isempty(local_neighbors)
+        neighbors = get_neighbors(field.adjacency, i)
+        if isempty(neighbors)
             continue
         end
-        local_curvature = mean(abs.(field.real[i] .- field.real[local_neighbors]))
+        local_curvature = mean(abs.(field.real[i] .- field.real[neighbors]))
         # Slowly adjust curvature memory
         field.curvature_memory[i] += 0.01f0 * (local_curvature - field.curvature_memory[i])
     end
 end
+
 
 "Simple normalization helper."
 function normalize!(v::Vector{Float32})
@@ -551,7 +558,7 @@ function update_confidences!(field::LivingFieldSimplex)
         end
 
         # --- Curvature Stability
-        neighbors = findnz(field.adjacency[i, :])[2]
+        neighbors = get_neighbors(field.adjacency, i)
         if !isempty(neighbors)
             local_curvature = mean(abs.(field.real[i] .- field.real[neighbors]))
             Δ_curv = abs(field.curvature_memory[i] - local_curvature)
@@ -620,7 +627,7 @@ end
     model_id::String = "living_field"
 end
 
-mutable struct LivingRolloutLog
+@kwdef mutable struct LivingRolloutLog
     epoch::Int
     avg_real_confidence::Float32
     avg_imag_confidence::Float32
@@ -715,15 +722,15 @@ function build_adjacency_matrix(pf_states::Vector{String}, edges::Vector{Tuple{S
     return adj
 end
 
-batch_id, samples = generate_safe_random_initials(100)
+batch_id, samples = generate_safe_random_initials(1000)
 
 config = LivingFlowConfig(
     pf_states = pf_states,
     flat_pos = flat_pos,
     edges = edges,
     initials = samples,
-    epochs = 50,          # 🔥 however many you want
-    batch_size = 5,       # 🔥 however many you want
+    epochs = 250,          # 🔥 however many you want
+    batch_size = 1000,       # 🔥 however many you want
     rollout_steps = 100,   # 🔥 steps of evolution
     model_id = batch_id
 )
