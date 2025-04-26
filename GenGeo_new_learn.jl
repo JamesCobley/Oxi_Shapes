@@ -415,3 +415,137 @@ function record_flow_trace!(
         action_cost
     )
 end
+
+# ============================================================================
+# Define the IMAGINARY Model & Differentiable Complex Flow (GeoFlow)
+# ============================================================================
+
+@kwdef mutable struct ComplexField
+    real::Vector{Float32}       # Real occupancy (ρ)
+    imag::Vector{Float32}       # Imagined prediction (geometry)
+    memory::Vector{Float32}     # Memory/history of real (learning trace)
+end
+
+function init_complex_field_from_graph(real::Vector{Float32}, geo::GeoGraphStruct)
+    degree_vec = vec(sum(geo.adjacency, dims=2))
+    memory = degree_vec ./ sum(degree_vec)
+    imag = zeros(Float32, length(real))
+    return ComplexField(real, imag, memory)
+end
+
+"Compute normalized recall weights from memory and R(x) curvature"
+function recall_weights(field::ComplexField, R_vals::Vector{Float32})
+    W = field.memory .+ R_vals
+    W = exp.(W .- maximum(W))  # softmax form
+    return W ./ sum(W)
+end
+
+"Define local per-node λ based on curvature and memory-imag divergence"
+function dynamic_lambda(field::ComplexField, R_vals::Vector{Float32})
+    Δ = field.imag .- field.memory
+    λ = [1.0f0 / (1.0f0 + exp(R_vals[i] * abs(Δi))) for (i, Δi) in enumerate(Δ)]
+    return λ
+end
+
+"Update imaginary prediction with local λ modulation"
+function updated_imaginary_field(field::ComplexField, geo::GeoGraphStruct)
+    _, R_vals, _, _ = update_geometry_from_rho(field.real, geo)
+    λ_vec = dynamic_lambda(field, R_vals)
+    W = recall_weights(field, R_vals)
+
+    raw = [(1f0 - λ_vec[i]) * field.imag[i] + λ_vec[i] * W[i] for i in 1:length(field.imag)]
+    clamped = max.(raw, 0.0f0)
+    imag_new = clamped ./ sum(clamped)
+
+    return imag_new, λ_vec
+end
+
+"Memory evolves based on averaging with the real field"
+function updated_memory_field(field::ComplexField)
+    mixed = (field.memory .+ field.real) ./ 2f0
+    return mixed ./ sum(mixed)
+end
+
+"Main complex evolution — predicts next imaginary state"
+function evolve_complex_field(field::ComplexField, geo::GeoGraphStruct)
+    imag_new, λ_vec = updated_imaginary_field(field, geo)
+    mem_new = updated_memory_field(field)
+    return ComplexField(field.real, imag_new, mem_new), λ_vec
+end
+
+# ============================================================================
+# Complex Flow Prediction from FlowTrace (learning context)
+# ============================================================================
+
+"""
+Initialize a ComplexField using the first state from a FlowTrace.
+"""
+function init_complex_field_from_flowtrace(flow::FlowTrace)
+    real = flow.ρ_series[1]
+    memory = real ./ sum(real)
+    imag = zeros(Float32, length(real))
+    return ComplexField(real, imag, memory)
+end
+
+"""
+Compute mean squared error between imaginary prediction and real next step.
+"""
+function shape_prediction_loss(imag::Vector{Float32}, real_next::Vector{Float32})
+    return mean((imag .- real_next).^2)
+end
+
+"""
+Evolve complex field using timepoint t from FlowTrace.
+Returns: (updated field, imaginary prediction, loss, lambda vector)
+"""
+function evolve_complex_from_flowtrace(
+    field::ComplexField,
+    flow::FlowTrace,
+    t::Int,
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}}
+)
+    field.real = flow.ρ_series[t]
+    real_next = flow.ρ_series[t+1]
+
+    geo = build_GeoGraphStruct(field.real, pf_states, flat_pos, edges)
+    R_vals = flow.R_series[t]  # use stored R(x)
+
+    λ_vec = dynamic_lambda(field, R_vals)
+    W = recall_weights(field.memory, R_vals)
+
+    raw = [(1f0 - λ_vec[i]) * field.imag[i] + λ_vec[i] * W[i] for i in 1:length(field.imag)]
+    imag_new = max.(raw, 0.0f0)
+    imag_new ./= sum(imag_new)
+
+    mem_new = (field.memory .+ field.real) ./ 2f0
+    mem_new ./= sum(mem_new)
+
+    loss = shape_prediction_loss(imag_new, real_next)
+
+    updated_field = ComplexField(field.real, imag_new, mem_new)
+    return updated_field, imag_new, loss, λ_vec
+end
+
+# ============================================================================
+# Random Initial Generator with UUIDs
+# ============================================================================
+
+function generate_safe_random_initials(n::Int; min_val=0.0f0)
+    batch_id = "batch_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
+    samples = []
+
+    while length(samples) < n
+        vec = rand(Float32, 8)
+        norm_vec = vec / sum(vec)
+        is_safe = all(x -> x ≥ min_val || isapprox(x, 0.0f0; atol=1e-8f0), norm_vec)
+
+        if is_safe
+            sample_id = uuid4()
+            push!(samples, (uuid=sample_id, rho=norm_vec))
+        end
+    end
+
+    return batch_id, samples
+end
