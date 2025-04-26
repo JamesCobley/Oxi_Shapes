@@ -435,7 +435,6 @@ end
 # ============================================================================
 # Initialization
 # ============================================================================
-
 function init_living_field_simplex(real::Vector{Float32}, adjacency::SparseMatrixCSC{Float32, Int})
     n = length(real)
 
@@ -450,7 +449,7 @@ function init_living_field_simplex(real::Vector{Float32}, adjacency::SparseMatri
     for i in 1:n
         for j in findnz(adjacency[i, :])[2]
             if i < j
-                tensions[(i, j)] = 0.01f0
+                tensions[(i, j)] = 0.0f0  # 🌟 no initial tension
             end
         end
     end
@@ -464,7 +463,7 @@ function init_living_field_simplex(real::Vector{Float32}, adjacency::SparseMatri
         curvature_confidence,
         adjacency,
         tensions,
-        copy(real)  # 🌟 prev_real initialized as copy
+        copy(real)
     )
 end
 
@@ -503,12 +502,13 @@ function update_imaginary_field!(field::LivingFieldSimplex)
     normalize!(field.imag)
 end
 
-"Update simplex tensions based on curvature differences."
+"Update simplex tensions based on real-imag mismatch."
 function update_tensions!(field::LivingFieldSimplex)
-    for ((i, j), tension) in field.simplex_tensions
-        curvature_diff = abs(field.curvature_memory[i] - field.curvature_memory[j])
-        tension_update = 0.01f0 * curvature_diff
-        field.simplex_tensions[(i, j)] = clamp(tension + tension_update, 0.0f0, 1.0f0)
+    for ((i, j), _) in field.simplex_tensions
+        diff_i = abs(field.real[i] - field.imag[i])
+        diff_j = abs(field.real[j] - field.imag[j])
+        tension = (diff_i + diff_j) / 2f0
+        field.simplex_tensions[(i, j)] = clamp(tension, 0.0f0, 1.0f0)
     end
 end
 
@@ -525,7 +525,6 @@ function update_curvature_memory!(field::LivingFieldSimplex)
     end
 end
 
-
 "Simple normalization helper."
 function normalize!(v::Vector{Float32})
     total = sum(v)
@@ -534,43 +533,52 @@ function normalize!(v::Vector{Float32})
     end
 end
 
-"Update confidences based on stability and prediction quality."
+"Update confidences dynamically based on local tensions and activity."
 function update_confidences!(field::LivingFieldSimplex)
-    η_real = 0.01f0         # learning rate for real confidence
-    η_imag = 0.01f0         # learning rate for imag confidence
-    η_curvature = 0.005f0   # learning rate for curvature confidence
-
     for i in eachindex(field.real)
-        # --- Real Stability
-        Δ_real = abs(field.real[i] - field.prev_real[i])
-        if Δ_real < 0.01f0
-            field.real_confidence[i] += η_real * (1.0f0 - field.real_confidence[i])
-        else
-            field.real_confidence[i] -= η_real * field.real_confidence[i]
-        end
-
-        # --- Imaginary Match
-        Δ_imag = abs(field.imag[i] - field.real[i])
-        if Δ_imag < 0.02f0
-            field.imag_confidence[i] += η_imag * (1.0f0 - field.imag_confidence[i])
-        else
-            field.imag_confidence[i] -= η_imag * field.imag_confidence[i]
-        end
-
-        # --- Curvature Stability
         neighbors = get_neighbors(field.adjacency, i)
-        if !isempty(neighbors)
-            local_curvature = mean(abs.(field.real[i] .- field.real[neighbors]))
-            Δ_curv = abs(field.curvature_memory[i] - local_curvature)
-            if Δ_curv < 0.02f0
-                field.curvature_confidence[i] += η_curvature * (1.0f0 - field.curvature_confidence[i])
-            else
-                field.curvature_confidence[i] -= η_curvature * field.curvature_confidence[i]
-            end
+        if isempty(neighbors)
+            continue
+        end
+
+        # Average local tension (based on simplex tensions)
+        local_tensions = Float32[]
+        for j in neighbors
+            sorted_pair = sort(collect((i, j)))
+            push!(local_tensions, get(field.simplex_tensions, (sorted_pair[1], sorted_pair[2]), 0.0f0))
+        end
+        avg_tension = isempty(local_tensions) ? 0.0f0 : mean(local_tensions)
+
+        # --- Real Confidence
+        Δ_real = abs(field.real[i] - field.prev_real[i])
+        tension_boost_real = 1.0f0 - exp(-10f0 * avg_tension)
+        if Δ_real < 0.01f0
+            field.real_confidence[i] += tension_boost_real * (1.0f0 - field.real_confidence[i])
+        else
+            field.real_confidence[i] -= tension_boost_real * field.real_confidence[i]
+        end
+
+        # --- Imaginary Confidence
+        Δ_imag = abs(field.imag[i] - field.real[i])
+        tension_boost_imag = 1.0f0 - exp(-10f0 * avg_tension)
+        if Δ_imag < 0.02f0
+            field.imag_confidence[i] += tension_boost_imag * (1.0f0 - field.imag_confidence[i])
+        else
+            field.imag_confidence[i] -= tension_boost_imag * field.imag_confidence[i]
+        end
+
+        # --- Curvature Confidence
+        local_curvature = mean(abs.(field.real[i] .- field.real[neighbors]))
+        Δ_curv = abs(field.curvature_memory[i] - local_curvature)
+        tension_boost_curv = 1.0f0 - exp(-10f0 * avg_tension)
+        if Δ_curv < 0.02f0
+            field.curvature_confidence[i] += tension_boost_curv * (1.0f0 - field.curvature_confidence[i])
+        else
+            field.curvature_confidence[i] -= tension_boost_curv * field.curvature_confidence[i]
         end
     end
 
-    # Clamp confidences to [0,1]
+    # Clamp all confidences between [0,1]
     field.real_confidence .= clamp.(field.real_confidence, 0.0f0, 1.0f0)
     field.imag_confidence .= clamp.(field.imag_confidence, 0.0f0, 1.0f0)
     field.curvature_confidence .= clamp.(field.curvature_confidence, 0.0f0, 1.0f0)
