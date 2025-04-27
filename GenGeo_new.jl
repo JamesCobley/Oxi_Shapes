@@ -582,78 +582,86 @@ function run_living_geobrain_rollout!(
 end
 
 # ============================================================================
-# Function to rollout
+# Master Trainer for the GeoBrain Model
 # ============================================================================
 
-struct LivingGeoBrainConfig
+mutable struct LivingFlowConfig
     pf_states::Vector{String}
     flat_pos::Dict{String, Tuple{Float64, Float64}}
     edges::Vector{Tuple{String, String}}
-    initials::Vector{NamedTuple}  # each (uuid, rho)
+    initials::Vector{NamedTuple}
     epochs::Int
     batch_size::Int
     rollout_steps::Int
+    max_moves_real::Int
+    max_moves_imag::Int
     model_id::String
 end
 
-function train_living_geobrain_model(config::LivingGeoBrainConfig)
-    training_trace = []
-    mse_epoch_history = Float32[]
+function train_geobrain_model(config::LivingFlowConfig)
+    println("🌟 Starting GeoBrain Training with model ID: $(config.model_id)")
 
+    # === Prepare adjacency ===
+    g = SimpleDiGraph(length(config.pf_states))
+    idx_map = Dict(s => i for (i, s) in enumerate(config.pf_states))
+    for (u, v) in config.edges
+        add_edge!(g, idx_map[u], idx_map[v])
+    end
+    adjacency = Float32.(adjacency_matrix(g))
+
+    # === Initialize Memory Simplex ===
     geobrain = GeoBrainMemory()
 
-    for epoch in 1:config.epochs
-        batch_mse = Float32[]
+    # === Track all rollouts
+    all_training_traces = []
 
-        for (uuid, rho0) in config.initials
-            # Initialize fields
-            field = init_living_field_simplex(rho0, sparse(config.edges))
+    # === Training Loop ===
+    for (sample_idx, initial) in enumerate(config.initials)
+        println("🧠 Training Sample: $(sample_idx) / $(length(config.initials))")
+        
+        field = init_living_field_simplex(initial.rho, adjacency)
 
-            # Run the real+imagined rollout
-            run_living_geobrain_rollout!(
-                field,
-                config.pf_states,
-                config.flat_pos,
-                config.edges,
-                config.rollout_steps,
-                geobrain;
-                max_moves_real=10,
-                max_moves_imag=10
-            )
+        single_trace = []
 
-            # Track loss for this sample (MSE real vs imag after rollout)
-            mse = mean((field.real .- field.imag).^2)
-            push!(batch_mse, mse)
+        for step in 1:config.rollout_steps
+            # --- Real evolution
+            oxi_shapes_alive!(field.real, config.pf_states, config.flat_pos, config.edges; max_moves=config.max_moves_real)
+
+            # --- Imaginary evolution
+            evolve_imagination!(field.imag, config.pf_states, config.flat_pos, config.edges; max_moves=config.max_moves_imag)
+
+            # --- Lambda computation
+            λ = compute_lambda(field.real, field.imag)
+
+            # --- GeoBrain update
+            update_geobrain!(geobrain, copy(field.real), copy(field.imag), λ)
+
+            # --- Trace
+            push!(single_trace, (real=copy(field.real), imag=copy(field.imag), λ=λ))
         end
 
-        push!(mse_epoch_history, mean(batch_mse))
-        println("Epoch $epoch | MSE = $(mean(batch_mse))")
+        push!(all_training_traces, single_trace)
     end
 
-    return training_trace, mse_epoch_history, geobrain
+    return geobrain, all_training_traces
 end
 
-batch_id, samples = generate_safe_random_initials(1000)
+batch_id, samples = generate_safe_random_initials(100)
 
-config = LivingGeoBrainConfig(
+config = LivingFlowConfig(
     pf_states = pf_states,
     flat_pos = flat_pos,
     edges = edges,
     initials = samples,
-    epochs = 250,
-    batch_size = 1000,
-    rollout_steps = 100,
+    epochs = 1,         # (not needed anymore actually! rollout_steps counts)
+    batch_size = 100,   
+    rollout_steps = 100,  
+    max_moves_real = 10,
+    max_moves_imag = 10,
     model_id = batch_id
 )
 
-training_trace, mse_epoch_history, geobrain = train_living_geobrain_model(config)
 
-global_metadata = Dict(
-    "run_id" => config.model_id,
-    "config" => config,
-    "training_trace" => training_trace,
-    "mse_epoch_history" => mse_epoch_history
-)
+geobrain, training_traces = train_geobrain_model(config)
 
-@save "living_field_$(config.model_id).bson" global_metadata
-@save "brain_snapshot.bson" geobrain
+@save "geobrain_model_$(config.model_id).bson" geobrain training_traces
