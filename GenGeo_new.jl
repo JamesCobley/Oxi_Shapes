@@ -438,3 +438,56 @@ function generate_safe_random_initials(n::Int; min_val=0.0f0)
     return batch_id, samples
 end
 
+# ============================================================================
+# Define LivingFieldSimplex (Core Memory Manifold)
+# ============================================================================
+
+mutable struct LivingFieldSimplex
+    real::Vector{Float32}
+    imag::Vector{Float32}
+    curvature_memory::Vector{Float32}
+    real_confidence::Vector{Float32}
+    imag_confidence::Vector{Float32}
+    curvature_confidence::Vector{Float32}
+    adjacency::SparseMatrixCSC{Float32, Int}
+    simplex_tensions::Dict{Tuple{Int,Int}, Float32}
+    prev_real::Vector{Float32}  # 🌟 new field: store previous real field
+end
+
+# ============================================================================
+# Initialization
+# ============================================================================
+function init_living_field_simplex(real::Vector{Float32}, adjacency::SparseMatrixCSC{Float32, Int})
+    n = length(real)
+
+    imag = zeros(Float32, n)
+    curvature_memory = zeros(Float32, n)
+
+    real_confidence = ones(Float32, n)
+    imag_confidence = zeros(Float32, n)
+    curvature_confidence = zeros(Float32, n)
+
+    tensions = Dict{Tuple{Int, Int}, Float32}()
+    for i in 1:n
+        for j in findnz(adjacency[i, :])[2]
+            if i < j
+                tensions[(i, j)] = 0.0f0  # 🌟 no initial tension
+            end
+        end
+    end
+
+    return LivingFieldSimplex(
+        real,
+        imag,
+        curvature_memory,
+        real_confidence,
+        imag_confidence,
+        curvature_confidence,
+        adjacency,
+        tensions,
+        copy(real)
+    )
+end
+
+
+
