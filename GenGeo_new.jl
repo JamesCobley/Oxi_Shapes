@@ -581,7 +581,79 @@ function run_living_geobrain_rollout!(
     end
 end
 
+# ============================================================================
+# Function to rollout
+# ============================================================================
 
+struct LivingGeoBrainConfig
+    pf_states::Vector{String}
+    flat_pos::Dict{String, Tuple{Float64, Float64}}
+    edges::Vector{Tuple{String, String}}
+    initials::Vector{NamedTuple}  # each (uuid, rho)
+    epochs::Int
+    batch_size::Int
+    rollout_steps::Int
+    model_id::String
+end
 
+function train_living_geobrain_model(config::LivingGeoBrainConfig)
+    training_trace = []
+    mse_epoch_history = Float32[]
 
+    geobrain = GeoBrainMemory()
 
+    for epoch in 1:config.epochs
+        batch_mse = Float32[]
+
+        for (uuid, rho0) in config.initials
+            # Initialize fields
+            field = init_living_field_simplex(rho0, sparse(config.edges))
+
+            # Run the real+imagined rollout
+            run_living_geobrain_rollout!(
+                field,
+                config.pf_states,
+                config.flat_pos,
+                config.edges,
+                config.rollout_steps,
+                geobrain;
+                max_moves_real=10,
+                max_moves_imag=10
+            )
+
+            # Track loss for this sample (MSE real vs imag after rollout)
+            mse = mean((field.real .- field.imag).^2)
+            push!(batch_mse, mse)
+        end
+
+        push!(mse_epoch_history, mean(batch_mse))
+        println("Epoch $epoch | MSE = $(mean(batch_mse))")
+    end
+
+    return training_trace, mse_epoch_history, geobrain
+end
+
+batch_id, samples = generate_safe_random_initials(1000)
+
+config = LivingGeoBrainConfig(
+    pf_states = pf_states,
+    flat_pos = flat_pos,
+    edges = edges,
+    initials = samples,
+    epochs = 250,
+    batch_size = 1000,
+    rollout_steps = 100,
+    model_id = batch_id
+)
+
+training_trace, mse_epoch_history, geobrain = train_living_geobrain_model(config)
+
+global_metadata = Dict(
+    "run_id" => config.model_id,
+    "config" => config,
+    "training_trace" => training_trace,
+    "mse_epoch_history" => mse_epoch_history
+)
+
+@save "living_field_$(config.model_id).bson" global_metadata
+@save "brain_snapshot.bson" geobrain
