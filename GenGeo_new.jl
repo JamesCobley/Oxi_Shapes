@@ -578,7 +578,6 @@ function run_living_geobrain_rollout!(
         # 4. GEO BRAIN: Update geobrain memory if imagination was good
         update_geobrain!(geobrain, field.prev_real, field.imag, λ; lambda_threshold=lambda_threshold)
 
-        # 🌟 No more tensions, confidences, curvature update needed!
     end
 end
 
