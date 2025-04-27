@@ -439,55 +439,150 @@ function generate_safe_random_initials(n::Int; min_val=0.0f0)
 end
 
 # ============================================================================
-# Define LivingFieldSimplex (Core Memory Manifold)
+# Define the Imagined Oxi-Shape and Update it 
 # ============================================================================
 
-mutable struct LivingFieldSimplex
-    real::Vector{Float32}
-    imag::Vector{Float32}
-    curvature_memory::Vector{Float32}
-    real_confidence::Vector{Float32}
-    imag_confidence::Vector{Float32}
-    curvature_confidence::Vector{Float32}
-    adjacency::SparseMatrixCSC{Float32, Int}
-    simplex_tensions::Dict{Tuple{Int,Int}, Float32}
-    prev_real::Vector{Float32}  # 🌟 new field: store previous real field
+"Build the geometric structure for the imagined field."
+function build_imaginary_geometry(field::LivingFieldSimplex, pf_states, flat_pos, edges)
+    ρ_imag = copy(field.imag)  # Get the current imagined field
+    return build_GeoGraphStruct(ρ_imag, pf_states, flat_pos, edges)
 end
 
-# ============================================================================
-# Initialization
-# ============================================================================
-function init_living_field_simplex(real::Vector{Float32}, adjacency::SparseMatrixCSC{Float32, Int})
-    n = length(real)
+function evolve_imagination!(
+    imag::Vector{Float32},
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    max_moves::Int = 10
+)
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    neighbor_indices = Dict(s => Int[] for s in pf_states)
+    for (u, v) in edges
+        push!(neighbor_indices[u], idx[v])
+        push!(neighbor_indices[v], idx[u])
+    end
 
-    imag = zeros(Float32, n)
-    curvature_memory = zeros(Float32, n)
+    # Integer molecule approximation
+    counts = round.(Int, imag .* 100)
+    counts[end] = 100 - sum(counts[1:end-1])
+    imag .= Float32.(counts) ./ 100
 
-    real_confidence = ones(Float32, n)
-    imag_confidence = zeros(Float32, n)
-    curvature_confidence = zeros(Float32, n)
+    points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(imag, build_GeoGraphStruct(imag, pf_states, flat_pos, edges))
 
-    tensions = Dict{Tuple{Int, Int}, Float32}()
-    for i in 1:n
-        for j in findnz(adjacency[i, :])[2]
-            if i < j
-                tensions[(i, j)] = 0.0f0  # 🌟 no initial tension
-            end
+    inflow = zeros(Float32, length(pf_states))
+    outflow = zeros(Float32, length(pf_states))
+
+    total_moves = max_moves  # ← fully deterministic number of moves!
+
+    candidate_indices = findall(x -> x > 0, counts)
+
+    for _ in 1:total_moves
+        isempty(candidate_indices) && break
+        i = findmin(R_vals[candidate_indices])[2]  # minimal Ricci deviation
+        i = candidate_indices[i]
+        s = pf_states[i]
+        nbrs = neighbor_indices[s]
+        isempty(nbrs) && continue
+
+        # Deterministic move: choose neighbor minimizing curvature cost
+        best_j = argmin([compute_entropy_cost(i, j, R_vals, pf_states) for j in nbrs])
+        chosen = nbrs[best_j]
+
+        inflow[chosen] += 0.01f0
+        outflow[i] += 0.01f0
+    end
+
+    for i in eachindex(pf_states)
+        inflow[i] += (counts[i] / 100.0f0) - outflow[i]
+    end
+
+    # Clamp and normalize
+    inflow .= max.(inflow, 0.0f0)
+    if sum(inflow) > 0.0f0
+        inflow ./= sum(inflow)
+    end
+
+    for i in eachindex(inflow)
+        if inflow[i] > 0.0f0 && inflow[i] < 0.01f0
+            inflow[i] = 0.01f0
         end
     end
 
-    return LivingFieldSimplex(
-        real,
-        imag,
-        curvature_memory,
-        real_confidence,
-        imag_confidence,
-        curvature_confidence,
-        adjacency,
-        tensions,
-        copy(real)
-    )
+    inflow .= max.(inflow, 0.0f0)
+    inflow ./= sum(inflow)
+    imag .= inflow
 end
+
+# ============================================================================
+# GeoBrain: The Living Memory Simplex
+# ============================================================================
+
+mutable struct GeoBrainMemory
+    memory_keys::Vector{Vector{Float32}}  # Stored priors (shape signatures)
+    memory_values::Vector{Vector{Float32}} # Associated imagined outputs
+    memory_scores::Vector{Float32}         # Scores (lambda-driven convergence values)
+
+    function GeoBrainMemory()
+        new(Vector{Vector{Float32}}(), Vector{Vector{Float32}}(), Vector{Float32}())
+    end
+end
+
+"Compute lambda divergence between real and imagined fields."
+function compute_lambda(real::Vector{Float32}, imag::Vector{Float32})
+    return mean(abs.(real .- imag))
+end
+
+"Update GeoBrain memory based on the latest experience."
+function update_geobrain!(geobrain::GeoBrainMemory, 
+                           prior_signature::Vector{Float32}, 
+                           imagined_update::Vector{Float32}, 
+                           lambda_divergence::Float32; 
+                           lambda_threshold=0.2f0)
+
+    if lambda_divergence < lambda_threshold
+        # Good prediction: Store it
+        push!(geobrain.memory_keys, copy(prior_signature))
+        push!(geobrain.memory_values, copy(imagined_update))
+        push!(geobrain.memory_scores, 1.0f0 - lambda_divergence)  # The smaller divergence, the stronger the score
+    end
+end
+
+# ============================================================================
+# Function to integrate
+# ============================================================================
+
+function run_living_geobrain_rollout!(
+    field::LivingFieldSimplex,
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    T::Int,                         # Number of time steps
+    geobrain::GeoBrainMemory;
+    max_moves_real=10,
+    max_moves_imag=10,
+    lambda_threshold=0.2f0
+)
+    for t in 1:T
+        # Save previous real field
+        copy!(field.prev_real, field.real)
+
+        # 1. REAL WORLD: Update the real field using alive mechanics
+        oxi_shapes_alive!(field.real, pf_states, flat_pos, edges; max_moves=max_moves_real)
+
+        # 2. IMAGINED WORLD: Update the imagination field deterministically
+        evolve_imagination!(field.imag, pf_states, flat_pos, edges, max_moves_imag)
+
+        # 3. LAMBDA: Compute divergence between real and imagined
+        λ = compute_lambda(field.real, field.imag)
+
+        # 4. GEO BRAIN: Update geobrain memory if imagination was good
+        update_geobrain!(geobrain, field.prev_real, field.imag, λ; lambda_threshold=lambda_threshold)
+
+        # 🌟 No more tensions, confidences, curvature update needed!
+    end
+end
+
+
 
 
 
