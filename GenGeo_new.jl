@@ -439,121 +439,59 @@ function generate_safe_random_initials(n::Int; min_val=0.0f0)
 end
 
 # ============================================================================
-# Define the Imagined Oxi-Shape and Update it 
+# Define the Living Simplex Tensor (Geometric Brain Core)
 # ============================================================================
 
-"Build the geometric structure for the imagined field."
-function build_imaginary_geometry(field::LivingFieldSimplex, pf_states, flat_pos, edges)
-    ρ_imag = copy(field.imag)  # Get the current imagined field
-    return build_GeoGraphStruct(ρ_imag, pf_states, flat_pos, edges)
+mutable struct LivingSimplexTensor
+    real::Vector{Float32}             # Current real field (ρ_real)
+    imag::Vector{Float32}             # Current imagined field (ρ_imag)
+    prev_real::Vector{Float32}         # Previous real field (for λ computation)
+    curvature::Vector{Float32}         # Current Ricci/Dirichlet curvature at nodes
+    curvature_memory::Vector{Float32}  # Moving average of past curvatures
+    adjacency::SparseMatrixCSC{Float32, Int} # Adjacency graph (sparse)
+    shape_tensor::Dict{Tuple{Int, Int}, Float32}  # Tension memory
 end
 
-"Single evolution step of a candidate imagination."
-function evolve_imagination_single!(
-    imag::Vector{Float32},
-    pf_states::Vector{String},
-    flat_pos::Dict{String, Tuple{Float64, Float64}},
-    edges::Vector{Tuple{String, String}},
-    moves::Int
-)
-    idx = Dict(s => i for (i, s) in enumerate(pf_states))
-    neighbor_indices = Dict(s => Int[] for s in pf_states)
-    for (u, v) in edges
-        push!(neighbor_indices[u], idx[v])
-        push!(neighbor_indices[v], idx[u])
-    end
+"Initialize a LivingSimplexTensor from real field and adjacency."
+function init_living_field_simplex(real::Vector{Float32}, adjacency::Matrix{Float32})
+    sparse_adj = sparse(adjacency)  # Convert to SparseMatrixCSC
+    return init_living_simplex_tensor(real, sparse_adj)
+end
 
-    counts = round.(Int, imag .* 100)
-    counts[end] = 100 - sum(counts[1:end-1])
-    imag .= Float32.(counts) ./ 100
+function init_living_simplex_tensor(real::Vector{Float32}, adjacency::SparseMatrixCSC{Float32, Int})
+    n = length(real)
+    imag = zeros(Float32, n)
+    prev_real = copy(real)
+    curvature = zeros(Float32, n)
+    curvature_memory = zeros(Float32, n)
 
-    points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(
-        imag, build_GeoGraphStruct(imag, pf_states, flat_pos, edges)
-    )
-
-    inflow = zeros(Float32, length(pf_states))
-    outflow = zeros(Float32, length(pf_states))
-
-    candidate_indices = findall(x -> x > 0, counts)
-
-    for _ in 1:moves
-        isempty(candidate_indices) && break
-        i = findmin(R_vals[candidate_indices])[2]
-        i = candidate_indices[i]
-        s = pf_states[i]
-        nbrs = neighbor_indices[s]
-        isempty(nbrs) && continue
-
-        best_j = argmin([compute_entropy_cost(i, j, R_vals, pf_states) for j in nbrs])
-        chosen = nbrs[best_j]
-
-        inflow[chosen] += 0.01f0
-        outflow[i] += 0.01f0
-    end
-
-    for i in eachindex(pf_states)
-        inflow[i] += (counts[i] / 100.0f0) - outflow[i]
-    end
-
-    inflow .= max.(inflow, 0.0f0)
-    if sum(inflow) > 0.0f0
-        inflow ./= sum(inflow)
-    end
-
-    for i in eachindex(inflow)
-        if inflow[i] > 0.0f0 && inflow[i] < 0.01f0
-            inflow[i] = 0.01f0
+    shape_tensor = Dict{Tuple{Int, Int}, Float32}()
+    for i in 1:n
+        for j in findnz(adjacency[i, :])[2]
+            if i < j
+                shape_tensor[(i, j)] = 0.0f0
+            end
         end
     end
 
-    inflow .= max.(inflow, 0.0f0)
-    inflow ./= sum(inflow)
-    imag .= inflow
+    return LivingSimplexTensor(
+        real, imag, prev_real, curvature, curvature_memory, adjacency, shape_tensor
+    )
 end
 
-"Generate multiple imagination candidates based on structured and random strategies."
-function structured_imagination_candidates(
-    field::LivingFieldSimplex,
-    pf_states::Vector{String},
-    flat_pos::Dict{String, Tuple{Float64, Float64}},
-    edges::Vector{Tuple{String, String}},
-    max_moves::Int
-)
-    move_fractions = [0.0, 1.0, 0.5]
-    n_random_candidates = 2
+function update_simplex_tensor!(simplex::LivingSimplexTensor, flat_pos, pf_states, edges)
+    geo = build_GeoGraphStruct(simplex.real, pf_states, flat_pos, edges)
+    simplex.curvature .= geo.R_vals
 
-    candidates = Vector{Vector{Float32}}()
+    α = 0.9f0
+    simplex.curvature_memory .= α .* simplex.curvature_memory .+ (1.0f0 - α) .* simplex.curvature
 
-    # --- Structured candidates
-    for fraction in move_fractions
-        candidate = copy(field.imag)
-        moves = Int(round(fraction * max_moves))
-        evolve_imagination_single!(candidate, pf_states, flat_pos, edges, moves)
-        push!(candidates, candidate)
-    end
-
-    # --- Random exploration candidates
-    for _ in 1:n_random_candidates
-        candidate = copy(field.imag)
-        moves = rand(1:max_moves)
-        evolve_imagination_single!(candidate, pf_states, flat_pos, edges, moves)
-        push!(candidates, candidate)
-    end
-
-    return candidates
-end
-
-# ============================================================================
-# GeoBrain: The Living Memory Simplex
-# ============================================================================
-
-mutable struct GeoBrainMemory
-    memory_keys::Vector{Vector{Float32}}  # Stored priors (shape signatures)
-    memory_values::Vector{Vector{Float32}} # Associated imagined outputs
-    memory_scores::Vector{Float32}         # Scores (lambda-driven convergence values)
-
-    function GeoBrainMemory()
-        new(Vector{Vector{Float32}}(), Vector{Vector{Float32}}(), Vector{Float32}())
+    idx_map = Dict(s => i for (i, s) in enumerate(pf_states))
+    for (u, v) in edges
+        i, j = idx_map[u], idx_map[v]
+        key = (min(i, j), max(i, j))
+        tension_update = abs(simplex.real[i] - simplex.real[j])
+        simplex.shape_tensor[key] = 0.9f0 * get(simplex.shape_tensor, key, 0.0f0) + 0.1f0 * tension_update
     end
 end
 
@@ -605,6 +543,108 @@ function recall_from_geobrain(
     end
 end
 
+"Build the geometric structure of the imagined manifold from the field vector."
+function build_imaginary_geometry(imag::Vector{Float32}, pf_states, flat_pos, edges)
+    return build_GeoGraphStruct(imag, pf_states, flat_pos, edges)
+end
+"Single evolution step of a candidate imagination on the manifold."
+function evolve_imagination_single!(
+    imag::Vector{Float32},
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    moves::Int
+)
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    neighbor_indices = Dict(s => Int[] for s in pf_states)
+    for (u, v) in edges
+        push!(neighbor_indices[u], idx[v])
+        push!(neighbor_indices[v], idx[u])
+    end
+
+    counts = round.(Int, imag .* 100)
+    counts[end] = 100 - sum(counts[1:end-1])
+    imag .= Float32.(counts) ./ 100
+
+    # 🧠 Build the temporary imagined manifold
+    geo = build_imaginary_geometry(imag, pf_states, flat_pos, edges)
+
+    points3D = geo.points3D
+    R_vals = geo.R_vals
+    anisotropy_vals = geo.anisotropy
+
+    inflow = zeros(Float32, length(pf_states))
+    outflow = zeros(Float32, length(pf_states))
+
+    candidate_indices = findall(x -> x > 0, counts)
+
+    for _ in 1:moves
+        isempty(candidate_indices) && break
+        i = findmin(R_vals[candidate_indices])[2]
+        i = candidate_indices[i]
+        s = pf_states[i]
+        nbrs = neighbor_indices[s]
+        isempty(nbrs) && continue
+
+        best_j = argmin([compute_entropy_cost(i, j, R_vals, pf_states) for j in nbrs])
+        chosen = nbrs[best_j]
+
+        inflow[chosen] += 0.01f0
+        outflow[i] += 0.01f0
+    end
+
+    for i in eachindex(pf_states)
+        inflow[i] += (counts[i] / 100.0f0) - outflow[i]
+    end
+
+    inflow .= max.(inflow, 0.0f0)
+    if sum(inflow) > 0.0f0
+        inflow ./= sum(inflow)
+    end
+
+    for i in eachindex(inflow)
+        if inflow[i] > 0.0f0 && inflow[i] < 0.01f0
+            inflow[i] = 0.01f0
+        end
+    end
+
+    inflow .= max.(inflow, 0.0f0)
+    inflow ./= sum(inflow)
+    imag .= inflow
+end
+
+"Generate multiple imagination candidates based on structured and random strategies."
+function structured_imagination_candidates(
+    imag::Vector{Float32},
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    max_moves::Int
+)
+    move_fractions = [0.0, 1.0, 0.5]
+    n_random_candidates = 2
+
+    candidates = Vector{Vector{Float32}}()
+
+    # --- Structured candidates (no memory, logical pathways)
+    for fraction in move_fractions
+        candidate = copy(imag)
+        moves = Int(round(fraction * max_moves))
+        evolve_imagination_single!(candidate, pf_states, flat_pos, edges, moves)
+        push!(candidates, candidate)
+    end
+
+    # --- Random exploration candidates (noisy imagination)
+    for _ in 1:n_random_candidates
+        candidate = copy(imag)
+        moves = rand(1:max_moves)
+        evolve_imagination_single!(candidate, pf_states, flat_pos, edges, moves)
+        push!(candidates, candidate)
+    end
+
+    return candidates
+end
+
 # ============================================================================
 # Run the Living GeoBrain Rollout (Core Evolution Loop)
 # ============================================================================
@@ -618,7 +658,6 @@ samples_fixed = [(s.uuid, s.rho) for s in samples]
     flat_pos::Dict{String, Tuple{Float64, Float64}}
     edges::Vector{Tuple{String, String}}
     initials::Vector{Tuple{UUID, Vector{Float32}}}
-    epochs::Int
     batch_size::Int
     rollout_steps::Int
     model_id::String
@@ -631,84 +670,9 @@ config = LivingFlowConfig2(
     flat_pos = flat_pos,
     edges = edges,
     initials = samples_fixed,
-    epochs = 250,
     batch_size = 1000,
     rollout_steps = 100,
     model_id = batch_id,
     max_moves_real = 10,
     max_moves_imag = 10
 )
-
-# ============================================================================
-# --- Define all needed functions ---
-# ============================================================================
-
-"Run real+imaginary evolution over T steps and update GeoBrain."
-function run_living_geobrain_rollout!(
-    field::LivingFieldSimplex,
-    pf_states::Vector{String},
-    flat_pos::Dict{String, Tuple{Float64, Float64}},
-    edges::Vector{Tuple{String, String}},
-    T::Int,
-    geobrain::GeoBrainMemory;
-    max_moves_real=10,
-    max_moves_imag=10,
-    lambda_threshold=0.2f0
-)
-    for t in 1:T
-        copy!(field.prev_real, field.real)
-        oxi_shapes_alive!(field.real, pf_states, flat_pos, edges; max_moves=max_moves_real)
-        evolve_imagination_with_geobrain!(field, pf_states, flat_pos, edges, geobrain; max_moves=max_moves_imag)
-        λ = compute_lambda(field.real, field.imag)
-        update_geobrain!(geobrain, field.prev_real, field.imag, λ; lambda_threshold=lambda_threshold)
-    end
-end
-
-"Train the GeoBrain model across many initial conditions."
-function train_geobrain_model(config::LivingFlowConfig2)
-    println("🌟 Starting GeoBrain Training with model ID: $(config.model_id)")
-    g = SimpleDiGraph(length(config.pf_states))
-    idx_map = Dict(s => i for (i, s) in enumerate(config.pf_states))
-    for (u, v) in config.edges
-        add_edge!(g, idx_map[u], idx_map[v])
-    end
-    adjacency = Float32.(adjacency_matrix(g))
-    geobrain = GeoBrainMemory()
-    all_training_traces = []
-
-    for (sample_idx, initial) in enumerate(config.initials)
-        println("🧠 Training Sample: $(sample_idx) / $(length(config.initials))")
-        field = init_living_field_simplex(initial[2], adjacency)
-        run_living_geobrain_rollout!(
-            field, config.pf_states, config.flat_pos, config.edges, config.rollout_steps, geobrain;
-            max_moves_real=config.max_moves_real,
-            max_moves_imag=config.max_moves_imag,
-            lambda_threshold=0.2f0
-        )
-        push!(all_training_traces, (final_real=copy(field.real), final_imag=copy(field.imag)))
-    end
-
-    return geobrain, all_training_traces
-end
-
-"Save outputs after training."
-function save_geobrain_training_outputs(config::LivingFlowConfig2, geobrain::GeoBrainMemory, all_training_traces)
-    global_metadata = Dict(
-        "run_id" => config.model_id,
-        "config" => config,
-        "geobrain" => geobrain,
-        "training_traces" => all_training_traces
-    )
-    @save "geobrain_model_$(config.model_id).bson" global_metadata
-    println("💾 GeoBrain model and traces saved successfully under ID: $(config.model_id)")
-end
-
-# ============================================================================
-# --- Full Execution ---
-# ============================================================================
-
-geobrain, all_training_traces = train_geobrain_model(config)
-
-save_geobrain_training_outputs(config, geobrain, all_training_traces)
-
-println("🌟 Full GeoBrain training and save complete.")
