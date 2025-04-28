@@ -645,6 +645,50 @@ function structured_imagination_candidates(
     return candidates
 end
 
+"Use GeoBrain recall + structured imagination to evolve the imagination field."
+function evolve_imagination_with_geobrain!(
+    field::LivingSimplexTensor,
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    geobrain::GeoBrainMemory;
+    max_moves::Int = 10
+)
+    prior = copy(field.imag)
+    recalled = recall_from_geobrain(geobrain, prior; threshold=0.2f0)
+
+    candidates = Vector{Vector{Float32}}()
+
+    if isnothing(recalled)
+        # No memory found → structured + random imaginations
+        candidates = structured_imagination_candidates(prior, pf_states, flat_pos, edges, max_moves)
+    else
+        # Memory found → start from memory and generate 2 new randoms
+        push!(candidates, recalled)
+        for _ in 1:2
+            candidate = copy(prior)
+            moves = rand(1:max_moves)
+            evolve_imagination_single!(candidate, pf_states, flat_pos, edges, moves)
+            push!(candidates, candidate)
+        end
+    end
+
+    # Choose best imagined update according to lambda divergence
+    best_candidate = candidates[1]
+    best_lambda = compute_lambda(field.real, best_candidate)
+
+    for candidate in candidates[2:end]
+        λ = compute_lambda(field.real, candidate)
+        if λ < best_lambda
+            best_lambda = λ
+            best_candidate = candidate
+        end
+    end
+
+    # Update the imagined field
+    copy!(field.imag, best_candidate)
+end
+
 # ============================================================================
 # Run the Living GeoBrain Rollout (Core Evolution Loop)
 # ============================================================================
