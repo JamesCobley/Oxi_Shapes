@@ -613,20 +613,83 @@ function evolve_imagination_single!(
     imag .= inflow
 end
 
+"Generate an imagination candidate that tries to reduce tension and curvature anomalies."
+function evolve_tensor_guided_imagination!(
+    imag::Vector{Float32},
+    simplex::LivingSimplexTensor,
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    moves::Int
+)
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    neighbor_indices = Dict(s => Int[] for s in pf_states)
+    for (u, v) in edges
+        push!(neighbor_indices[u], idx[v])
+        push!(neighbor_indices[v], idx[u])
+    end
+
+    counts = round.(Int, imag .* 100)
+    counts[end] = 100 - sum(counts[1:end-1])
+    imag .= Float32.(counts) ./ 100
+
+    inflow = zeros(Float32, length(pf_states))
+    outflow = zeros(Float32, length(pf_states))
+
+    candidate_indices = findall(x -> x > 0, counts)
+
+    for _ in 1:moves
+        isempty(candidate_indices) && break
+        # Prioritize nodes with high tension
+        node_tensions = [sum(abs(simplex.shape_tensor[(min(i, j), max(i, j))]) for j in neighbor_indices[pf_states[i]]) for i in candidate_indices]
+        i = candidate_indices[argmax(node_tensions)]
+        s = pf_states[i]
+        nbrs = neighbor_indices[s]
+        isempty(nbrs) && continue
+
+        # Among neighbors, prefer ones that reduce tension
+        best_j = argmin([simplex.curvature_memory[j] for j in nbrs])
+        chosen = nbrs[best_j]
+
+        inflow[chosen] += 0.01f0
+        outflow[i] += 0.01f0
+    end
+
+    for i in eachindex(pf_states)
+        inflow[i] += (counts[i] / 100.0f0) - outflow[i]
+    end
+
+    inflow .= max.(inflow, 0.0f0)
+    if sum(inflow) > 0.0f0
+        inflow ./= sum(inflow)
+    end
+
+    for i in eachindex(inflow)
+        if inflow[i] > 0.0f0 && inflow[i] < 0.01f0
+            inflow[i] = 0.01f0
+        end
+    end
+
+    inflow .= max.(inflow, 0.0f0)
+    inflow ./= sum(inflow)
+    imag .= inflow
+end
+
 "Generate multiple imagination candidates based on structured and random strategies."
 function structured_imagination_candidates(
     imag::Vector{Float32},
+    simplex::LivingSimplexTensor,
     pf_states::Vector{String},
     flat_pos::Dict{String, Tuple{Float64, Float64}},
     edges::Vector{Tuple{String, String}},
     max_moves::Int
 )
-    move_fractions = [0.0, 1.0, 0.5]
-    n_random_candidates = 2
+    move_fractions = [0.0, 1.0, 0.2, 0.4, 0.6, 0.8]
+    n_random_candidates = 4
 
     candidates = Vector{Vector{Float32}}()
 
-    # --- Structured candidates (no memory, logical pathways)
+    # --- Structured candidates
     for fraction in move_fractions
         candidate = copy(imag)
         moves = Int(round(fraction * max_moves))
@@ -634,7 +697,12 @@ function structured_imagination_candidates(
         push!(candidates, candidate)
     end
 
-    # --- Random exploration candidates (noisy imagination)
+    # --- Tensor-guided imagination
+    tensor_candidate = copy(imag)
+    evolve_tensor_guided_imagination!(tensor_candidate, simplex, pf_states, flat_pos, edges, max_moves)
+    push!(candidates, tensor_candidate)
+
+    # --- Random exploration candidates
     for _ in 1:n_random_candidates
         candidate = copy(imag)
         moves = rand(1:max_moves)
