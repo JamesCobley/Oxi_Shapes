@@ -577,61 +577,122 @@ function update_geobrain!(geobrain::GeoBrainMemory,
     end
 end
 
+"Recall a past imagined update from the GeoBrain if close prior is found."
+function recall_from_geobrain(
+    geobrain::GeoBrainMemory,
+    current_prior::Vector{Float32};
+    threshold::Float32 = 0.2f0
+)
+    if isempty(geobrain.memory_keys)
+        return nothing
+    end
+
+    best_match_idx = nothing
+    best_divergence = Inf
+
+    for (i, stored_prior) in enumerate(geobrain.memory_keys)
+        divergence = mean(abs.(current_prior .- stored_prior))
+        if divergence < threshold && divergence < best_divergence
+            best_match_idx = i
+            best_divergence = divergence
+        end
+    end
+
+    if isnothing(best_match_idx)
+        return nothing
+    else
+        return geobrain.memory_values[best_match_idx]
+    end
+end
+
 # ============================================================================
-# Function to integrate
+# Run the Living GeoBrain Rollout (Core Evolution Loop)
 # ============================================================================
 
+# --- Generate config ---
+batch_id, samples = generate_safe_random_initials(1000)
+samples_fixed = [(s.uuid, s.rho) for s in samples]
+
+@kwdef struct LivingFlowConfig2
+    pf_states::Vector{String}
+    flat_pos::Dict{String, Tuple{Float64, Float64}}
+    edges::Vector{Tuple{String, String}}
+    initials::Vector{Tuple{UUID, Vector{Float32}}}
+    epochs::Int
+    batch_size::Int
+    rollout_steps::Int
+    model_id::String
+    max_moves_real::Int
+    max_moves_imag::Int
+end
+
+config = LivingFlowConfig2(
+    pf_states = pf_states,
+    flat_pos = flat_pos,
+    edges = edges,
+    initials = samples_fixed,
+    epochs = 250,
+    batch_size = 1000,
+    rollout_steps = 100,
+    model_id = batch_id,
+    max_moves_real = 10,
+    max_moves_imag = 10
+)
+
+# ============================================================================
+# --- Full execution ---
+# ============================================================================
+
+geobrain, all_training_traces = train_geobrain_model(config)
+
+save_geobrain_training_outputs(config, geobrain, all_training_traces)
+
+"Run real+imaginary evolution over T steps and update GeoBrain."
 function run_living_geobrain_rollout!(
     field::LivingFieldSimplex,
     pf_states::Vector{String},
     flat_pos::Dict{String, Tuple{Float64, Float64}},
     edges::Vector{Tuple{String, String}},
-    T::Int,                         # Number of time steps
+    T::Int,
     geobrain::GeoBrainMemory;
     max_moves_real=10,
     max_moves_imag=10,
     lambda_threshold=0.2f0
 )
     for t in 1:T
-        # Save previous real field
+        # 1. Save previous real field
         copy!(field.prev_real, field.real)
 
-        # 1. REAL WORLD: Update the real field using alive mechanics
+        # 2. REAL WORLD: Update the real field
         oxi_shapes_alive!(field.real, pf_states, flat_pos, edges; max_moves=max_moves_real)
 
-        # 2. IMAGINED WORLD: Update the imagination field deterministically
-        evolve_imagination!(field.imag, pf_states, flat_pos, edges, max_moves_imag)
+        # 3. IMAGINED WORLD: Hybrid imagination using memory if available
+        evolve_imagination_with_geobrain!(
+            field,
+            pf_states,
+            flat_pos,
+            edges,
+            geobrain;
+            max_moves=max_moves_imag
+        )
 
-        # 3. LAMBDA: Compute divergence between real and imagined
+        # 4. Compute divergence
         λ = compute_lambda(field.real, field.imag)
 
-        # 4. GEO BRAIN: Update geobrain memory if imagination was good
+        # 5. Update GeoBrain memory
         update_geobrain!(geobrain, field.prev_real, field.imag, λ; lambda_threshold=lambda_threshold)
-
     end
 end
 
 # ============================================================================
-# Master Trainer for the GeoBrain Model
+# Train the GeoBrain Model
 # ============================================================================
 
-mutable struct LivingFlowConfig
-    pf_states::Vector{String}
-    flat_pos::Dict{String, Tuple{Float64, Float64}}
-    edges::Vector{Tuple{String, String}}
-    initials::Vector{NamedTuple}
-    epochs::Int
-    batch_size::Int
-    rollout_steps::Int
-    max_moves_real::Int
-    max_moves_imag::Int
-    model_id::String
-end
-
-function train_geobrain_model(config::LivingFlowConfig)
+"Train the GeoBrain model across many initial conditions."
+function train_geobrain_model(config::LivingFlowConfig2)
     println("🌟 Starting GeoBrain Training with model ID: $(config.model_id)")
 
-    # === Prepare adjacency ===
+    # Build initial adjacency structure
     g = SimpleDiGraph(length(config.pf_states))
     idx_map = Dict(s => i for (i, s) in enumerate(config.pf_states))
     for (u, v) in config.edges
@@ -639,59 +700,55 @@ function train_geobrain_model(config::LivingFlowConfig)
     end
     adjacency = Float32.(adjacency_matrix(g))
 
-    # === Initialize Memory Simplex ===
     geobrain = GeoBrainMemory()
 
-    # === Track all rollouts
     all_training_traces = []
 
-    # === Training Loop ===
     for (sample_idx, initial) in enumerate(config.initials)
         println("🧠 Training Sample: $(sample_idx) / $(length(config.initials))")
-        
-        field = init_living_field_simplex(initial.rho, adjacency)
 
-        single_trace = []
+        field = init_living_field_simplex(initial[2], adjacency)  # initial[2] is rho
 
-        for step in 1:config.rollout_steps
-            # --- Real evolution
-            oxi_shapes_alive!(field.real, config.pf_states, config.flat_pos, config.edges; max_moves=config.max_moves_real)
+        run_living_geobrain_rollout!(
+            field,
+            config.pf_states,
+            config.flat_pos,
+            config.edges,
+            config.rollout_steps,
+            geobrain;
+            max_moves_real=config.max_moves_real,
+            max_moves_imag=config.max_moves_imag,
+            lambda_threshold=0.2f0
+        )
 
-            # --- Imaginary evolution
-            evolve_imagination!(field.imag, config.pf_states, config.flat_pos, config.edges; max_moves=config.max_moves_imag)
-
-            # --- Lambda computation
-            λ = compute_lambda(field.real, field.imag)
-
-            # --- GeoBrain update
-            update_geobrain!(geobrain, copy(field.real), copy(field.imag), λ)
-
-            # --- Trace
-            push!(single_trace, (real=copy(field.real), imag=copy(field.imag), λ=λ))
-        end
-
-        push!(all_training_traces, single_trace)
+        push!(all_training_traces, (final_real=copy(field.real), final_imag=copy(field.imag)))
     end
 
     return geobrain, all_training_traces
 end
 
-batch_id, samples = generate_safe_random_initials(100)
+# ============================================================================
+# Save Outputs Cleanly
+# ============================================================================
 
-config = LivingFlowConfig(
-    pf_states = pf_states,
-    flat_pos = flat_pos,
-    edges = edges,
-    initials = samples,
-    epochs = 1,         # (not needed anymore actually! rollout_steps counts)
-    batch_size = 100,   
-    rollout_steps = 100,  
-    max_moves_real = 10,
-    max_moves_imag = 10,
-    model_id = batch_id
-)
+function save_geobrain_training_outputs(config::LivingFlowConfig2, geobrain::GeoBrainMemory, all_training_traces)
+    global_metadata = Dict(
+        "run_id" => config.model_id,
+        "config" => config,
+        "geobrain" => geobrain,
+        "training_traces" => all_training_traces
+    )
 
+    @save "geobrain_model_$(config.model_id).bson" global_metadata
+    println("💾 GeoBrain model and traces saved successfully under ID: $(config.model_id)")
+end
 
-geobrain, training_traces = train_geobrain_model(config)
+# ============================================================================
+# Full Execution
+# ============================================================================
 
-@save "geobrain_model_$(config.model_id).bson" geobrain training_traces
+# ---(Assuming you already generated config properly)---
+
+geobrain, all_training_traces = train_geobrain_model(config)
+
+save_geobrain_training_outputs(config, geobrain, all_training_traces)
