@@ -690,6 +690,23 @@ function evolve_imagination_with_geobrain!(
 end
 
 # ============================================================================
+# Lambda Trend Helper
+# ============================================================================
+
+function compute_lambda_trend(lambda_series)
+    n = length(lambda_series)
+    x = collect(1:n)
+    x_mean = mean(x)
+    y_mean = mean(lambda_series)
+
+    numerator = sum((xi - x_mean)*(yi - y_mean) for (xi, yi) in zip(x, lambda_series))
+    denominator = sum((xi - x_mean)^2 for xi in x)
+
+    slope = numerator / denominator
+    return slope
+end
+
+# ============================================================================
 # Run the Living GeoBrain Rollout (Core Evolution Loop)
 # ============================================================================
 
@@ -755,9 +772,12 @@ function run_living_geobrain_rollout!(
     end
 end
 
-"Train the GeoBrain model across many initial conditions."
-function train_geobrain_model(config::LivingFlowConfig2)
+"Train the GeoBrain model across many initial conditions, tracking λ trends and memory growth."
+function train_geobrain_model_with_lambda_tracking(config::LivingFlowConfig2)
+
     println("🌟 Starting GeoBrain Training with model ID: $(config.model_id)")
+
+    # --- Setup adjacency
     g = SimpleDiGraph(length(config.pf_states))
     idx_map = Dict(s => i for (i, s) in enumerate(config.pf_states))
     for (u, v) in config.edges
@@ -767,27 +787,57 @@ function train_geobrain_model(config::LivingFlowConfig2)
 
     geobrain = GeoBrainMemory()
     all_training_traces = []
+    training_log = []
 
     for (sample_idx, initial) in enumerate(config.initials)
+
         println("🧠 Training Sample: $(sample_idx) / $(length(config.initials))")
+
         field = init_living_field_simplex(initial[2], adjacency)
 
-        run_living_geobrain_rollout!(
-            field,
-            config.pf_states,
-            config.flat_pos,
-            config.edges,
-            config.rollout_steps,
-            geobrain;
-            max_moves_real=config.max_moves_real,
-            max_moves_imag=config.max_moves_imag,
-            lambda_threshold=0.2f0
-        )
+        lambda_series = Float32[]
+        memories_before = length(geobrain.memory_keys)
+        recall_counter = 0
+
+        # --- Rollout
+        for t in 1:config.rollout_steps
+            copy!(field.prev_real, field.real)
+            oxi_shapes_alive!(field.real, config.pf_states, config.flat_pos, config.edges; max_moves=config.max_moves_real)
+            evolve_imagination_with_geobrain!(field, config.pf_states, config.flat_pos, config.edges, geobrain; max_moves=config.max_moves_imag)
+
+            λ = compute_lambda(field.real, field.imag)
+            push!(lambda_series, λ)
+
+            update_geobrain!(geobrain, field.prev_real, field.imag, λ; lambda_threshold=0.2f0)
+        end
+
+        # --- Post-run stats
+        λ_start = lambda_series[1]
+        λ_end = lambda_series[end]
+        λ_mean = mean(lambda_series)
+        λ_trend = compute_lambda_trend(lambda_series)
+
+        memories_after = length(geobrain.memory_keys)
+        memories_saved = memories_after - memories_before
 
         push!(all_training_traces, (final_real=copy(field.real), final_imag=copy(field.imag)))
+
+        # --- Log
+        run_log = Dict(
+            "sample_idx" => sample_idx,
+            "λ_start" => λ_start,
+            "λ_end" => λ_end,
+            "λ_mean" => λ_mean,
+            "λ_trend" => λ_trend,
+            "memories_saved" => memories_saved
+        )
+        push!(training_log, run_log)
+
+        # --- Print live monitoring
+        println("📈 λ_start: $(round(λ_start, digits=5)) | λ_end: $(round(λ_end, digits=5)) | mean λ: $(round(λ_mean, digits=5)) | trend: $(round(λ_trend, digits=5)) | memories saved: $(memories_saved)")
     end
 
-    return geobrain, all_training_traces
+    return geobrain, all_training_traces, training_log
 end
 
 "Save outputs after training."
@@ -802,6 +852,10 @@ function save_geobrain_training_outputs(config::LivingFlowConfig2, geobrain::Geo
     println("💾 GeoBrain model and traces saved successfully under ID: $(config.model_id)")
 end
 
-# --- Full Execution ---
-geobrain, all_training_traces = train_geobrain_model(config)
+geobrain, all_training_traces, training_log = train_geobrain_model_with_lambda_tracking(config)
+
 save_geobrain_training_outputs(config, geobrain, all_training_traces)
+
+@save "training_log_$(config.model_id).bson" training_log
+
+println("🌟 Full GeoBrain training complete with lambda tracking.")
