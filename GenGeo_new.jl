@@ -448,12 +448,13 @@ function build_imaginary_geometry(field::LivingFieldSimplex, pf_states, flat_pos
     return build_GeoGraphStruct(ρ_imag, pf_states, flat_pos, edges)
 end
 
-function evolve_imagination!(
+"Single evolution step of a candidate imagination."
+function evolve_imagination_single!(
     imag::Vector{Float32},
     pf_states::Vector{String},
     flat_pos::Dict{String, Tuple{Float64, Float64}},
     edges::Vector{Tuple{String, String}},
-    max_moves::Int = 10
+    moves::Int
 )
     idx = Dict(s => i for (i, s) in enumerate(pf_states))
     neighbor_indices = Dict(s => Int[] for s in pf_states)
@@ -462,29 +463,27 @@ function evolve_imagination!(
         push!(neighbor_indices[v], idx[u])
     end
 
-    # Integer molecule approximation
     counts = round.(Int, imag .* 100)
     counts[end] = 100 - sum(counts[1:end-1])
     imag .= Float32.(counts) ./ 100
 
-    points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(imag, build_GeoGraphStruct(imag, pf_states, flat_pos, edges))
+    points3D, R_vals, C_R_vals, anisotropy_vals = update_geometry_from_rho(
+        imag, build_GeoGraphStruct(imag, pf_states, flat_pos, edges)
+    )
 
     inflow = zeros(Float32, length(pf_states))
     outflow = zeros(Float32, length(pf_states))
 
-    total_moves = max_moves  # ← fully deterministic number of moves!
-
     candidate_indices = findall(x -> x > 0, counts)
 
-    for _ in 1:total_moves
+    for _ in 1:moves
         isempty(candidate_indices) && break
-        i = findmin(R_vals[candidate_indices])[2]  # minimal Ricci deviation
+        i = findmin(R_vals[candidate_indices])[2]
         i = candidate_indices[i]
         s = pf_states[i]
         nbrs = neighbor_indices[s]
         isempty(nbrs) && continue
 
-        # Deterministic move: choose neighbor minimizing curvature cost
         best_j = argmin([compute_entropy_cost(i, j, R_vals, pf_states) for j in nbrs])
         chosen = nbrs[best_j]
 
@@ -496,7 +495,6 @@ function evolve_imagination!(
         inflow[i] += (counts[i] / 100.0f0) - outflow[i]
     end
 
-    # Clamp and normalize
     inflow .= max.(inflow, 0.0f0)
     if sum(inflow) > 0.0f0
         inflow ./= sum(inflow)
@@ -511,6 +509,38 @@ function evolve_imagination!(
     inflow .= max.(inflow, 0.0f0)
     inflow ./= sum(inflow)
     imag .= inflow
+end
+
+"Generate multiple imagination candidates based on structured and random strategies."
+function structured_imagination_candidates(
+    field::LivingFieldSimplex,
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    max_moves::Int
+)
+    move_fractions = [0.0, 1.0, 0.5]
+    n_random_candidates = 2
+
+    candidates = Vector{Vector{Float32}}()
+
+    # --- Structured candidates
+    for fraction in move_fractions
+        candidate = copy(field.imag)
+        moves = Int(round(fraction * max_moves))
+        evolve_imagination_single!(candidate, pf_states, flat_pos, edges, moves)
+        push!(candidates, candidate)
+    end
+
+    # --- Random exploration candidates
+    for _ in 1:n_random_candidates
+        candidate = copy(field.imag)
+        moves = rand(1:max_moves)
+        evolve_imagination_single!(candidate, pf_states, flat_pos, edges, moves)
+        push!(candidates, candidate)
+    end
+
+    return candidates
 end
 
 # ============================================================================
@@ -533,10 +563,10 @@ function compute_lambda(real::Vector{Float32}, imag::Vector{Float32})
 end
 
 "Update GeoBrain memory based on the latest experience."
-function update_geobrain!(geobrain::GeoBrainMemory, 
-                           prior_signature::Vector{Float32}, 
-                           imagined_update::Vector{Float32}, 
-                           lambda_divergence::Float32; 
+function update_geobrain!(geobrain::GeoBrainMemory,
+                           prior_signature::Vector{Float32},
+                           imagined_update::Vector{Float32},
+                           lambda_divergence::Float32;
                            lambda_threshold=0.2f0)
 
     if lambda_divergence < lambda_threshold
