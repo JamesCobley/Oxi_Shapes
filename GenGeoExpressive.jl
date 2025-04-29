@@ -235,6 +235,240 @@ struct GeoNode
 end
 
 # =============================================================================
+# Module 2: Simplex Construction and Flow
+# =============================================================================
+
+# =============================================================================
+# 1. Real-Flow (Oxi-Shapes Alive)
+# =============================================================================
+
+"""
+    init_alive_buffers!(G, bitcounts)
+
+Pre-allocate counts, inflow, outflow, and degeneracy penalties.
+"""
+function init_alive_buffers!(G::GeoGraphReal, bitcounts::Vector{Int})
+    n = G.n
+    counts = Vector{Int}(undef, n)
+    inflow_int = zeros(Int, n)
+    outflow_int = zeros(Int, n)
+    R_total = length(bitcounts)
+    binom = Dict(k => binomial(R_total, k) for k in 0:R_total)
+    deg_pen = Float32[1f0/binom[bitcounts[i]] for i in 1:n]
+    return (counts=counts, inflow_int=inflow_int, outflow_int=outflow_int, deg_pen=deg_pen)
+end
+
+"""
+    oxi_shapes_alive!(ρ, G, buffers; max_moves)
+
+Discrete-count stochastic flow; updates ρ in-place according to real flow rules.
+"""
+function oxi_shapes_alive!(ρ::Vector{Float32}, G::GeoGraphReal, buffers; max_moves::Int=10)
+    n = G.n; counts = buffers.counts
+    @inbounds for i in 1:n counts[i] = round(Int, ρ[i]*100) end
+    counts[n] = 100 - sum(counts[1:n-1])
+
+    update_real_geometry!(G, ρ)
+
+    fill!(buffers.inflow_int, 0); fill!(buffers.outflow_int, 0)
+    total_moves = rand(0:max_moves)
+    nonzero = findall(>(0), counts)
+
+    for _ in 1:total_moves
+        isempty(nonzero) && break
+        i = rand(nonzero); nbrs = G.neighbors[i]
+        isempty(nbrs) && continue
+
+        wsum = 0f0; ws = Float32[]; push!(ws, 0f0)
+        for j in nbrs
+            ΔS = 0.1f0 + 0.01f0 + abs(G.R_vals[j]) + buffers.deg_pen[j]
+            Δf = exp(counts[i]/100) - G.R_vals[i] + ΔS
+            w = exp(-Δf) * exp(-G.anisotropy[j]); wsum += w; push!(ws, w)
+        end
+        wsum < 1e-8f0 && continue
+
+        r = rand() * wsum; cum = 0f0; chosen = nbrs[1]
+        for (k, j) in enumerate(nbrs)
+            cum += ws[k+1]
+            if cum >= r
+                chosen = j
+                break
+            end
+        end
+
+        buffers.inflow_int[chosen] += 1
+        buffers.outflow_int[i] += 1
+
+        if counts[i] - buffers.outflow_int[i] == 0
+            deleteat!(nonzero, findfirst(==(i), nonzero))
+        end
+        if counts[chosen] + buffers.inflow_int[chosen] == 1
+            push!(nonzero, chosen)
+        end
+    end
+
+    @inbounds for i in 1:n
+        counts[i] += buffers.inflow_int[i] - buffers.outflow_int[i]
+        ρ[i] = counts[i] / 100f0
+    end
+
+    return ρ
+end
+
+# =============================================================================
+# 2. Imagination Pipeline
+# =============================================================================
+
+struct LivingSimplexTensor
+    real::Vector{Float32}
+    imag::Vector{Float32}
+end
+
+init_living_simplex_tensor(ρ0::Vector{Float32}) = 
+    LivingSimplexTensor(copy(ρ0), copy(ρ0))
+
+build_imagined_manifold!(field::LivingSimplexTensor, G::GeoGraphReal) = 
+    update_real_geometry!(G, field.imag)
+
+function evolve_imagination_single_counts!(field::LivingSimplexTensor, G::GeoGraphReal, buffers; moves::Int=10)
+    counts = buffers.counts
+    @inbounds for i in 1:G.n counts[i] = round(Int, field.imag[i]*100) end
+    counts[G.n] = 100 - sum(counts[1:G.n-1])
+
+    update_real_geometry!(G, field.imag)
+
+    fill!(buffers.inflow_int, 0); fill!(buffers.outflow_int, 0)
+    nmoves = rand(0:moves)
+    nonzero = findall(>(0), counts)
+
+    for _ in 1:nmoves
+        isempty(nonzero) && break
+        i = nonzero[argmax(G.R_vals[nonzero])]; nbrs = G.neighbors[i]
+        isempty(nbrs) && continue
+
+        best_j, bc = nbrs[1], Inf
+        for j in nbrs
+            ΔS = 0.1f0 + 0.01f0 + abs(G.R_vals[j]) + buffers.deg_pen[j]
+            Δf = exp(counts[i]/100) - G.R_vals[i] + ΔS
+            if Δf < bc
+                bc, best_j = Δf, j
+            end
+        end
+
+        buffers.inflow_int[best_j] += 1
+        buffers.outflow_int[i] += 1
+
+        if counts[i] - buffers.outflow_int[i] == 0
+            deleteat!(nonzero, findfirst(==(i), nonzero))
+        end
+        if counts[best_j] + buffers.inflow_int[best_j] == 1
+            push!(nonzero, best_j)
+        end
+    end
+
+    @inbounds for i in 1:G.n
+        counts[i] += buffers.inflow_int[i] - buffers.outflow_int[i]
+        field.imag[i] = counts[i] / 100f0
+    end
+
+    return field.imag
+end
+
+compute_lambda(ρ_real::Vector{Float32}, ρ_imag::Vector{Float32}) = 
+    mean(abs.(ρ_imag .- ρ_real))
+
+function step_imagination!(field::LivingSimplexTensor, G::GeoGraphReal, buffers; max_moves::Int=10)
+    build_imagined_manifold!(field, G)
+    evolve_imagination_single_counts!(field, G, buffers; moves=max_moves)
+    return compute_lambda(field.real, field.imag)
+end
+
+# =============================================================================
+# 3. Simplex Tensor (λ-Surface) Construction
+# =============================================================================
+
+"""
+    build_simplex_surface(simplex::Vector{Vector{GeoNode}}) → Matrix{Float32}
+
+Given the simplex tensor (list of GeoNode sequences per run),
+builds the λ-surface where each point is -λ.
+"""
+function build_simplex_surface(simplex::Vector{Vector{GeoNode}})
+    n_runs = length(simplex)
+    rollout_steps = maximum(length(run) for run in simplex)
+    λ_surface = fill(0f0, rollout_steps, n_runs)
+
+    for (r, run) in enumerate(simplex)
+        for (t, node) in enumerate(run)
+            λ_surface[t, r] = -node.λ
+        end
+    end
+
+    return λ_surface
+end
+
+"""
+    compute_simplex_dirichlet_energy(lambda_surface::Matrix{Float32}) → Float32
+
+Computes the total Dirichlet energy of the simplex λ-surface.
+"""
+function compute_simplex_dirichlet_energy(lambda_surface::Matrix{Float32})
+    T, R = size(lambda_surface)
+    energy = 0.0f0
+
+    for t in 1:T
+        for r in 1:R
+            if t < T
+                energy += (lambda_surface[t, r] - lambda_surface[t+1, r])^2
+            end
+            if r < R
+                energy += (lambda_surface[t, r] - lambda_surface[t, r+1])^2
+            end
+        end
+    end
+
+    return energy
+end
+
+"""
+    build_simplex_laplacian(lambda_surface::Matrix{Float32}) → Matrix{Float32}
+
+Builds the graph Laplacian over the Simplex surface grid.
+"""
+function build_simplex_laplacian(lambda_surface::Matrix{Float32})
+    T, R = size(lambda_surface)
+    n = T * R
+    W = zeros(Float32, n, n)
+
+    for t in 1:T
+        for r in 1:R
+            idx = (t-1)*R + r
+            if t < T
+                W[idx, idx+R] = 1.0f0
+                W[idx+R, idx] = 1.0f0
+            end
+            if r < R
+                W[idx, idx+1] = 1.0f0
+                W[idx+1, idx] = 1.0f0
+            end
+        end
+    end
+
+    D = Diagonal(sum(W, dims=2))
+    L = D - W
+
+    return L
+end
+
+
+
+
+
+
+
+
+
+# =============================================================================
 # Real-Flow (Oxi-Shapes Alive)
 # =============================================================================
 """
