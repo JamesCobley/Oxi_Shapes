@@ -13,7 +13,7 @@ using BSON: @save, @load
 using Dates
 
 # =============================================================================
-# 0. Graph Manifold Construction
+# Graph Manifold Construction
 # =============================================================================
 struct GeoGraphReal
     n::Int
@@ -85,7 +85,7 @@ function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32})
 end
 
 # =============================================================================
-# 1. Real-Flow (Oxi-Shapes Alive)
+# Real-Flow (Oxi-Shapes Alive)
 # =============================================================================
 """
 init_alive_buffers!(G, bitcounts)
@@ -147,31 +147,19 @@ function oxi_shapes_alive!(ρ::Vector{Float32}, G::GeoGraphReal, buffers;
 end
 
 # =============================================================================
-# 2. Imagination Pipeline
+# Imagination Pipeline
 # =============================================================================
 struct LivingSimplexTensor
     real::Vector{Float32}
     imag::Vector{Float32}
 end
 
-"""
-init_living_simplex_tensor(ρ0)
-Initialize real & imag fields.
-"""
 init_living_simplex_tensor(ρ0::Vector{Float32}) =
     LivingSimplexTensor(copy(ρ0), copy(ρ0))
 
-"""
-build_imagined_manifold!(field,G)
-Update G geometry based on imag.
-"""
 build_imagined_manifold!(field::LivingSimplexTensor, G::GeoGraphReal) =
     update_real_geometry!(G, field.imag)
 
-"""
-evolve_imagination_single_counts!(field,G,buffers;moves)
-Deterministic moves on imag counts.
-"""
 function evolve_imagination_single_counts!(field::LivingSimplexTensor,
                                          G::GeoGraphReal,
                                          buffers;
@@ -207,17 +195,9 @@ function evolve_imagination_single_counts!(field::LivingSimplexTensor,
     return field.imag
 end
 
-"""
-compute_lambda(r,i)
-Mean absolute difference.
-"""
 compute_lambda(ρ_real::Vector{Float32}, ρ_imag::Vector{Float32}) =
     mean(abs.(ρ_imag .- ρ_real))
 
-"""
-step_imagination!(field,G,buffers)
-One imag step, returns λ.
-"""
 function step_imagination!(field::LivingSimplexTensor,
                            G::GeoGraphReal,
                            buffers;
@@ -225,36 +205,6 @@ function step_imagination!(field::LivingSimplexTensor,
     build_imagined_manifold!(field,G)
     evolve_imagination_single_counts!(field,G,buffers; moves=max_moves)
     return compute_lambda(field.real, field.imag)
-end
-
-# =============================================================================
-# 3. GeoNode & Simplex Storage
-# =============================================================================
-struct GeoNode
-  node_index::Int           # ← graph‐index
-  ρ_real::Vector{Float32}
-  ρ_imag::Vector{Float32}
-  R_vals::Vector{Float32}
-  anisotropy::Vector{Float32}
-  λ::Float32
-  flux::Vector{Float32}
-  action_cost::Float32
-end
-
-init_simplex(n_runs::Int) = [GeoNode[] for _ in 1:n_runs]
-
-"""
-record_geonode!(simplex,run,field,ρ,G,buffers)
-Wrap and store one GeoNode.
-"""
-function record_geonode!(simplex, run_idx, field, ρ_real, G, buffers;
-                         max_moves_imag::Int=10)
-    field.real .= ρ_real
-    λ = step_imagination!(field,G,buffers; max_moves=max_moves_imag)
-    R_im = copy(G.R_vals); a_im = copy(G.anisotropy)
-    node = GeoNode(copy(ρ_real), copy(field.imag), R_im, a_im, λ)
-    push!(simplex[run_idx], node)
-    return node
 end
 
 # =============================================================================
@@ -324,11 +274,7 @@ function on_geodesic_flags(traj::Vector{String}, path::Vector{String})
 end
 
 # --- 6) Master flow-metrics builder
-"""
-    build_flow_metrics(simplex_run, pf_states; geodesics)
 
-Given a vector of GeoNode for one run, return FlowMetrics.
-"""
 function build_flow_metrics(
     run_nodes::Vector{GeoNode},
     pf_states::Vector{String};
@@ -382,10 +328,6 @@ end
 
 init_simplex(n_runs::Int) = [GeoNode[] for _ in 1:n_runs]
 
-"""
-record_geonode!(simplex, run_idx, field, ρ_old, ρ_new, G, buffers)
-Wrap and store one GeoNode, capturing flux and action cost.
-"""
 function record_geonode!(simplex, run_idx, field, ρ_old::Vector{Float32}, ρ_new::Vector{Float32}, G::GeoGraphReal, buffers;
                          max_moves_imag::Int=10)
     # 1) Compute flux & action cost from real-flow
@@ -427,11 +369,6 @@ mutable struct MetaLambdaHypergraph
     transition_w     :: Vector{Float32}  # one per transition pattern
 end
 
-"""
-    init_meta_hypergraph(hyperedges)
-
-Create a MetaLambdaHypergraph with uniform weights over every hyperedge family.
-"""
 function init_meta_hypergraph(hyperedges::Dict)
     return MetaLambdaHypergraph(
         ones(Float32, length(hyperedges[:run])),
@@ -441,13 +378,6 @@ function init_meta_hypergraph(hyperedges::Dict)
     )
 end
 
-"""
-    update_meta_hypergraph!(ml, hyperedges, nodes, η; λ_target=0.05)
-
-Delta-rule update: for each hyperedge e in each family, compute
-    err = mean(nodes[e].λ) - λ_target
-and adjust its weight by −η * err.
-"""
 function update_meta_hypergraph!(
     ml::MetaLambdaHypergraph,
     hyperedges::Dict{Symbol, Vector{Vector{Int}}},
@@ -492,11 +422,6 @@ mutable struct MetaController
     info_potential   :: Vector{Float32}   # scalar φ per node
 end
 
-"""
-    init_meta_controller(hyperedges::Dict, G::GeoGraphReal)
-
-Initialize hyperedge weights to 1 and info_potential to zero.
-"""
 function init_meta_controller(hyperedges::Dict, G::GeoGraphReal)
     nr   = length(hyperedges[:run])
     nc   = length(hyperedges[:curvature])
@@ -590,14 +515,6 @@ end
 # Update the Information Potential from λ-errors
 # =============================================================================
 
-"""
-    update_info_potential!(ml, all_nodes, η, λ_target)
-
-Update φ(i) by averaging λ-errors over all_nodes.
-For each node:
-  Δφ = mean(λ_target - λ_observed)   # positive if λ_observed < λ_target
-  φ(i) += η * Δφ
-"""
 function update_info_potential!(
     ml::MetaController,
     all_nodes::Vector{GeoNode},
@@ -633,10 +550,6 @@ end
 
 init_simplex(n_runs::Int) = [GeoNode[] for _ in 1:n_runs]
 
-"""
-record_geonode!(simplex, run_idx, field, ρ_old, ρ_new, G, buffers)
-Wrap and store one GeoNode, capturing flux and action cost.
-"""
 function record_geonode!(simplex, run_idx, field, ρ_old::Vector{Float32}, ρ_new::Vector{Float32}, G::GeoGraphReal, buffers;
                          max_moves_imag::Int=10)
     # 1) Compute flux & action cost from real-flow
@@ -759,15 +672,6 @@ struct GeoNode
     action_cost::Float32          # primitive action cost (sum(abs(flux)))
 end
 
-"""
-    generate_safe_random_initials(n::Int, R::Int; total::Int = 100)
-
-Produce `n` random integer allocations of `total` indistinguishable molecules
-into `R` buckets (states), along with their normalized ρ vectors.
-
-Returns `(batch_id, samples)` where each sample is a NamedTuple
-(uuid, counts::Vector{Int}, rho::Vector{Float32}).
-"""
 function generate_safe_random_initials(n::Int, R::Int; total::Int = 100)
     batch_id = "batch_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
     samples = Vector{NamedTuple{(:uuid,:counts,:rho),Tuple{UUID,Vector{Int},Vector{Float32}}}}()
@@ -805,16 +709,6 @@ end
       λ_target::Float32=0.05f0,
       max_epochs::Int=100
     ) -> (ml_ctrl::MetaController, hyperedges, all_nodes)
-
-Runs epoch after epoch of:
-  1. Generating n_runs random initials of length R
-  2. For each run: real‐flow + imagination recording into `simplex`
-  3. Building the hypergraph over all recorded GeoNodes
-  4. Updating both hyperedge weights and info_potential
-  5. Checking λ‐convergence and early‐stopping
-
-Returns the final `MetaController`, the last `hyperedges` dict,
-and the flat list of all `GeoNode`s for inspection.
 
 function train_geobrain!(
     pf_states::Vector{String},
