@@ -13,7 +13,7 @@ using BSON: @save, @load
 using Dates
 
 # =============================================================================
-# Graph Manifold Construction
+# Geomtric object 1: The GeoNode = real and imagined Oxi-shape
 # =============================================================================
 struct GeoGraphReal
     n::Int
@@ -53,15 +53,55 @@ function GeoGraphReal(pf_states::Vector{String},
     return GeoGraphReal(n, fx, fy, nbrs, d0, eidx, A, pts3D, Rbuf, anis)
 end
 
-"""
-update_real_geometry!(G, ρ)
-Lift to 3D and compute curvature + anisotropy in-place.
-"""
-function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32})
+function lift_to_z_plane(rho::Vector{Float32}, pf_states, flat_pos)
+    return [Point3(Float32(flat_pos[s][1]), Float32(flat_pos[s][2]), -rho[i]) for (i, s) in enumerate(pf_states)]
+end
+
+function build_neighbor_indices(pf_states::Vector{String}, edges::Vector{Tuple{String, String}}, idx::Dict{String, Int})
+    return Dict(s => [idx[v] for (u, v) in edges if u == s] ∪ [idx[u] for (u, v) in edges if v == s] for s in pf_states)
+end
+
+function compute_anisotropy_from_curvature(
+    R_vals::Vector{Float32},
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}}
+)
+    idx = Dict(s => i for (i, s) in enumerate(pf_states))
+    neighbor_indices = build_neighbor_indices(pf_states, edges, idx)
+
+    anisotropy = map(pf_states) do s
+        i = idx[s]
+        grads = map(neighbor_indices[s]) do j
+            dx = Float32(flat_pos[s][1] - flat_pos[pf_states[j]][1])
+            dy = Float32(flat_pos[s][2] - flat_pos[pf_states[j]][2])
+            dist = sqrt(dx^2 + dy^2)
+            dist > 1f-6 ? abs(R_vals[i] - R_vals[j]) / dist : 0.0f0
+        end
+        grads_nonzero = filter(x -> x > 0, grads)
+        isempty(grads_nonzero) ? 0.0f0 : mean(grads_nonzero)
+    end
+
+    return collect(anisotropy)
+end
+
+function initialize_sheaf_stalks(flat_pos, pf_states)
+    Dict(s => [Float32(flat_pos[s][1]), Float32(flat_pos[s][2])] for s in pf_states)
+end
+
+function sheaf_consistency(stalks, edges; threshold=2.5f0)
+    [(u, v, norm(stalks[u] .- stalks[v])) for (u, v) in edges if norm(stalks[u] .- stalks[v]) > threshold]
+end
+function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32=1e-3)
+    violated = Int[]
+
+    # Step 1: z-lift from ρ to 3D points
     @inbounds for i in 1:G.n
         G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ[i])
         G.R_vals[i] = 0f0
     end
+
+    # Step 2: Compute scalar curvature R(x)
     @inbounds for i in 1:G.n
         pi = G.points3D[i]
         for (k,j) in enumerate(G.neighbors[i])
@@ -69,6 +109,8 @@ function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32})
             G.R_vals[i] += d3 - G.d0[i][k]
         end
     end
+
+    # Step 3: Compute anisotropy A(x)
     @inbounds for i in 1:G.n
         acc, cnt = 0f0, 0
         Ri = G.R_vals[i]
@@ -76,12 +118,120 @@ function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32})
             dist = G.d0[i][k]
             ΔR = abs(Ri - G.R_vals[j])
             if dist > 1e-6f0
-                acc += ΔR/dist; cnt += 1
+                acc += ΔR / dist
+                cnt += 1
             end
         end
-        G.anisotropy[i] = cnt>0 ? acc/cnt : 0f0
+        G.anisotropy[i] = cnt > 0 ? acc / cnt : 0f0
     end
-    return G
+
+    # Step 4: Sheath integrity & volume check
+    for i in 1:G.n
+        # Local volume (ρ at self + neighbors)
+        vol = ρ[i] + sum(ρ[j] for j in G.neighbors[i])
+        expected_vol = (1 + length(G.neighbors[i])) / G.n
+        vol_ok = abs(vol - expected_vol) ≤ ε
+
+        # Sheath logic (curvature must be supported by anisotropy)
+        shape_ok = abs(G.R_vals[i]) ≤ ε * (1.0f0 + G.anisotropy[i])
+
+        if !(vol_ok && shape_ok)
+            push!(violated, i)
+        end
+    end
+
+    return violated
+end
+
+function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε::Float32=1e-3)
+    violated = Int[]
+
+    # Step 1: z-lift imagined ρ to 3D points
+    @inbounds for i in 1:G.n
+        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ_imag[i])
+        G.R_vals[i] = 0f0
+    end
+
+    # Step 2: Compute curvature for imagined field
+    @inbounds for i in 1:G.n
+        pi = G.points3D[i]
+        for (k,j) in enumerate(G.neighbors[i])
+            d3 = norm(pi - G.points3D[j])
+            G.R_vals[i] += d3 - G.d0[i][k]
+        end
+    end
+
+    # Step 3: Compute anisotropy for imagined field
+    @inbounds for i in 1:G.n
+        acc, cnt = 0f0, 0
+        Ri = G.R_vals[i]
+        for (k,j) in enumerate(G.neighbors[i])
+            dist = G.d0[i][k]
+            ΔR = abs(Ri - G.R_vals[j])
+            if dist > 1e-6f0
+                acc += ΔR / dist
+                cnt += 1
+            end
+        end
+        G.anisotropy[i] = cnt > 0 ? acc / cnt : 0f0
+    end
+
+    # Step 4: Sheath stress check (optional during training)
+    # (Optional: compute sheath stress on ρ_imag)
+
+    return nothing
+end
+
+function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε::Float32=1e-3)
+    violated = Int[]
+
+    # Step 1: z-lift imagined ρ to 3D points
+    @inbounds for i in 1:G.n
+        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ_imag[i])
+        G.R_vals[i] = 0f0
+    end
+
+    # Step 2: Compute curvature for imagined field
+    @inbounds for i in 1:G.n
+        pi = G.points3D[i]
+        for (k,j) in enumerate(G.neighbors[i])
+            d3 = norm(pi - G.points3D[j])
+            G.R_vals[i] += d3 - G.d0[i][k]
+        end
+    end
+
+    # Step 3: Compute anisotropy for imagined field
+    @inbounds for i in 1:G.n
+        acc, cnt = 0f0, 0
+        Ri = G.R_vals[i]
+        for (k,j) in enumerate(G.neighbors[i])
+            dist = G.d0[i][k]
+            ΔR = abs(Ri - G.R_vals[j])
+            if dist > 1e-6f0
+                acc += ΔR / dist
+                cnt += 1
+            end
+        end
+        G.anisotropy[i] = cnt > 0 ? acc / cnt : 0f0
+    end
+
+    # Step 4: Sheath stress check (optional during training)
+    # (Optional: compute sheath stress on ρ_imag)
+
+    return nothing
+end
+
+struct GeoNode
+    ρ_real::Vector{Float32}
+    R_real::Vector{Float32}
+    A_real::Vector{Float32}
+    ρ_imag::Vector{Float32}
+    R_imag::Vector{Float32}
+    A_imag::Vector{Float32}
+    λ::Float32
+    sheath_stress::Vector{Float32}  # from imag field
+    flux::Vector{Float32}
+    action_cost::Float32
 end
 
 # =============================================================================
