@@ -858,32 +858,31 @@ struct RicciFlowMetaLambda
 end
 
 """
-    update_meta_lambda!(brain::HypergraphBrain, control::RicciFlowMetaLambda)
+    update_info_potential!(brain::HypergraphBrain, simplex::Vector{Vector{GeoNode}}; η=0.1f0)
 
-Performs one update of φ over the λ-surface based on Ricci-like smoothing.
+Layer-aware φ update: computes λ mismatch per edge group, updates φ only for members.
 """
-function update_meta_lambda!(brain::HypergraphBrain, control::RicciFlowMetaLambda)
-    φ = brain.φ
-    λ = brain.λ
-    Ψ = brain.Ψ
-    L = brain.L
+function update_info_potential!(brain::HypergraphBrain, simplex::Vector{Vector{GeoNode}};
+                                η::Float32=0.1f0)
 
-    Δφ = similar(φ)
+    nodes = reduce(vcat, simplex)
+    N = length(nodes)
+    Δφ = zeros(Float32, N)
 
-    for i in eachindex(φ)
-        # Error from target divergence (want λ to be close to λ_target)
-        λ_err = control.λ_target - λ[i]
-        
-        # Weighted contribution: curvature & entropy
-        flow_force = control.curvature_weight * Ψ[i]
-
-        # Discrete Laplacian smoothing from φ
-        laplace_term = sum(L[i,j] * φ[j] for j in 1:length(φ))
-
-        # Combine terms to get update
-        Δφ[i] = control.η * (λ_err + control.smoothing_weight * laplace_term - flow_force)
+    for (etype, edges) in brain.edge_sets
+        for edge in edges
+            λ_vals = [nodes[i].λ for i in edge]
+            avg_λ = mean(abs, λ_vals)
+            for i in edge
+                Δφ[i] += η * (avg_λ - abs(nodes[i].λ))
+            end
+        end
     end
 
-    brain.φ .= φ .+ Δφ
+    brain.φ .= brain.φ .+ Δφ
     return brain
 end
+
+
+
+
