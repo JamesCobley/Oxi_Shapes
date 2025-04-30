@@ -92,6 +92,7 @@ end
 function sheaf_consistency(stalks, edges; threshold=2.5f0)
     [(u, v, norm(stalks[u] .- stalks[v])) for (u, v) in edges if norm(stalks[u] .- stalks[v]) > threshold]
 end
+
 function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32=1e-3)
     violated = Int[]
 
@@ -141,45 +142,6 @@ function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32
     end
 
     return violated
-end
-
-function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε::Float32=1e-3)
-    violated = Int[]
-
-    # Step 1: z-lift imagined ρ to 3D points
-    @inbounds for i in 1:G.n
-        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ_imag[i])
-        G.R_vals[i] = 0f0
-    end
-
-    # Step 2: Compute curvature for imagined field
-    @inbounds for i in 1:G.n
-        pi = G.points3D[i]
-        for (k,j) in enumerate(G.neighbors[i])
-            d3 = norm(pi - G.points3D[j])
-            G.R_vals[i] += d3 - G.d0[i][k]
-        end
-    end
-
-    # Step 3: Compute anisotropy for imagined field
-    @inbounds for i in 1:G.n
-        acc, cnt = 0f0, 0
-        Ri = G.R_vals[i]
-        for (k,j) in enumerate(G.neighbors[i])
-            dist = G.d0[i][k]
-            ΔR = abs(Ri - G.R_vals[j])
-            if dist > 1e-6f0
-                acc += ΔR / dist
-                cnt += 1
-            end
-        end
-        G.anisotropy[i] = cnt > 0 ? acc / cnt : 0f0
-    end
-
-    # Step 4: Sheath stress check (optional during training)
-    # (Optional: compute sheath stress on ρ_imag)
-
-    return nothing
 end
 
 function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε::Float32=1e-3)
@@ -716,16 +678,15 @@ function generate_safe_random_initials(n::Int, R::Int; total::Int = 100)
 end
 
 # =============================================================================
-# Rollout Simulation Pipeline for a Batch with save functions
+# Simulation Configuration and Execution
 # =============================================================================
 
-# --- Define your system parameters ---
-R = 8                              # Number of protofield states
-num_initials = 100               # Number of initial distributions
-total_molecules = 100            # Total molecules per distribution
-simulation_steps = 100           # Number of time steps per simulation
+# --- Parameters ---
+num_initials = 100         # Number of initial distributions
+total_molecules = 100       # Total molecules per distribution
+simulation_steps = 100      # Number of time steps per simulation
 
-# --- Define your protofield states and spatial layout ---
+# --- Geometry & States ---
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 flat_pos = Dict(
     "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
@@ -738,11 +699,11 @@ edges = [
     ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
 ]
 
-# --- Generate and save the initials ---
-batch_id, initials = generate_safe_random_initials(num_initials, R; total=total_molecules)
+# --- Generate and Save Initials ---
+batch_id, initials = generate_safe_random_initials(num_initials, length(pf_states); total=total_molecules)
 println("✔ Generated initials for batch: $batch_id")
 
-# --- Rollout the batch and save results ---
+# --- Run Simulation ---
 flow_traces, trace_metadata, simplex = rollout_batch(batch_id, initials, pf_states, flat_pos, edges, simulation_steps)
 save_run_data(batch_id, flow_traces, trace_metadata, simplex)
 
