@@ -690,7 +690,7 @@ function record_flow_trace!(
 end
 
 # =============================================================================
-# Geometric object 3: The Hypergraph: The learning manifold 
+# Geometric object 3: The Hypergraph learning manifold
 # =============================================================================
 
 struct HypergraphBrain
@@ -701,15 +701,18 @@ struct HypergraphBrain
     λ::Vector{Float32}
     L::SparseMatrixCSC{Float32, Int}
     modes::Matrix{Float32}
+    trace_patterns::Vector{Dict{Vector{String}, Int}}
+    delta_commutators::Vector{Float32}
 end
 
-function build_hypergraph_from_simplex(simplex::Vector{Vector{GeoNode}};
+function build_hypergraph_from_simplex(simplex::Vector{Vector{GeoNode}},
+                                       trace_metadata::Vector{Dict{Symbol, Any}};
                                        curvature_bins=5,
                                        cost_bins=5,
+                                       spectral_bins=5,
                                        mode_rank=10,
                                        α=1.0f0,
-                                       β=1.0f0,
-                                       spectral_bins=5)
+                                       β=1.0f0)
 
     # 1. Flatten all nodes
     nodes = reduce(vcat, simplex)
@@ -721,20 +724,20 @@ function build_hypergraph_from_simplex(simplex::Vector{Vector{GeoNode}};
     # Action-cost hyperedges
     costs = [n.action_cost for n in nodes]
     bins_cost = StatsBase.cut(costs, cost_bins)
-    cost_groups = Dict{Int, Vector{Int}}()
-    for (i, b) in enumerate(bins_cost)
-        push!(get!(cost_groups, b, Int[]), i)
-    end
-    edge_sets[:action_cost] = collect(values(cost_groups))
+    edge_sets[:action_cost] = group_by_bins(bins_cost)
 
     # Curvature hyperedges
     curvs = [mean(n.R_real) for n in nodes]
     bins_curv = StatsBase.cut(curvs, curvature_bins)
-    curv_groups = Dict{Int, Vector{Int}}()
-    for (i, b) in enumerate(bins_curv)
-        push!(get!(curv_groups, b, Int[]), i)
-    end
-    edge_sets[:curvature] = collect(values(curv_groups))
+    edge_sets[:curvature] = group_by_bins(bins_curv)
+
+    # Delta-commutator clustering
+    deltas = [m[:delta] for m in trace_metadata]
+    bins_delta = StatsBase.cut(deltas, spectral_bins)
+    edge_sets[:delta_commutator] = group_by_bins(bins_delta)
+
+    # Recurrence pattern tags (symbolic edge types)
+    trace_patterns = [m[:patterns] for m in trace_metadata]
 
     # 3. Fields
     λ = [n.λ for n in nodes]
@@ -743,52 +746,53 @@ function build_hypergraph_from_simplex(simplex::Vector{Vector{GeoNode}};
     Ψ = [α * e + β * s for (e, s) in zip(local_energy, local_entropy)]
     φ = zeros(Float32, N)
 
-    # 4. Build Laplacian
+    # 4. Build Laplacian and spectrum
     λ_surface = build_simplex_surface(simplex)
     L = build_simplex_laplacian(λ_surface)
     evals, evecs = eigen(Matrix(L))
     modes = evecs[:, 1:min(mode_rank, size(evecs, 2))]
 
-    # 5. Add spectral binning
+    # 5. Spectral edge bins
     add_spectral_binning!(edge_sets, modes, spectral_bins)
 
-    # 6. Init uniform weights
+    # 6. Weights
     weights = Dict{Symbol, Vector{Float32}}()
     for k in keys(edge_sets)
         weights[k] = ones(Float32, length(edge_sets[k]))
     end
 
-    return HypergraphBrain(edge_sets, weights, φ, Ψ, λ, sparse(L), modes)
+    return HypergraphBrain(
+        edge_sets,
+        weights,
+        φ,
+        Ψ,
+        λ,
+        sparse(L),
+        modes,
+        trace_patterns,
+        deltas
+    )
+end
+
+function group_by_bins(binning::Vector{Int})
+    groups = Dict{Int, Vector{Int}}()
+    for (i, b) in enumerate(binning)
+        push!(get!(groups, b, Int[]), i)
+    end
+    return collect(values(groups))
 end
 
 function add_spectral_binning!(edge_sets::Dict{Symbol, Vector{Vector{Int}}},
                                modes::Matrix{Float32},
                                spectral_bins::Int)
-    # Project nodes into spectral basis (first mode_rank dimensions)
     projections = eachrow(modes)
     clusters = Dict{Int, Vector{Int}}()
-
     for (i, vec) in enumerate(projections)
-        key = round(Int, sum(vec) * spectral_bins)  # crude scalar bin
+        key = round(Int, sum(vec) * spectral_bins)
         push!(get!(clusters, key, Int[]), i)
     end
-
     edge_sets[:spectral] = collect(values(clusters))
 end
 
-function extract_lie_patterns(sequences::Vector{Vector{String}};
-                              max_window=5, min_occurrences=2)
-    pattern_counts = Dict{Vector{String}, Int}()
 
-    for seq in sequences
-        len_seq = length(seq)
-        for win in 2:max_window
-            for i in 1:(len_seq - win + 1)
-                pat = seq[i:i+win-1]
-                pattern_counts[pat] = get(pattern_counts, pat, 0) + 1
-            end
-        end
-    end
 
-    return filter(p -> p[2] ≥ min_occurrences, collect(pattern_counts))
-end
