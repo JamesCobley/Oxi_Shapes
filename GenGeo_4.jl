@@ -690,111 +690,6 @@ function record_flow_trace!(
 end
 
 # =============================================================================
-# Geometric object 3: The Hypergraph learning manifold
-# =============================================================================
-
-struct HypergraphBrain
-    edge_sets::Dict{Symbol, Vector{Vector{Int}}}
-    weights::Dict{Symbol, Vector{Float32}}
-    φ::Vector{Float32}
-    Ψ::Vector{Float32}
-    λ::Vector{Float32}
-    L::SparseMatrixCSC{Float32, Int}
-    modes::Matrix{Float32}
-    trace_patterns::Vector{Dict{Vector{String}, Int}}
-    delta_commutators::Vector{Float32}
-end
-
-function build_hypergraph_from_simplex(simplex::Vector{Vector{GeoNode}},
-                                       trace_metadata::Vector{Dict{Symbol, Any}};
-                                       curvature_bins=5,
-                                       cost_bins=5,
-                                       spectral_bins=5,
-                                       mode_rank=10,
-                                       α=1.0f0,
-                                       β=1.0f0)
-
-    # 1. Flatten all nodes
-    nodes = reduce(vcat, simplex)
-    N = length(nodes)
-
-    # 2. Build edge sets
-    edge_sets = Dict{Symbol, Vector{Vector{Int}}}()
-
-    # Action-cost hyperedges
-    costs = [n.action_cost for n in nodes]
-    bins_cost = StatsBase.cut(costs, cost_bins)
-    edge_sets[:action_cost] = group_by_bins(bins_cost)
-
-    # Curvature hyperedges
-    curvs = [mean(n.R_real) for n in nodes]
-    bins_curv = StatsBase.cut(curvs, curvature_bins)
-    edge_sets[:curvature] = group_by_bins(bins_curv)
-
-    # Delta-commutator clustering
-    deltas = [m[:delta] for m in trace_metadata]
-    bins_delta = StatsBase.cut(deltas, spectral_bins)
-    edge_sets[:delta_commutator] = group_by_bins(bins_delta)
-
-    # Recurrence pattern tags (symbolic edge types)
-    trace_patterns = [m[:patterns] for m in trace_metadata]
-
-    # 3. Fields
-    λ = [n.λ for n in nodes]
-    local_energy = [sum(abs.(n.R_real)) for n in nodes]
-    local_entropy = [sum(abs.(n.flux)) for n in nodes]
-    Ψ = [α * e + β * s for (e, s) in zip(local_energy, local_entropy)]
-    φ = zeros(Float32, N)
-
-    # 4. Build Laplacian and spectrum
-    λ_surface = build_simplex_surface(simplex)
-    L = build_simplex_laplacian(λ_surface)
-    evals, evecs = eigen(Matrix(L))
-    modes = evecs[:, 1:min(mode_rank, size(evecs, 2))]
-
-    # 5. Spectral edge bins
-    add_spectral_binning!(edge_sets, modes, spectral_bins)
-
-    # 6. Weights
-    weights = Dict{Symbol, Vector{Float32}}()
-    for k in keys(edge_sets)
-        weights[k] = ones(Float32, length(edge_sets[k]))
-    end
-
-    return HypergraphBrain(
-        edge_sets,
-        weights,
-        φ,
-        Ψ,
-        λ,
-        sparse(L),
-        modes,
-        trace_patterns,
-        deltas
-    )
-end
-
-function group_by_bins(binning::Vector{Int})
-    groups = Dict{Int, Vector{Int}}()
-    for (i, b) in enumerate(binning)
-        push!(get!(groups, b, Int[]), i)
-    end
-    return collect(values(groups))
-end
-
-function add_spectral_binning!(edge_sets::Dict{Symbol, Vector{Vector{Int}}},
-                               modes::Matrix{Float32},
-                               spectral_bins::Int)
-    projections = eachrow(modes)
-    clusters = Dict{Int, Vector{Int}}()
-    for (i, vec) in enumerate(projections)
-        key = round(Int, sum(vec) * spectral_bins)
-        push!(get!(clusters, key, Int[]), i)
-    end
-    edge_sets[:spectral] = collect(values(clusters))
-end
-
-# =============================================================================
 # TraceAlgebra Module: Discrete Fourier-like Analysis for Flow Traces
 # =============================================================================
 
@@ -847,6 +742,94 @@ function build_trace_spectral_features(traces::Vector{Trace}; window::Int=3, top
 end
 
 # =============================================================================
+# Geometric object 3: The Hypergraph learning manifold
+# =============================================================================
+
+struct HypergraphBrain
+    edge_sets::Dict{Symbol, Vector{Vector{Int}}}        # Hyperedges: action_cost, curvature, spectral, etc.
+    weights::Dict{Symbol, Vector{Float32}}              # One scalar per hyperedge
+    φ::Vector{Float32}                                  # Information potential
+    Ψ::Vector{Float32}                                  # Energy + entropy field
+    λ::Vector{Float32}                                  # Real-imag divergence
+    L::SparseMatrixCSC{Float32, Int}                    # Laplacian matrix from simplex λ-surface
+    modes::Matrix{Float32}                              # Laplacian eigenmodes (spectral basis)
+    trace_patterns::Vector{Dict{Vector{String}, Int}}   # Recurring transition patterns per flow
+    delta_commutators::Vector{Float32}                  # Non-commutativity score per flow
+    fourier_features::Vector{Dict{Vector{String}, Int}} # Projection onto Fourier-like basis
+    fourier_basis::Vector{Vector{String}}               # Discrete trace patterns used as basis
+end
+
+# --- Step 1: Collect Flow Traces
+traces = [Trace(ft.geodesic_path) for ft in flow_traces]  # flow_traces: List of FlowTrace
+basis, spectral_features = build_trace_spectral_features(traces; window=3, top_k=10)
+
+# --- Step 2: Build Hypergraph from Simplex with Spectral Features
+function build_hypergraph_from_simplex(simplex::Vector{Vector{GeoNode}},
+                                       trace_metadata::Vector{Dict{Symbol, Any}},
+                                       trace_features::Vector{Dict{Vector{String}, Int}},
+                                       trace_basis::Vector{Vector{String}};
+                                       curvature_bins=5,
+                                       cost_bins=5,
+                                       spectral_bins=5,
+                                       mode_rank=10,
+                                       α=1.0f0,
+                                       β=1.0f0)
+
+    nodes = reduce(vcat, simplex)
+    N = length(nodes)
+    edge_sets = Dict{Symbol, Vector{Vector{Int}}}()
+
+    costs = [n.action_cost for n in nodes]
+    edge_sets[:action_cost] = group_by_bins(StatsBase.cut(costs, cost_bins))
+
+    curvs = [mean(n.R_real) for n in nodes]
+    edge_sets[:curvature] = group_by_bins(StatsBase.cut(curvs, curvature_bins))
+
+    deltas = [m[:delta] for m in trace_metadata]
+    edge_sets[:delta_commutator] = group_by_bins(StatsBase.cut(deltas, spectral_bins))
+
+    λ = [n.λ for n in nodes]
+    local_energy = [sum(abs.(n.R_real)) for n in nodes]
+    local_entropy = [sum(abs.(n.flux)) for n in nodes]
+    Ψ = [α * e + β * s for (e, s) in zip(local_energy, local_entropy)]
+    φ = zeros(Float32, N)
+
+    λ_surface = build_simplex_surface(simplex)
+    L = build_simplex_laplacian(λ_surface)
+    evals, evecs = eigen(Matrix(L))
+    modes = evecs[:, 1:min(mode_rank, size(evecs, 2))]
+
+    add_spectral_binning!(edge_sets, modes, spectral_bins)
+
+    # --- Fourier Hyperedges
+    trace_bin_groups = Dict{Int, Vector{Int}}()
+    for (i, feats) in enumerate(trace_features)
+        score = sum(values(feats))
+        push!(get!(trace_bin_groups, score, Int[]), i)
+    end
+    edge_sets[:fourier_spectral] = collect(values(trace_bin_groups))
+
+    weights = Dict{Symbol, Vector{Float32}}()
+    for k in keys(edge_sets)
+        weights[k] = ones(Float32, length(edge_sets[k]))
+    end
+
+    return HypergraphBrain(
+    edge_sets,
+    weights,
+    φ,
+    Ψ,
+    λ,
+    sparse(L),
+    modes,
+    [m[:patterns] for m in trace_metadata],
+    deltas,
+    trace_features,
+    trace_basis
+)
+end
+
+# =============================================================================
 # RicciFlowMetaLambda: Meta-learning and smoothing over the hypergraph
 # =============================================================================
 
@@ -857,11 +840,6 @@ struct RicciFlowMetaLambda
     curvature_weight::Float32 # Controls influence of R on φ
 end
 
-"""
-    update_info_potential!(brain::HypergraphBrain, simplex::Vector{Vector{GeoNode}}; η=0.1f0)
-
-Layer-aware φ update: computes λ mismatch per edge group, updates φ only for members.
-"""
 function update_info_potential!(brain::HypergraphBrain, simplex::Vector{Vector{GeoNode}};
                                 η::Float32=0.1f0)
 
@@ -869,12 +847,24 @@ function update_info_potential!(brain::HypergraphBrain, simplex::Vector{Vector{G
     N = length(nodes)
     Δφ = zeros(Float32, N)
 
+    # Assume brain has fields: spectral_error, fourier_error, combined_error
+    # These should be vectors of length N, containing the prediction errors for each node
+
     for (etype, edges) in brain.edge_sets
         for edge in edges
             λ_vals = [nodes[i].λ for i in edge]
             avg_λ = mean(abs, λ_vals)
             for i in edge
-                Δφ[i] += η * (avg_λ - abs(nodes[i].λ))
+                # Compute weights based on inverse errors
+                total_error = brain.spectral_error[i] + brain.fourier_error[i] + 1e-8f0  # Avoid division by zero
+                spectral_weight = (brain.fourier_error[i] + 1e-8f0) / total_error
+                fourier_weight = (brain.spectral_error[i] + 1e-8f0) / total_error
+
+                # Combined weight
+                combined_weight = 0.5f0 * (spectral_weight + fourier_weight)
+
+                # Update Δφ with combined weight
+                Δφ[i] += η * combined_weight * (avg_λ - abs(nodes[i].λ))
             end
         end
     end
@@ -882,7 +872,3 @@ function update_info_potential!(brain::HypergraphBrain, simplex::Vector{Vector{G
     brain.φ .= brain.φ .+ Δφ
     return brain
 end
-
-
-
-
