@@ -794,5 +794,96 @@ function add_spectral_binning!(edge_sets::Dict{Symbol, Vector{Vector{Int}}},
     edge_sets[:spectral] = collect(values(clusters))
 end
 
+# =============================================================================
+# TraceAlgebra Module: Discrete Fourier-like Analysis for Flow Traces
+# =============================================================================
 
+struct Trace
+    steps::Vector{String}
+end
 
+# Function to extract recurring patterns of a given window size from a trace
+function trace_patterns(trace::Trace; window::Int=3)
+    patterns = Dict{Vector{String}, Int}()
+    for i in 1:(length(trace.steps) - window + 1)
+        pat = trace.steps[i:i+window-1]
+        patterns[pat] = get(patterns, pat, 0) + 1
+    end
+    return patterns
+end
+
+# Function to compute frequencies of patterns across multiple traces
+function pattern_frequencies(traces::Vector{Trace}; window::Int=3)
+    freq = Dict{Vector{String}, Int}()
+    for trace in traces
+        pats = trace_patterns(trace; window=window)
+        for (pat, count) in pats
+            freq[pat] = get(freq, pat, 0) + count
+        end
+    end
+    return freq
+end
+
+# Function to project a trace onto a set of basis patterns
+function project_trace(trace::Trace, basis::Vector{Vector{String}}; window::Int=3)
+    pats = trace_patterns(trace; window=window)
+    projection = Dict{Vector{String}, Int}()
+    for b in basis
+        projection[b] = get(pats, b, 0)
+    end
+    return projection
+end
+
+# Function to build spectral features for a set of traces
+function build_trace_spectral_features(traces::Vector{Trace}; window::Int=3, top_k::Int=10)
+    # Compute pattern frequencies across all traces
+    freq = pattern_frequencies(traces; window=window)
+    # Select top_k most frequent patterns as basis
+    sorted_patterns = sort(collect(freq), by=x->-x[2])
+    basis = [pat for (pat, _) in sorted_patterns[1:min(top_k, length(sorted_patterns))]]
+    # Project each trace onto the basis
+    features = [project_trace(trace, basis; window=window) for trace in traces]
+    return basis, features
+end
+
+# =============================================================================
+# RicciFlowMetaLambda: Meta-learning and smoothing over the hypergraph
+# =============================================================================
+
+struct RicciFlowMetaLambda
+    η::Float32                 # Learning rate
+    λ_target::Float32         # Target divergence smoothing
+    smoothing_weight::Float32 # Diffusion coefficient for φ smoothing
+    curvature_weight::Float32 # Controls influence of R on φ
+end
+
+"""
+    update_meta_lambda!(brain::HypergraphBrain, control::RicciFlowMetaLambda)
+
+Performs one update of φ over the λ-surface based on Ricci-like smoothing.
+"""
+function update_meta_lambda!(brain::HypergraphBrain, control::RicciFlowMetaLambda)
+    φ = brain.φ
+    λ = brain.λ
+    Ψ = brain.Ψ
+    L = brain.L
+
+    Δφ = similar(φ)
+
+    for i in eachindex(φ)
+        # Error from target divergence (want λ to be close to λ_target)
+        λ_err = control.λ_target - λ[i]
+        
+        # Weighted contribution: curvature & entropy
+        flow_force = control.curvature_weight * Ψ[i]
+
+        # Discrete Laplacian smoothing from φ
+        laplace_term = sum(L[i,j] * φ[j] for j in 1:length(φ))
+
+        # Combine terms to get update
+        Δφ[i] = control.η * (λ_err + control.smoothing_weight * laplace_term - flow_force)
+    end
+
+    brain.φ .= φ .+ Δφ
+    return brain
+end
