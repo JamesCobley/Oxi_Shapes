@@ -173,41 +173,36 @@ brain = build_hypergraph_from_simplex(simplex, trace_metadata, features, basis)
 # =============================================================================
 
 struct RicciFlowMetaLambda
-    η::Float32                 # Learning rate
-    λ_target::Float32         # Target divergence smoothing
-    smoothing_weight::Float32 # Diffusion coefficient for φ smoothing
-    curvature_weight::Float32 # Controls influence of R on φ
+    eta::Float32                 # Learning rate
+    lambda_target::Float32       # Target divergence smoothing
+    smoothing_weight::Float32    # Diffusion coefficient for phi smoothing
+    curvature_weight::Float32    # Controls influence of curvature on phi
 end
 
-function update_info_potential!(brain::HypergraphBrain, simplex::Vector{Vector{GeoNode}};
-                                η::Float32=0.1f0)
+function update_info_potential!(brain::HypergraphBrain1, simplex::Vector{Vector{GeoNode}};
+                                eta::Float32=0.1f0)
 
     nodes = reduce(vcat, simplex)
     N = length(nodes)
-    Δφ = zeros(Float32, N)
+    delta_phi = zeros(Float32, N)
 
-    # Assume brain has fields: spectral_error, fourier_error, combined_error
-    # These should be vectors of length N, containing the prediction errors for each node
-
+    # Loop over all edge types
     for (etype, edges) in brain.edge_sets
         for edge in edges
-            λ_vals = [nodes[i].λ for i in edge]
-            avg_λ = mean(abs, λ_vals)
-            for i in edge
-                # Compute weights based on inverse errors
-                total_error = brain.spectral_error[i] + brain.fourier_error[i] + 1e-8f0  # Avoid division by zero
-                spectral_weight = (brain.fourier_error[i] + 1e-8f0) / total_error
-                fourier_weight = (brain.spectral_error[i] + 1e-8f0) / total_error
+            lambda_vals = [nodes[i].lambda for i in edge]
+            avg_lambda = mean(abs, lambda_vals)
 
-                # Combined weight
+            for i in edge
+                total_error = brain.spectral_error[i] + brain.fourier_error[i] + 1e-8f0  # prevent div by zero
+                spectral_weight = (brain.fourier_error[i] + 1e-8f0) / total_error
+                fourier_weight  = (brain.spectral_error[i] + 1e-8f0) / total_error
                 combined_weight = 0.5f0 * (spectral_weight + fourier_weight)
 
-                # Update Δφ with combined weight
-                Δφ[i] += η * combined_weight * (avg_λ - abs(nodes[i].λ))
+                delta_phi[i] += eta * combined_weight * (avg_lambda - abs(nodes[i].lambda))
             end
         end
     end
 
-    brain.φ .= brain.φ .+ Δφ
+    brain.phi .= brain.phi .+ delta_phi
     return brain
 end
