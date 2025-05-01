@@ -652,18 +652,18 @@ end
 # Generate and save the initials
 # =============================================================================
 
-function generate_safe_random_initials(n::Int, R::Int; total::Int = 100)
+function generate_safe_random_initials(n::Int, num_bins::Int; total::Int = 100)
     batch_id = "batch_$(Dates.format(now(), "yyyymmdd_HHMMSS"))"
-    samples = Vector{NamedTuple{(:uuid,:counts,:rho),Tuple{UUID,Vector{Int},Vector{Float32}}}}()
+    samples = Vector{NamedTuple{(:uuid, :counts, :rho), Tuple{UUID, Vector{Int}, Vector{Float32}}}}()
 
     for _ in 1:n
-        cuts = sort(rand(0:total, R-1))
-        counts = Vector{Int}(undef, R)
+        cuts = sort(rand(0:total, num_bins - 1))
+        counts = Vector{Int}(undef, num_bins)
         counts[1] = cuts[1]
-        for i in 2:R-1
-            counts[i] = cuts[i] - cuts[i-1]
+        for i in 2:num_bins - 1
+            counts[i] = cuts[i] - cuts[i - 1]
         end
-        counts[R] = total - cuts[end]
+        counts[num_bins] = total - cuts[end]
         rho = Float32.(counts) ./ Float32(total)
         push!(samples, (uuid=uuid4(), counts=counts, rho=rho))
     end
@@ -690,23 +690,23 @@ function rollout_batch(batch_id::String, initials, pf_states, flat_pos, edges, T
         ft, trace_meta = record_flow_trace!(ρ0, T, pf_states, flat_pos, edges; run_id=run_id)
 
         nodes = Vector{GeoNode}()
-        for t in 1:length(ft.ρ_series)
-            ρ = ft.ρ_series[t]
-            R = ft.R_series[t]
-            flux = t > 1 ? ft.flux_series[t-1] : zeros(Float32, length(ρ))
-            G = GeoGraphReal(pf_states, flat_pos, edges)
-            update_real_geometry!(G, ρ)
-            A = copy(G.anisotropy)
-            field = init_living_simplex_tensor(ρ)
-            λ = step_imagination!(field, G, init_alive_buffers!(G, [count(==('1'), s) for s in pf_states]))
+        for t in 2:length(ft.ρ_series)  # start from step 2
+        ρ = ft.ρ_series[t]
+        R = ft.R_series[t - 1]
+        flux = ft.flux_series[t - 1]
+        G = GeoGraphReal(pf_states, flat_pos, edges)
+        update_real_geometry!(G, ρ)
+        A = copy(G.anisotropy)
+        field = init_living_simplex_tensor(ρ)
+        λ = step_imagination!(field, G, init_alive_buffers!(G, [count(==('1'), s) for s in pf_states]))
 
-            node = GeoNode(copy(ρ), copy(R), copy(A), copy(field.imag), copy(G.R_vals), copy(G.anisotropy), λ,
-                           zeros(Float32, length(ρ)), flux, ft.action_cost)
-            push!(nodes, node)
-        end
+        node = GeoNode(copy(ρ), copy(R), copy(A), copy(field.imag), copy(G.R_vals), copy(G.anisotropy), λ,
+                   zeros(Float32, length(ρ)), flux, ft.action_cost)
+        push!(nodes, node)
+end
 
         push!(flow_traces, ft)
-        push!(trace_metadata, trace_meta)
+        push!(trace_metadata, Dict(pairs(trace_meta)))
         push!(simplex, nodes)
     end
 
@@ -725,7 +725,7 @@ end
 # =============================================================================
 
 # --- Parameters ---
-num_initials = 100         # Number of initial distributions
+num_initials = 100          # Number of initial distributions
 total_molecules = 100       # Total molecules per distribution
 simulation_steps = 100      # Number of time steps per simulation
 
