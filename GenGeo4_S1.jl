@@ -15,7 +15,7 @@ using Dates
 # =============================================================================
 # Geomtric object 1: The GeoNode = real and imagined Oxi-shape
 # =============================================================================
-struct GeoGraphReal
+@kwdef struct GeoGraphReal
     n::Int
     flat_x::Vector{Float32}
     flat_y::Vector{Float32}
@@ -93,13 +93,13 @@ function sheaf_consistency(stalks, edges; threshold=2.5f0)
     [(u, v, norm(stalks[u] .- stalks[v])) for (u, v) in edges if norm(stalks[u] .- stalks[v]) > threshold]
 end
 
-function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32=1e-3)
+function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32 = 1f-3)
     violated = Int[]
 
     # Step 1: z-lift from ρ to 3D points
     @inbounds for i in 1:G.n
         G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ[i])
-        G.R_vals[i] = 0f0
+        G.R_vals[i]    = 0f0        # <- ensure no space: 0f0
     end
 
     # Step 2: Compute scalar curvature R(x)
@@ -117,25 +117,21 @@ function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32
         Ri = G.R_vals[i]
         for (k,j) in enumerate(G.neighbors[i])
             dist = G.d0[i][k]
-            ΔR = abs(Ri - G.R_vals[j])
+            ΔR   = abs(Ri - G.R_vals[j])
             if dist > 1e-6f0
                 acc += ΔR / dist
                 cnt += 1
             end
         end
-        G.anisotropy[i] = cnt > 0 ? acc / cnt : 0f0
+        G.anisotropy[i] = cnt > 0 ? acc/cnt : 0f0
     end
 
     # Step 4: Sheath integrity & volume check
     for i in 1:G.n
-        # Local volume (ρ at self + neighbors)
-        vol = ρ[i] + sum(ρ[j] for j in G.neighbors[i])
+        vol          = ρ[i] + sum(ρ[j] for j in G.neighbors[i])
         expected_vol = (1 + length(G.neighbors[i])) / G.n
-        vol_ok = abs(vol - expected_vol) ≤ ε
-
-        # Sheath logic (curvature must be supported by anisotropy)
-        shape_ok = abs(G.R_vals[i]) ≤ ε * (1.0f0 + G.anisotropy[i])
-
+        vol_ok       = abs(vol - expected_vol) ≤ ε
+        shape_ok     = abs(G.R_vals[i]) ≤ ε * (1.0f0 + G.anisotropy[i])
         if !(vol_ok && shape_ok)
             push!(violated, i)
         end
@@ -144,7 +140,7 @@ function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32
     return violated
 end
 
-function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε::Float32=1e-3)
+function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε=1f-3)
     violated = Int[]
 
     # Step 1: z-lift imagined ρ to 3D points
