@@ -713,10 +713,6 @@ end
     return flow_traces, trace_metadata, simplex
 end
 
-println("→ FlowTraces: ", length(flow_traces))
-println("→ Metadata: ", length(trace_metadata))
-println("→ Simplex: ", length(simplex))
-
 function save_run_data(batch_id::String, flow_traces, trace_metadata, simplex)
     @save "flow_traces_$batch_id.bson" flow_traces
     @save "trace_metadata_$batch_id.bson" trace_metadata
@@ -743,6 +739,12 @@ println("✔ Generated initials for batch: $batch_id")
 
 # --- Run Simulation ---
 flow_traces, trace_metadata, simplex = rollout_batch(batch_id, initials, pf_states, flat_pos, edges, simulation_steps)
+
+# ✅ Now it's safe to call:
+println("→ FlowTraces: ", length(flow_traces))
+println("→ Metadata: ", length(trace_metadata))
+println("→ Simplex: ", length(simplex))
+
 save_run_data(batch_id, flow_traces, trace_metadata, simplex)
 
 println("✔ Finished rollout and saved data for batch: $batch_id")
