@@ -276,26 +276,39 @@ build_imagined_manifold!(field::LivingSimplexTensor, G::GeoGraphReal) =
 
 function evolve_imagination_single_counts!(field::LivingSimplexTensor, G::GeoGraphReal, buffers; moves::Int=10)
     counts = buffers.counts
-    @inbounds for i in 1:G.n counts[i] = round(Int, field.imag[i]*100) end
-    counts[G.n] = 100 - sum(counts[1:G.n-1])
+    n = G.n
+
+    # Convert imag → counts
+    @inbounds for i in 1:n
+        counts[i] = round(Int, field.imag[i] * 100)
+    end
+    counts[n] = 100 - sum(counts[1:n-1])  # Force total mass = 100
 
     update_real_geometry!(G, field.imag)
 
-    fill!(buffers.inflow_int, 0); fill!(buffers.outflow_int, 0)
+    fill!(buffers.inflow_int, 0)
+    fill!(buffers.outflow_int, 0)
     nmoves = rand(0:moves)
     nonzero = findall(>(0), counts)
 
     for _ in 1:nmoves
         isempty(nonzero) && break
-        i = nonzero[argmax(G.R_vals[nonzero])]; nbrs = G.neighbors[i]
+        i = nonzero[argmax(G.R_vals[nonzero])]
+        if counts[i] - buffers.outflow_int[i] ≤ 0
+            continue
+        end
+
+        nbrs = G.neighbors[i]
         isempty(nbrs) && continue
 
-        best_j, bc = nbrs[1], Inf
+        # Greedy: choose neighbor with lowest Δf
+        best_j, best_cost = nbrs[1], Inf
         for j in nbrs
             ΔS = 0.1f0 + 0.01f0 + abs(G.R_vals[j]) + buffers.deg_pen[j]
             Δf = exp(counts[i]/100) - G.R_vals[i] + ΔS
-            if Δf < bc
-                bc, best_j = Δf, j
+            if Δf < best_cost
+                best_cost = Δf
+                best_j = j
             end
         end
 
@@ -310,8 +323,9 @@ function evolve_imagination_single_counts!(field::LivingSimplexTensor, G::GeoGra
         end
     end
 
-    @inbounds for i in 1:G.n
-        counts[i] += buffers.inflow_int[i] - buffers.outflow_int[i]
+    @inbounds for i in 1:n
+        net = counts[i] + buffers.inflow_int[i] - buffers.outflow_int[i]
+        counts[i] = max(0, net)
         field.imag[i] = counts[i] / 100f0
     end
 
