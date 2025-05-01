@@ -107,8 +107,9 @@ basis, spectral_features = run_trace_spectral_analysis(Dict{Symbol, Any}.(trace_
 
 function save_trace_spectral_analysis(batch_id::String, basis::Vector{Vector{String}}, features::Vector{Dict{Vector{String}, Int}})
     filename = "trace_spectral_analysis_$(batch_id).bson"
-    @save filename basis features
-    println("✔ Saved spectral analysis to: $filename")
+    spectral_data = Dict(:basis => basis, :features => features)
+    @save filename spectral_data
+    println("✔ Saved spectral analysis as Dict to: $filename")
 end
 
 save_trace_spectral_analysis(batch_id, basis, spectral_features)
