@@ -15,22 +15,45 @@ using Dates
 # =============================================================================
 # Geomtric object 1: The GeoNode = real and imagined Oxi-shape
 # =============================================================================
+# --- Geometry & States ---
+pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
+flat_pos = Dict(
+    "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
+    "100" => (2.0, 2.0), "011" => (-1.0, 1.0), "101" => (0.0, 1.0),
+    "110" => (1.0, 1.0), "111" => (0.0, 0.0)
+)
+edges = [
+    ("000", "001"), ("000", "010"), ("000", "100"),
+    ("001", "011"), ("001", "101"), ("010", "011"), ("010", "110"),
+    ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
+]
+
 @kwdef struct GeoGraphReal
-    n::Int
-    flat_x::Vector{Float32}
-    flat_y::Vector{Float32}
-    neighbors::Vector{Vector{Int}}
-    d0::Vector{Vector{Float32}}
-    edges_idx::Vector{Tuple{Int,Int}}
-    adjacency::Matrix{Float32}
-    points3D::Vector{Point3{Float32}}
-    R_vals::Vector{Float32}
-    anisotropy::Vector{Float32}
+    # --- Original data needed for lifting, curvature, etc.
+    pf_states :: Vector{String}
+    flat_pos  :: Dict{String, Tuple{Float64,Float64}}
+    edges      :: Vector{Tuple{String,String}}
+
+    # --- Precomputed, derived fields
+    n         :: Int
+    flat_x    :: Vector{Float32}
+    flat_y    :: Vector{Float32}
+    neighbors :: Vector{Vector{Int}}
+    d0        :: Vector{Vector{Float32}}
+    edges_idx :: Vector{Tuple{Int,Int}}
+    adjacency :: Matrix{Float32}
+
+    # --- Mutable state
+    points3D   :: Vector{Point3{Float32}}
+    R_vals     :: Vector{Float32}
+    anisotropy :: Vector{Float32}
 end
 
-function GeoGraphReal(pf_states::Vector{String},
-                      flat_pos::Dict{String,Tuple{Float64,Float64}},
-                      edges::Vector{Tuple{String,String}})
+function GeoGraphReal(
+    pf_states::Vector{String},
+    flat_pos::Dict{String,Tuple{Float64,Float64}},
+    edges::Vector{Tuple{String,String}}
+)
     n = length(pf_states)
     idx_map = Dict(s=>i for (i,s) in enumerate(pf_states))
     fx = Float32[flat_pos[s][1] for s in pf_states]
@@ -41,16 +64,21 @@ function GeoGraphReal(pf_states::Vector{String},
         push!(nbrs[i], j)
         push!(nbrs[j], i)
     end
-    d0 = [Float32[sqrt((fx[i]-fx[j])^2 + (fy[i]-fy[j])^2) for j in nbrs[i]] for i in 1:n]
-    g = SimpleGraph(n)
+    d0    = [Float32[sqrt((fx[i]-fx[j])^2 + (fy[i]-fy[j])^2) for j in nbrs[i]] for i in 1:n]
+    g     = SimpleGraph(n)
     for (i,j) in eidx
-        add_edge!(g,i,j)
+        add_edge!(g, i, j)
     end
-    A = Float32.(adjacency_matrix(g))
+    A     = Float32.(adjacency_matrix(g))
     pts3D = Vector{Point3{Float32}}(undef, n)
     Rbuf  = zeros(Float32, n)
     anis  = zeros(Float32, n)
-    return GeoGraphReal(n, fx, fy, nbrs, d0, eidx, A, pts3D, Rbuf, anis)
+
+    return GeoGraphReal(
+        pf_states, flat_pos, edges,
+        n, fx, fy, nbrs, d0, eidx, A,
+        pts3D, Rbuf, anis
+    )
 end
 
 function lift_to_z_plane(rho::Vector{Float32}, pf_states, flat_pos)
@@ -93,16 +121,82 @@ function sheaf_consistency(stalks, edges; threshold=2.5f0)
     [(u, v, norm(stalks[u] .- stalks[v])) for (u, v) in edges if norm(stalks[u] .- stalks[v]) > threshold]
 end
 
-function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32 = 1f-3)
+# -----------------------------------------------------------------------------
+# In-place update of GeoGraphReal from a ρ-vector
+# -----------------------------------------------------------------------------
+function update_real_geometry!(
+    G::GeoGraphReal,
+    ρ::Vector{Float32};
+    ε::Float32 = 1e-3f0
+)
     violated = Int[]
 
-    # Step 1: z-lift from ρ to 3D points
+    # Step 1: lift into 3D and zero out curvature
     @inbounds for i in 1:G.n
         G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ[i])
-        G.R_vals[i]    = 0f0        # <- ensure no space: 0f0
+        G.R_vals[i]    = 0f0         # ← no space!
     end
 
-    # Step 2: Compute scalar curvature R(x)
+    # Step 2: scalar curvature
+    @inbounds for i in 1:G.n
+        pi = G.points3D[i]
+        for (k, j) in enumerate(G.neighbors[i])
+            d3 = norm(pi - G.points3D[j])
+            G.R_vals[i] += d3 - G.d0[i][k]
+        end
+    end
+
+    # Step 3: anisotropy
+    @inbounds for i in 1:G.n
+        acc, cnt = 0f0, 0
+        Ri = G.R_vals[i]
+        for (k, j) in enumerate(G.neighbors[i])
+            dist = G.d0[i][k]
+            ΔR   = abs(Ri - G.R_vals[j])
+            if dist > 1e-6f0          # ← no space here either
+                acc += ΔR / dist
+                cnt += 1
+            end
+        end
+        G.anisotropy[i] = cnt > 0 ? acc/cnt : 0f0
+    end
+
+    # Step 4: volume & sheath‐shape check
+    for i in 1:G.n
+        vol          = ρ[i] + sum(ρ[j] for j in G.neighbors[i])
+        expected_vol = (1 + length(G.neighbors[i])) / G.n
+        vol_ok   = abs(vol - expected_vol) ≤ ε
+        shape_ok = abs(G.R_vals[i])      ≤ ε * (1.0f0 + G.anisotropy[i])
+        if !(vol_ok && shape_ok)
+            push!(violated, i)
+        end
+    end
+
+    return violated
+end
+
+# -----------------------------------------------------------------------------
+# Always call it with (G, ρ), never (ρ, G):
+# -----------------------------------------------------------------------------
+G = GeoGraphReal(pf_states, flat_pos, edges)
+ρ = rand(Float32, length(pf_states))
+violations = update_real_geometry!(G, ρ)
+
+
+function update_real_geometry!(
+    G::GeoGraphReal,
+    ρ::Vector{Float32};
+    ε::Float32 = 1f-3
+)
+    violated = Int[]
+
+    # Step 1: z-lift
+    @inbounds for i in 1:G.n
+        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ[i])
+        G.R_vals[i]    = 0f0      # ← no spaces: “0f0”
+    end
+
+    # Step 2: scalar curvature
     @inbounds for i in 1:G.n
         pi = G.points3D[i]
         for (k,j) in enumerate(G.neighbors[i])
@@ -111,14 +205,14 @@ function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32
         end
     end
 
-    # Step 3: Compute anisotropy A(x)
+    # Step 3: anisotropy
     @inbounds for i in 1:G.n
         acc, cnt = 0f0, 0
         Ri = G.R_vals[i]
         for (k,j) in enumerate(G.neighbors[i])
             dist = G.d0[i][k]
             ΔR   = abs(Ri - G.R_vals[j])
-            if dist > 1e-6f0
+            if dist > 1f-6      # ← again, no space
                 acc += ΔR / dist
                 cnt += 1
             end
@@ -126,12 +220,12 @@ function update_real_geometry!(G::GeoGraphReal, ρ::Vector{Float32}; ε::Float32
         G.anisotropy[i] = cnt > 0 ? acc/cnt : 0f0
     end
 
-    # Step 4: Sheath integrity & volume check
+    # Step 4: volume & shape check
     for i in 1:G.n
         vol          = ρ[i] + sum(ρ[j] for j in G.neighbors[i])
         expected_vol = (1 + length(G.neighbors[i])) / G.n
-        vol_ok       = abs(vol - expected_vol) ≤ ε
-        shape_ok     = abs(G.R_vals[i]) ≤ ε * (1.0f0 + G.anisotropy[i])
+        vol_ok   = abs(vol - expected_vol) ≤ ε
+        shape_ok = abs(G.R_vals[i]) ≤ ε * (1.0f0 + G.anisotropy[i])
         if !(vol_ok && shape_ok)
             push!(violated, i)
         end
@@ -165,7 +259,7 @@ function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε
         for (k,j) in enumerate(G.neighbors[i])
             dist = G.d0[i][k]
             ΔR = abs(Ri - G.R_vals[j])
-            if dist > 1e-6f0
+            if dist > 1f-6
                 acc += ΔR / dist
                 cnt += 1
             end
@@ -674,38 +768,6 @@ function generate_safe_random_initials(n::Int, R::Int; total::Int = 100)
 end
 
 # =============================================================================
-# Simulation Configuration and Execution
-# =============================================================================
-
-# --- Parameters ---
-num_initials = 100         # Number of initial distributions
-total_molecules = 100       # Total molecules per distribution
-simulation_steps = 100      # Number of time steps per simulation
-
-# --- Geometry & States ---
-pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
-flat_pos = Dict(
-    "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
-    "100" => (2.0, 2.0), "011" => (-1.0, 1.0), "101" => (0.0, 1.0),
-    "110" => (1.0, 1.0), "111" => (0.0, 0.0)
-)
-edges = [
-    ("000", "001"), ("000", "010"), ("000", "100"),
-    ("001", "011"), ("001", "101"), ("010", "011"), ("010", "110"),
-    ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
-]
-
-# --- Generate and Save Initials ---
-batch_id, initials = generate_safe_random_initials(num_initials, length(pf_states); total=total_molecules)
-println("✔ Generated initials for batch: $batch_id")
-
-# --- Run Simulation ---
-flow_traces, trace_metadata, simplex = rollout_batch(batch_id, initials, pf_states, flat_pos, edges, simulation_steps)
-save_run_data(batch_id, flow_traces, trace_metadata, simplex)
-
-println("✔ Finished rollout and saved data for batch: $batch_id")
-
-# =============================================================================
 # Support Functions
 # =============================================================================
 
@@ -750,3 +812,22 @@ function save_run_data(batch_id::String, flow_traces, trace_metadata, simplex)
     @save "data/$(batch_id)/trace_metadata.bson" trace_metadata
     @save "data/$(batch_id)/simplex.bson" simplex
 end
+
+# =============================================================================
+# Simulation Configuration and Execution
+# =============================================================================
+
+# --- Parameters ---
+num_initials = 100         # Number of initial distributions
+total_molecules = 100       # Total molecules per distribution
+simulation_steps = 100      # Number of time steps per simulation
+
+# --- Generate and Save Initials ---
+batch_id, initials = generate_safe_random_initials(num_initials, length(pf_states); total=total_molecules)
+println("✔ Generated initials for batch: $batch_id")
+
+# --- Run Simulation ---
+flow_traces, trace_metadata, simplex = rollout_batch(batch_id, initials, pf_states, flat_pos, edges, simulation_steps)
+save_run_data(batch_id, flow_traces, trace_metadata, simplex)
+
+println("✔ Finished rollout and saved data for batch: $batch_id")
