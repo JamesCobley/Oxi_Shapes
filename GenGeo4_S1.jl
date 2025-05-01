@@ -349,20 +349,20 @@ end
     build_simplex_surface(simplex::Vector{Vector{GeoNode}}) → Matrix{Float32}
 
 Given the simplex tensor (list of GeoNode sequences per run),
-builds the λ-surface where each point is -λ.
+builds the λ-surface where each point is -lambda.
 """
 function build_simplex_surface(simplex::Vector{Vector{GeoNode}})
     n_runs = length(simplex)
     rollout_steps = maximum(length(run) for run in simplex)
-    λ_surface = fill(0f0, rollout_steps, n_runs)
+    lambda_surface = fill(0f0, rollout_steps, n_runs)
 
     for (r, run) in enumerate(simplex)
         for (t, node) in enumerate(run)
-            λ_surface[t, r] = -node.λ
+            lambda_surface[t, r] = -node.lambda
         end
     end
 
-    return λ_surface
+    return lambda_surface
 end
 
 """
@@ -412,7 +412,7 @@ function build_simplex_laplacian(lambda_surface::Matrix{Float32})
         end
     end
 
-    D = Diagonal(sum(W, dims=2))
+    D = Diagonal(vec(sum(W, dims=2)))  # ✅ Fix: convert to vector
     L = D - W
 
     return L
