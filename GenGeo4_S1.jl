@@ -170,11 +170,6 @@ end
 # 1. Real-Flow (Oxi-Shapes Alive)
 # =============================================================================
 
-"""
-    init_alive_buffers!(G, bitcounts)
-
-Pre-allocate counts, inflow, outflow, and degeneracy penalties.
-"""
 function init_alive_buffers!(G::GeoGraphReal, bitcounts::Vector{Int})
     n = G.n
     counts = Vector{Int}(undef, n)
@@ -182,40 +177,58 @@ function init_alive_buffers!(G::GeoGraphReal, bitcounts::Vector{Int})
     outflow_int = zeros(Int, n)
     R_total = length(bitcounts)
     binom = Dict(k => binomial(R_total, k) for k in 0:R_total)
-    deg_pen = Float32[1f0/binom[bitcounts[i]] for i in 1:n]
+    deg_pen = Float32[1f0 / binom[bitcounts[i]] for i in 1:n]
     return (counts=counts, inflow_int=inflow_int, outflow_int=outflow_int, deg_pen=deg_pen)
 end
 
-"""
-    oxi_shapes_alive!(ρ, G, buffers; max_moves)
-
-Discrete-count stochastic flow; updates ρ in-place according to real flow rules.
-"""
 function oxi_shapes_alive!(rho::Vector{Float32}, G::GeoGraphReal, buffers; max_moves::Int=10)
-    n = G.n; counts = buffers.counts
-    @inbounds for i in 1:n counts[i] = round(Int, ρ[i]*100) end
-    counts[n] = 100 - sum(counts[1:n-1])
+    n = G.n
+    counts = buffers.counts
 
-    update_real_geometry!(G, ρ)
+    # Convert rho → counts (discrete copy, rounding)
+    @inbounds for i in 1:n
+        counts[i] = round(Int, rho[i] * 100)
+    end
+    counts[n] = 100 - sum(counts[1:n-1])  # force total mass = 100
 
-    fill!(buffers.inflow_int, 0); fill!(buffers.outflow_int, 0)
+    update_real_geometry!(G, rho)
+
+    fill!(buffers.inflow_int, 0)
+    fill!(buffers.outflow_int, 0)
     total_moves = rand(0:max_moves)
+
     nonzero = findall(>(0), counts)
 
     for _ in 1:total_moves
         isempty(nonzero) && break
-        i = rand(nonzero); nbrs = G.neighbors[i]
+        i = rand(nonzero)
+
+        if counts[i] - buffers.outflow_int[i] ≤ 0
+            continue  # skip: nothing left to move
+        end
+
+        nbrs = G.neighbors[i]
         isempty(nbrs) && continue
 
-        wsum = 0f0; ws = Float32[]; push!(ws, 0f0)
+        # Compute transition weights
+        wsum = 0f0
+        ws = Float32[]
+        push!(ws, 0f0)  # dummy 0 for indexing offset
+
         for j in nbrs
             ΔS = 0.1f0 + 0.01f0 + abs(G.R_vals[j]) + buffers.deg_pen[j]
             Δf = exp(counts[i]/100) - G.R_vals[i] + ΔS
-            w = exp(-Δf) * exp(-G.anisotropy[j]); wsum += w; push!(ws, w)
+            w = exp(-Δf) * exp(-G.anisotropy[j])
+            wsum += w
+            push!(ws, w)
         end
-        wsum < 1f-8 && continue
 
-        r = rand() * wsum; cum = 0f0; chosen = nbrs[1]
+        wsum < 1f-8 && continue  # avoid division by zero
+
+        # Weighted random choice
+        r = rand() * wsum
+        cum = 0f0
+        chosen = nbrs[1]
         for (k, j) in enumerate(nbrs)
             cum += ws[k+1]
             if cum >= r
@@ -227,6 +240,7 @@ function oxi_shapes_alive!(rho::Vector{Float32}, G::GeoGraphReal, buffers; max_m
         buffers.inflow_int[chosen] += 1
         buffers.outflow_int[i] += 1
 
+        # Track active update set
         if counts[i] - buffers.outflow_int[i] == 0
             deleteat!(nonzero, findfirst(==(i), nonzero))
         end
@@ -235,12 +249,14 @@ function oxi_shapes_alive!(rho::Vector{Float32}, G::GeoGraphReal, buffers; max_m
         end
     end
 
+    # Final update: apply inflow/outflow and update rho
     @inbounds for i in 1:n
-        counts[i] += buffers.inflow_int[i] - buffers.outflow_int[i]
-        ρ[i] = counts[i] / 100f0
+        net = counts[i] + buffers.inflow_int[i] - buffers.outflow_int[i]
+        counts[i] = max(0, net)
+        rho[i] = counts[i] / 100f0
     end
 
-    return ρ
+    return rho
 end
 
 # =============================================================================
