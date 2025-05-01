@@ -121,79 +121,17 @@ function sheaf_consistency(stalks, edges; threshold=2.5f0)
     [(u, v, norm(stalks[u] .- stalks[v])) for (u, v) in edges if norm(stalks[u] .- stalks[v]) > threshold]
 end
 
-# -----------------------------------------------------------------------------
-# In-place update of GeoGraphReal from a ρ-vector
-# -----------------------------------------------------------------------------
 function update_real_geometry!(
     G::GeoGraphReal,
-    ρ::Vector{Float32};
-    ε::Float32 = 1e-3f0
-)
-    violated = Int[]
-
-    # Step 1: lift into 3D and zero out curvature
-    @inbounds for i in 1:G.n
-        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ[i])
-        G.R_vals[i]    = 0f0         # ← no space!
-    end
-
-    # Step 2: scalar curvature
-    @inbounds for i in 1:G.n
-        pi = G.points3D[i]
-        for (k, j) in enumerate(G.neighbors[i])
-            d3 = norm(pi - G.points3D[j])
-            G.R_vals[i] += d3 - G.d0[i][k]
-        end
-    end
-
-    # Step 3: anisotropy
-    @inbounds for i in 1:G.n
-        acc, cnt = 0f0, 0
-        Ri = G.R_vals[i]
-        for (k, j) in enumerate(G.neighbors[i])
-            dist = G.d0[i][k]
-            ΔR   = abs(Ri - G.R_vals[j])
-            if dist > 1e-6f0          # ← no space here either
-                acc += ΔR / dist
-                cnt += 1
-            end
-        end
-        G.anisotropy[i] = cnt > 0 ? acc/cnt : 0f0
-    end
-
-    # Step 4: volume & sheath‐shape check
-    for i in 1:G.n
-        vol          = ρ[i] + sum(ρ[j] for j in G.neighbors[i])
-        expected_vol = (1 + length(G.neighbors[i])) / G.n
-        vol_ok   = abs(vol - expected_vol) ≤ ε
-        shape_ok = abs(G.R_vals[i])      ≤ ε * (1.0f0 + G.anisotropy[i])
-        if !(vol_ok && shape_ok)
-            push!(violated, i)
-        end
-    end
-
-    return violated
-end
-
-# -----------------------------------------------------------------------------
-# Always call it with (G, ρ), never (ρ, G):
-# -----------------------------------------------------------------------------
-G = GeoGraphReal(pf_states, flat_pos, edges)
-ρ = rand(Float32, length(pf_states))
-violations = update_real_geometry!(G, ρ)
-
-
-function update_real_geometry!(
-    G::GeoGraphReal,
-    ρ::Vector{Float32};
-    ε::Float32 = 1f-3
+    rho::Vector{Float32};
+    eps::Float32 = 1f-3
 )
     violated = Int[]
 
     # Step 1: z-lift
     @inbounds for i in 1:G.n
         G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ[i])
-        G.R_vals[i]    = 0f0      # ← no spaces: “0f0”
+        G.R_vals[i]    = 0.0f0
     end
 
     # Step 2: scalar curvature
@@ -212,7 +150,7 @@ function update_real_geometry!(
         for (k,j) in enumerate(G.neighbors[i])
             dist = G.d0[i][k]
             ΔR   = abs(Ri - G.R_vals[j])
-            if dist > 1f-6      # ← again, no space
+            if dist > 1f-6
                 acc += ΔR / dist
                 cnt += 1
             end
@@ -224,8 +162,8 @@ function update_real_geometry!(
     for i in 1:G.n
         vol          = ρ[i] + sum(ρ[j] for j in G.neighbors[i])
         expected_vol = (1 + length(G.neighbors[i])) / G.n
-        vol_ok   = abs(vol - expected_vol) ≤ ε
-        shape_ok = abs(G.R_vals[i]) ≤ ε * (1.0f0 + G.anisotropy[i])
+        vol_ok   = abs(vol - expected_vol) ≤ eps
+        shape_ok = abs(G.R_vals[i]) ≤ eps * (1.0f0 + G.anisotropy[i])
         if !(vol_ok && shape_ok)
             push!(violated, i)
         end
@@ -240,7 +178,7 @@ function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε
     # Step 1: z-lift imagined ρ to 3D points
     @inbounds for i in 1:G.n
         G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ_imag[i])
-        G.R_vals[i] = 0f0
+        G.R_vals[i] = 0.0f0
     end
 
     # Step 2: Compute curvature for imagined field
@@ -315,7 +253,7 @@ end
 
 Discrete-count stochastic flow; updates ρ in-place according to real flow rules.
 """
-function oxi_shapes_alive!(ρ::Vector{Float32}, G::GeoGraphReal, buffers; max_moves::Int=10)
+function oxi_shapes_alive!(rho::Vector{Float32}, G::GeoGraphReal, buffers; max_moves::Int=10)
     n = G.n; counts = buffers.counts
     @inbounds for i in 1:n counts[i] = round(Int, ρ[i]*100) end
     counts[n] = 100 - sum(counts[1:n-1])
@@ -337,7 +275,7 @@ function oxi_shapes_alive!(ρ::Vector{Float32}, G::GeoGraphReal, buffers; max_mo
             Δf = exp(counts[i]/100) - G.R_vals[i] + ΔS
             w = exp(-Δf) * exp(-G.anisotropy[j]); wsum += w; push!(ws, w)
         end
-        wsum < 1e-8f0 && continue
+        wsum < 1f-8 && continue
 
         r = rand() * wsum; cum = 0f0; chosen = nbrs[1]
         for (k, j) in enumerate(nbrs)
