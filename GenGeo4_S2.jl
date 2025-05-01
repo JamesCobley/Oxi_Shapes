@@ -103,4 +103,4 @@ function run_trace_spectral_analysis(trace_metadata::Vector{Dict{Symbol, Any}}; 
 end
 
 # --- Run it ---
-basis, spectral_features = run_trace_spectral_analysis(trace_metadata; window=3, top_k=10)
+basis, spectral_features = run_trace_spectral_analysis(Dict{Symbol, Any}.(trace_metadata); window=3, top_k=10)
