@@ -15,7 +15,7 @@ using Dates
 # =============================================================================
 # Geomtric object 1: The GeoNode = real and imagined Oxi-shape
 # =============================================================================
-# --- Geometry & States ---
+
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 flat_pos = Dict(
     "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
@@ -29,172 +29,67 @@ edges = [
 ]
 
 @kwdef struct GeoGraphReal
-    # --- Original data needed for lifting, curvature, etc.
-    pf_states :: Vector{String}
-    flat_pos  :: Dict{String, Tuple{Float64,Float64}}
-    edges      :: Vector{Tuple{String,String}}
+    pf_states::Vector{String}
+    flat_pos::Dict{String, Tuple{Float64, Float64}}
+    edges::Vector{Tuple{String, String}}
 
-    # --- Precomputed, derived fields
-    n         :: Int
-    flat_x    :: Vector{Float32}
-    flat_y    :: Vector{Float32}
-    neighbors :: Vector{Vector{Int}}
-    d0        :: Vector{Vector{Float32}}
-    edges_idx :: Vector{Tuple{Int,Int}}
-    adjacency :: Matrix{Float32}
+    n::Int
+    flat_x::Vector{Float32}
+    flat_y::Vector{Float32}
+    neighbors::Vector{Vector{Int}}
+    d0::Vector{Vector{Float32}}
+    edges_idx::Vector{Tuple{Int, Int}}
+    adjacency::Matrix{Float32}
 
-    # --- Mutable state
-    points3D   :: Vector{Point3{Float32}}
-    R_vals     :: Vector{Float32}
-    anisotropy :: Vector{Float32}
+    points3D::Vector{Point3{Float32}}
+    R_vals::Vector{Float32}
+    anisotropy::Vector{Float32}
 end
 
-function GeoGraphReal(
-    pf_states::Vector{String},
-    flat_pos::Dict{String,Tuple{Float64,Float64}},
-    edges::Vector{Tuple{String,String}}
-)
+function GeoGraphReal(pf_states, flat_pos, edges)
     n = length(pf_states)
-    idx_map = Dict(s=>i for (i,s) in enumerate(pf_states))
+    idx_map = Dict(s => i for (i, s) in enumerate(pf_states))
     fx = Float32[flat_pos[s][1] for s in pf_states]
     fy = Float32[flat_pos[s][2] for s in pf_states]
-    eidx = [(idx_map[u], idx_map[v]) for (u,v) in edges]
+    eidx = [(idx_map[u], idx_map[v]) for (u, v) in edges]
     nbrs = [Int[] for _ in 1:n]
-    for (i,j) in eidx
+    for (i, j) in eidx
         push!(nbrs[i], j)
         push!(nbrs[j], i)
     end
-    d0    = [Float32[sqrt((fx[i]-fx[j])^2 + (fy[i]-fy[j])^2) for j in nbrs[i]] for i in 1:n]
-    g     = SimpleGraph(n)
-    for (i,j) in eidx
+    d0 = [Float32[sqrt((fx[i] - fx[j])^2 + (fy[i] - fy[j])^2) for j in nbrs[i]] for i in 1:n]
+    g = SimpleGraph(n)
+    for (i, j) in eidx
         add_edge!(g, i, j)
     end
-    A     = Float32.(adjacency_matrix(g))
+    A = Float32.(adjacency_matrix(g))
     pts3D = Vector{Point3{Float32}}(undef, n)
-    Rbuf  = zeros(Float32, n)
-    anis  = zeros(Float32, n)
+    Rbuf = zeros(Float32, n)
+    anis = zeros(Float32, n)
 
-    return GeoGraphReal(
-        pf_states, flat_pos, edges,
-        n, fx, fy, nbrs, d0, eidx, A,
-        pts3D, Rbuf, anis
-    )
+    return GeoGraphReal(pf_states, flat_pos, edges, n, fx, fy, nbrs, d0, eidx, A, pts3D, Rbuf, anis)
 end
 
-function lift_to_z_plane(rho::Vector{Float32}, pf_states, flat_pos)
-    return [Point3(Float32(flat_pos[s][1]), Float32(flat_pos[s][2]), -rho[i]) for (i, s) in enumerate(pf_states)]
-end
-
-function build_neighbor_indices(pf_states::Vector{String}, edges::Vector{Tuple{String, String}}, idx::Dict{String, Int})
-    return Dict(s => [idx[v] for (u, v) in edges if u == s] ∪ [idx[u] for (u, v) in edges if v == s] for s in pf_states)
-end
-
-function compute_anisotropy_from_curvature(
-    R_vals::Vector{Float32},
-    pf_states::Vector{String},
-    flat_pos::Dict{String, Tuple{Float64, Float64}},
-    edges::Vector{Tuple{String, String}}
-)
-    idx = Dict(s => i for (i, s) in enumerate(pf_states))
-    neighbor_indices = build_neighbor_indices(pf_states, edges, idx)
-
-    anisotropy = map(pf_states) do s
-        i = idx[s]
-        grads = map(neighbor_indices[s]) do j
-            dx = Float32(flat_pos[s][1] - flat_pos[pf_states[j]][1])
-            dy = Float32(flat_pos[s][2] - flat_pos[pf_states[j]][2])
-            dist = sqrt(dx^2 + dy^2)
-            dist > 1f-6 ? abs(R_vals[i] - R_vals[j]) / dist : 0.0f0
-        end
-        grads_nonzero = filter(x -> x > 0, grads)
-        isempty(grads_nonzero) ? 0.0f0 : mean(grads_nonzero)
-    end
-
-    return collect(anisotropy)
-end
-
-function initialize_sheaf_stalks(flat_pos, pf_states)
-    Dict(s => [Float32(flat_pos[s][1]), Float32(flat_pos[s][2])] for s in pf_states)
-end
-
-function sheaf_consistency(stalks, edges; threshold=2.5f0)
-    [(u, v, norm(stalks[u] .- stalks[v])) for (u, v) in edges if norm(stalks[u] .- stalks[v]) > threshold]
-end
-
-function update_real_geometry!(
-    G::GeoGraphReal,
-    rho::Vector{Float32};
-    eps::Float32 = 1f-3
-)
+function update_real_geometry!(G::GeoGraphReal, rho::Vector{Float32}; eps::Float32 = 1f-3)
     violated = Int[]
 
-    # Step 1: z-lift
     @inbounds for i in 1:G.n
-        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ[i])
-        G.R_vals[i]    = 0.0f0
-    end
-
-    # Step 2: scalar curvature
-    @inbounds for i in 1:G.n
-        pi = G.points3D[i]
-        for (k,j) in enumerate(G.neighbors[i])
-            d3 = norm(pi - G.points3D[j])
-            G.R_vals[i] += d3 - G.d0[i][k]
-        end
-    end
-
-    # Step 3: anisotropy
-    @inbounds for i in 1:G.n
-        acc, cnt = 0f0, 0
-        Ri = G.R_vals[i]
-        for (k,j) in enumerate(G.neighbors[i])
-            dist = G.d0[i][k]
-            ΔR   = abs(Ri - G.R_vals[j])
-            if dist > 1f-6
-                acc += ΔR / dist
-                cnt += 1
-            end
-        end
-        G.anisotropy[i] = cnt > 0 ? acc/cnt : 0f0
-    end
-
-    # Step 4: volume & shape check
-    for i in 1:G.n
-        vol          = ρ[i] + sum(ρ[j] for j in G.neighbors[i])
-        expected_vol = (1 + length(G.neighbors[i])) / G.n
-        vol_ok   = abs(vol - expected_vol) ≤ eps
-        shape_ok = abs(G.R_vals[i]) ≤ eps * (1.0f0 + G.anisotropy[i])
-        if !(vol_ok && shape_ok)
-            push!(violated, i)
-        end
-    end
-
-    return violated
-end
-
-function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε=1f-3)
-    violated = Int[]
-
-    # Step 1: z-lift imagined ρ to 3D points
-    @inbounds for i in 1:G.n
-        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -ρ_imag[i])
+        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -rho[i])
         G.R_vals[i] = 0.0f0
     end
 
-    # Step 2: Compute curvature for imagined field
     @inbounds for i in 1:G.n
         pi = G.points3D[i]
-        for (k,j) in enumerate(G.neighbors[i])
+        for (k, j) in enumerate(G.neighbors[i])
             d3 = norm(pi - G.points3D[j])
             G.R_vals[i] += d3 - G.d0[i][k]
         end
     end
 
-    # Step 3: Compute anisotropy for imagined field
     @inbounds for i in 1:G.n
         acc, cnt = 0f0, 0
         Ri = G.R_vals[i]
-        for (k,j) in enumerate(G.neighbors[i])
+        for (k, j) in enumerate(G.neighbors[i])
             dist = G.d0[i][k]
             ΔR = abs(Ri - G.R_vals[j])
             if dist > 1f-6
@@ -205,10 +100,53 @@ function update_imagined_geometry!(G::GeoGraphReal, ρ_imag::Vector{Float32}; ε
         G.anisotropy[i] = cnt > 0 ? acc / cnt : 0f0
     end
 
-    # Step 4: Sheath stress check (optional during training)
-    # (Optional: compute sheath stress on ρ_imag)
+    for i in 1:G.n
+        vol = rho[i] + sum(rho[j] for j in G.neighbors[i])
+        expected_vol = (1 + length(G.neighbors[i])) / G.n
+        vol_ok = abs(vol - expected_vol) ≤ eps
+        shape_ok = abs(G.R_vals[i]) ≤ eps * (1.0f0 + G.anisotropy[i])
+        if !(vol_ok && shape_ok)
+            push!(violated, i)
+        end
+    end
 
-    return nothing
+    return violated
+end
+
+function update_imagined_geometry!(G::GeoGraphReal, rho_imag::Vector{Float32}; eps::Float32 = 1f-3)
+    violated = Int[]
+
+    # Step 1: Lift into 3D
+    @inbounds for i in 1:G.n
+        G.points3D[i] = Point3(G.flat_x[i], G.flat_y[i], -rho_imag[i])
+        G.R_vals[i] = 0.0f0
+    end
+
+    # Step 2: Compute scalar curvature
+    @inbounds for i in 1:G.n
+        pi = G.points3D[i]
+        for (k, j) in enumerate(G.neighbors[i])
+            d3 = norm(pi - G.points3D[j])
+            G.R_vals[i] += d3 - G.d0[i][k]
+        end
+    end
+
+    # Step 3: Compute anisotropy
+    @inbounds for i in 1:G.n
+        acc, cnt = 0f0, 0
+        Ri = G.R_vals[i]
+        for (k, j) in enumerate(G.neighbors[i])
+            dist = G.d0[i][k]
+            ΔR = abs(Ri - G.R_vals[j])
+            if dist > 1f-6
+                acc += ΔR / dist
+                cnt += 1
+            end
+        end
+        G.anisotropy[i] = cnt > 0 ? acc / cnt : 0f0
+    end
+
+    return nothing  # No violation tracking here (optional to add)
 end
 
 struct GeoNode
@@ -218,8 +156,8 @@ struct GeoNode
     ρ_imag::Vector{Float32}
     R_imag::Vector{Float32}
     A_imag::Vector{Float32}
-    λ::Float32
-    sheath_stress::Vector{Float32}  # from imag field
+    lambda::Float32
+    sheath_stress::Vector{Float32}
     flux::Vector{Float32}
     action_cost::Float32
 end
