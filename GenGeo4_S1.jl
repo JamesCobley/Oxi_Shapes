@@ -713,11 +713,19 @@ end
     return flow_traces, trace_metadata, simplex
 end
 
+println("→ FlowTraces: ", length(flow_traces))
+println("→ Metadata: ", length(trace_metadata))
+println("→ Simplex: ", length(simplex))
+
 function save_run_data(batch_id::String, flow_traces, trace_metadata, simplex)
-    mkpath("data/$(batch_id)")
-    @save "data/$(batch_id)/flow_traces.bson" flow_traces
-    @save "data/$(batch_id)/trace_metadata.bson" trace_metadata
-    @save "data/$(batch_id)/simplex.bson" simplex
+    @save "flow_traces_$batch_id.bson" flow_traces
+    @save "trace_metadata_$batch_id.bson" trace_metadata
+    @save "simplex_$batch_id.bson" simplex
+
+    println("✔ Saved run summary:")
+    println("→ FlowTraces: ", length(flow_traces))
+    println("→ Metadata: ", length(trace_metadata))
+    println("→ Simplex: ", length(simplex))
 end
 
 # =============================================================================
