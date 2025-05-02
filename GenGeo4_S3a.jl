@@ -9,6 +9,7 @@ using StatsBase
 using Statistics: mean
 using Random
 using Wavelets
+using Wavelets: dwt, wavelet
 using UUIDs
 using BSON: @save, @load
 using Dates
@@ -65,46 +66,59 @@ catch e
     @error "❌ Failed to load one or more required files for batch $(batch_id)" exception = e
 end
 
-wavelet_obj = Wavelets.wavelet(Wavelets.WT.db2)
+# =============================================================================
+# Perform the wavelet analysis 
+# =============================================================================
 
-function get_wavelet_embedding(series::Union{
-    Vector{Float64}, Vector{Float32}, Vector{Vector{Float32}}, Vector{Vector{Float64}}};
-    wavelet=wavelet_obj, level=3)
+wavelet_obj = wavelet(Wavelets.WT.db2)
 
-    if eltype(series) <: AbstractFloat
-        coeffs = dwtcoeffs(collect(Float64, series), wavelet, level)
-        return vcat(coeffs...)  # flatten
+function get_wavelet_embedding(series::Union{Vector{<:Real}, Vector{Vector{<:Real}}};
+                                wavelet=Wavelets.wavelet(Wavelets.WT.db2), level=3)
+
+    # Pad to nearest power-of-2 length
+    function pad_to_pow2(v::Vector{<:Real})
+        n = length(v)
+        next_pow2 = 2^ceil(Int, log2(n))
+        return vcat(v, zeros(next_pow2 - n))
+    end
+
+    if eltype(series) <: Real
+        padded = pad_to_pow2(series)
+        coeffs = dwt(padded, wavelet, level)
+        return vcat(coeffs...)  # coeffs is a Tuple of Arrays
     elseif eltype(series) <: AbstractVector
         result = Float64[]
         for subvec in series
-            coeffs = dwtcoeffs(collect(Float64, subvec), wavelet, level)
+            padded = pad_to_pow2(collect(subvec))
+            coeffs = dwt(padded, wavelet, level)
             append!(result, vcat(coeffs...))
         end
         return result
     else
-        error("Unsupported series type: $(eltype(series))")
+        error("Unsupported input type: $(eltype(series))")
     end
 end
 
 function build_wavelet_embeddings(flow_traces::Vector{FlowTrace};
-                                  wavelet=wavelet_obj, level=3)
+                                  wavelet=Wavelets.wavelet(Wavelets.WT.db2), level=3)
 
     wavelet_features = [
         :ρ_series,
         :flux_series,
         :R_series,
-        :shannon_entropy_series,
-        :fisher_info_series
+        
     ]
 
     embeddings = Vector{Dict{Symbol, Vector{Float64}}}(undef, length(flow_traces))
+
     for (i, trace) in enumerate(flow_traces)
         result = Dict{Symbol, Vector{Float64}}()
         for key in wavelet_features
             if hasproperty(trace, key)
                 data = getproperty(trace, key)
                 try
-                    result[key] = get_wavelet_embedding(data; wavelet=wavelet, level=level)
+                    embedding = get_wavelet_embedding(data; wavelet=wavelet, level=level)
+                    result[key] = embedding
                 catch err
                     @warn "Wavelet failed on $key in trace $i" exception=err
                 end
@@ -112,6 +126,7 @@ function build_wavelet_embeddings(flow_traces::Vector{FlowTrace};
         end
         embeddings[i] = result
     end
+
     return embeddings
 end
 
