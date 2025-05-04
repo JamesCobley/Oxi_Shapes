@@ -728,8 +728,11 @@ return FlowTrace(
     geo_path,
     lyap,
     action_cost,
-    mean_pred_error  # ← ✅ must be included here now
+    mean_pred_error
 ), trace_meta
+
+end  # ← ✅ This was missing
+
 
 # =============================================================================
 # Support Functions
@@ -796,12 +799,3 @@ initials = samples
 
 # --- Run Simulation ---
 flow_traces, trace_metadata, simplex = rollout_batch(initials, pf_states, flat_pos, edges, simulation_steps, brain)
-
-# ✅ Now it's safe to call:
-println("→ FlowTraces: ", length(flow_traces))
-println("→ Metadata: ", length(trace_metadata))
-println("→ Simplex: ", length(simplex))
-
-save_run_data(flow_traces, trace_metadata, simplex)
-
-println("✔ Finished rollout and saved data")
