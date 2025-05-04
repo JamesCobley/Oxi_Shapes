@@ -159,9 +159,9 @@ function update_info_potential!(brain::HypergraphBrain1, simplex;
             avg_lambda = mean(abs, lambda_vals)
 
             for i in edge
-                total_error = brain.spectral_error[i] + brain.fourier_error[i] + 1e-8f0
-                spectral_weight = (brain.fourier_error[i] + 1e-8f0) / total_error
-                fourier_weight  = (brain.spectral_error[i] + 1e-8f0) / total_error
+                total_error = brain.spectral_error[i] + brain.fourier_error[i] + 1f-8
+                spectral_weight = (brain.fourier_error[i] + 1f-8) / total_error
+                fourier_weight  = (brain.spectral_error[i] + 1f-8) / total_error
                 combined_weight = 0.5f0 * (spectral_weight + fourier_weight)
 
                 delta_phi[i] += eta * combined_weight * (avg_lambda - abs(nodes[i].lambda))
@@ -176,7 +176,7 @@ end
 function ricci_flow_learn!(brain::HypergraphBrain1, simplex;
                            eta::Float32 = 0.1f0,
                            max_steps::Int = 20,
-                           tol::Float32 = 1e-4)
+                           tol::Float32 = 0.00001f0)
 
     nodes = reduce(vcat, simplex)
     phi_history = [copy(brain.phi)]
@@ -206,7 +206,7 @@ end
 # Run Full Learning
 # =============================================================================
 brain = build_hypergraph_from_simplex(simplex, trace_metadata, spectral_features, basis)
-brain, phi_history = ricci_flow_learn!(brain, simplex; eta=0.1f0, max_steps=20, tol=1e-4)
+brain, phi_history = ricci_flow_learn!(brain, simplex; eta=0.1f0, max_steps=20, tol=0.00001f0)
 
 @save "ricci_learned_brain_$(batch_id).bson" brain phi_history
 println("✔ Ricci flow learning complete and brain + φ evolution saved.")
