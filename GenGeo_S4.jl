@@ -16,7 +16,22 @@ using Dates
 # Load the brain
 # =============================================================================
 
-@load "ricci_learned_brain_<your_batch_id>.bson" brain
+struct HypergraphBrain1
+    edge_sets::Dict{Symbol, Vector{Vector{Int}}}
+    weights::Dict{Symbol, Vector{Float32}}
+    phi::Vector{Float32}
+    psi::Vector{Float32}
+    lambda::Vector{Float32}
+    L::SparseMatrixCSC{Float32, Int}
+    modes::Matrix{Float32}
+    trace_patterns::Vector{Dict{Vector{String}, Int}}
+    delta_commutators::Vector{Float32}
+    fourier_features::Vector{Dict{Vector{String}, Int}}
+    fourier_basis::Vector{Vector{String}}
+    spectral_error::Vector{Float32}
+    fourier_error::Vector{Float32}
+end
+@load "/content/ricci_learned_brain_batch_20250502_120445.bson" brain
 
 # =============================================================================
 # Geomtric object 1: The GeoNode = real and imagined Oxi-shape
@@ -565,19 +580,59 @@ struct FlowTrace
     geodesic_path::Vector{String}
     lyapunov::Float32
     action_cost::Float32
-    mean_pred_error::Float32  # ← ✅ Add this line
+    mean_pred_error::Float32   # ← ✅ Add this line
 end
 
 # =============================================================================
 # Prediction from Ricci-Learned Brain
 # =============================================================================
 
-function predict_with_brain_from_real(ρ_real::Vector{Float32}, brain::HypergraphBrain1)
-    normed_phi = brain.phi ./ sum(brain.phi)
-    ρ_pred = 1 .- normed_phi
+function predict_with_hypergraph_reasoning(
+    ρ_real::Vector{Float32},
+    brain::HypergraphBrain1;
+    top_k::Int = 10
+)
+    k_dist = compute_k_distribution(ρ_real, pf_states)
+    mean_k = weighted_mean_oxidation(k_dist)
+
+    N = minimum([
+        length(brain.lambda),
+        length(brain.phi),
+        length(brain.delta_commutators),
+        length(brain.fourier_features)
+    ])
+
+    similarities = Float32[]
+    for i in 1:N
+        Δk = abs(mean_k - brain.lambda[i])
+        Δφ = abs(mean(brain.phi[1:N]) - brain.phi[i])
+        Δδ = abs(mean(brain.delta_commutators[1:N]) - brain.delta_commutators[i])
+        push!(similarities, 1f0 / (1f-5 + Δk + Δφ + Δδ))
+    end
+
+    top_k = min(top_k, N)
+    top_idx = partialsortperm(similarities, rev=true, 1:top_k)
+
+    weights = similarities[top_idx]
+    weights ./= sum(weights)
+
+    ρ_pred = zeros(Float32, 8)
+
+    for (j, i) in enumerate(top_idx)
+        prior = brain.fourier_features[i]
+        for (pattern, v) in prior
+            k = count(==('1'), pattern[1])
+            k_idx = k + 1
+            if k_idx ≤ 8
+                ρ_pred[k_idx] += weights[j] * Float32(v)
+            end
+        end
+    end
+
     ρ_pred ./= sum(ρ_pred)
-    return Float32.(ρ_pred)
+    return ρ_pred
 end
+
 
 # --- Record Flow Trace
 function record_flow_trace!(ρ0::Vector{Float32}, T::Int, pf_states, flat_pos, edges;
@@ -640,7 +695,7 @@ function record_flow_trace!(ρ0::Vector{Float32}, T::Int, pf_states, flat_pos, e
         total_moves += 1
 
         # --- Ricci Flow Brain Prediction ---
-        ρ_pred = predict_with_brain_from_real(ρ, brain)
+        ρ_pred = predict_with_hypergraph_reasoning(ρ, brain)
         update_imagined_geometry!(G, ρ_pred)
         λ_pred = compute_lambda(ρ, ρ_pred)
         push!(prediction_lambda_series, λ_pred)
@@ -659,28 +714,28 @@ function record_flow_trace!(ρ0::Vector{Float32}, T::Int, pf_states, flat_pos, e
     mean_pred_error = mean(prediction_lambda_series)
     println("📉 Mean Ricci prediction λ-error: ", round(mean_pred_error, digits=5))
 
-    return FlowTrace(
-        run_id,
-        ρ_series,
-        flux_series,
-        R_series,
-        k_states,
-        mean_oxidation_series,
-        shannon_entropy_series,
-        fisher_info_series,
-        transition_classes,
-        on_geodesic_flags,
-        geo_path,
-        lyap,
-        action_cost
-    ), trace_meta
-end
+return FlowTrace(
+    run_id,
+    ρ_series,
+    flux_series,
+    R_series,
+    k_states,
+    mean_oxidation_series,
+    shannon_entropy_series,
+    fisher_info_series,
+    transition_classes,
+    on_geodesic_flags,
+    geo_path,
+    lyap,
+    action_cost,
+    mean_pred_error  # ← ✅ must be included here now
+), trace_meta
 
 # =============================================================================
 # Support Functions
 # =============================================================================
 
-function rollout_batch(batch_id::String, initials, pf_states, flat_pos, edges, T::Int, brain)
+function rollout_batch(initials, pf_states, flat_pos, edges, T::Int, brain)
     flow_traces = FlowTrace[]
     trace_metadata = Vector{Dict{Symbol, Any}}()
     simplex = Vector{Vector{GeoNode}}()
@@ -736,18 +791,17 @@ total_molecules = 100       # Total molecules per distribution
 simulation_steps = 100      # Number of time steps per simulation
 
 # --- Load Initials ---
-@load "initials_<your_batch_id>.bson" initials
-batch_id = "<your_batch_id>"
-println("✔ Loaded initials from batch: $batch_id")
+@load "/content/initials_batch_20250504_152322.bson" samples
+initials = samples
 
 # --- Run Simulation ---
-flow_traces, trace_metadata, simplex = rollout_batch(batch_id, initials, pf_states, flat_pos, edges, simulation_steps, brain)
+flow_traces, trace_metadata, simplex = rollout_batch(initials, pf_states, flat_pos, edges, simulation_steps, brain)
 
 # ✅ Now it's safe to call:
 println("→ FlowTraces: ", length(flow_traces))
 println("→ Metadata: ", length(trace_metadata))
 println("→ Simplex: ", length(simplex))
 
-save_run_data(batch_id, flow_traces, trace_metadata, simplex)
+save_run_data(flow_traces, trace_metadata, simplex)
 
-println("✔ Finished rollout and saved data for batch: $batch_id")
+println("✔ Finished rollout and saved data")
