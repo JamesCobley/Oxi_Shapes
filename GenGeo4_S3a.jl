@@ -66,13 +66,10 @@ catch e
     @error "❌ Failed to load one or more required files for batch $(batch_id)" exception = e
 end
 
-# =============================================================================
-# Perform the wavelet analysis 
-# =============================================================================
 
 wavelet_obj = wavelet(Wavelets.WT.db2)
 
-function get_wavelet_embedding(series::Union{Vector{<:Real}, Vector{Vector{<:Real}}};
+function get_wavelet_embedding(series::Union{Vector{<:Real}, Vector{<:Vector{<:Real}}};
                                 wavelet=Wavelets.wavelet(Wavelets.WT.db2), level=3)
 
     # Pad to nearest power-of-2 length
