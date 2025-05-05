@@ -1,5 +1,5 @@
 # =============================================================================
-# MetaLambda + Ricci Flow Brain: Integrated Geometric Learning Framework
+# MetaLambda Ricci Flow Learner – Hypergraph Construction & Training
 # =============================================================================
 
 using LinearAlgebra
@@ -10,34 +10,34 @@ using Statistics
 using BSON: @save, @load
 
 # =============================================================================
-# Load Data (assumes batch_id defined)
-# =============================================================================
-@load "/content/flow_traces_batch_20250504_152322.bson" flow_traces
-@load "/content/wavelet_embeddings_batch_20250504_152322.bson" wavelet_embeddings
-@load "/content/trace_spectral_analysis_batch_20250504_152322.bson" spectral_data
-spectral_features = spectral_data[:features]
-basis = spectral_data[:basis]
-@load "/content/simplex_batch_20250504_152322.bson" simplex
-simplex = [Vector{GeoNode}(run) for run in simplex]
-
-# =============================================================================
-# Structures
+# Load Data (adjust your batch ID accordingly)
 # =============================================================================
 
-struct MetaLambdaNode
-    id::Int
-    wavelet::Dict{Symbol, Vector{Float64}}
-    spectral::Dict{Vector{String}, Int}
-    λ::Float32
-    curvature::Float32
+struct GeoNode
+    ρ_real::Vector{Float32}
+    R_real::Vector{Float32}
+    A_real::Vector{Float32}
+    ρ_imag::Vector{Float32}
+    R_imag::Vector{Float32}
+    A_imag::Vector{Float32}
+    lambda::Float32
+    sheath_stress::Vector{Float32}
+    flux::Vector{Float32}
     action_cost::Float32
 end
 
-struct MetaLambdaHypergraph
-    nodes::Vector{MetaLambdaNode}
-    edges::Dict{Symbol, Vector{Tuple{Int, Int, Float64}}}
-    clusters::Vector{Int}
-end
+@load "/content/flow_traces_batch_20250505_080315.bson" flow_traces
+@load "/content/trace_metadata_batch_20250505_080315.bson" trace_metadata
+@load "/content/wavelet_embeddings_batch_20250505_080315.bson" wavelet_embeddings
+@load "/content/trace_spectral_analysis_batch_20250505_080315.bson" spectral_data
+spectral_features = spectral_data[:features]
+basis = spectral_data[:basis]
+@load "/content/simplex_batch_20250505_080315.bson" simplex
+simplex = [Vector{GeoNode}(run) for run in simplex]
+
+# =============================================================================
+# HypergraphBrain1 Structure (fully expressive)
+# =============================================================================
 
 struct HypergraphBrain1
     edge_sets::Dict{Symbol, Vector{Vector{Int}}}
@@ -53,20 +53,15 @@ struct HypergraphBrain1
     fourier_basis::Vector{Vector{String}}
     spectral_error::Vector{Float32}
     fourier_error::Vector{Float32}
+    curvature::Vector{Float32}
+    anisotropy::Vector{Float32}
 end
 
 # =============================================================================
 # Utility Functions
 # =============================================================================
-cosine_similarity(x, y) = dot(x, y) / (norm(x) * norm(y) + 1e-8)
 
-function jaccard_similarity(a::Dict, b::Dict)
-    keys_a = Set(keys(a))
-    keys_b = Set(keys(b))
-    inter = length(intersect(keys_a, keys_b))
-    union_size = length(union(keys_a, keys_b))
-    return inter / (union_size + 1e-8)
-end
+cosine_similarity(x, y) = dot(x, y) / (norm(x) * norm(y) + 1e-8)
 
 function group_by(assignments)
     bin_dict = Dict{Int, Vector{Int}}()
@@ -83,36 +78,69 @@ function spectral_bin_indices(modes::Matrix{T}, k::Int) where T<:AbstractFloat
     return result.assignments
 end
 
+function build_simplex_surface(simplex::Vector{Vector{GeoNode}})
+    T = maximum(length.(simplex))
+    R = length(simplex)
+    λ_surf = zeros(Float32, T, R)
+    for (j, run) in enumerate(simplex)
+        for (i, node) in enumerate(run)
+            λ_surf[i, j] = node.lambda
+        end
+    end
+    return λ_surf
+end
+
+function build_simplex_laplacian(surface::Matrix{Float32})
+    T, R = size(surface)
+    n = T * R
+    W = zeros(Float32, n, n)
+
+    for t in 1:T
+        for r in 1:R
+            idx = (t-1)*R + r
+            if t < T
+                W[idx, idx+R] = 1.0f0
+                W[idx+R, idx] = 1.0f0
+            end
+            if r < R
+                W[idx, idx+1] = 1.0f0
+                W[idx+1, idx] = 1.0f0
+            end
+        end
+    end
+
+    D = Diagonal(vec(sum(W, dims=2)))
+    return D - W
+end
+
 # =============================================================================
-# Build Hypergraph Brain
+# Build Hypergraph Brain from Simplex
 # =============================================================================
 
 function build_hypergraph_from_simplex(simplex, trace_metadata, trace_features, trace_basis;
                                        mode_rank=10, spectral_bins=5, alpha=1.0f0, beta=1.0f0)
-
     nodes = reduce(vcat, simplex)
     N = length(nodes)
 
-    # Laplacian and eigenmodes
     lambda_surface = build_simplex_surface(simplex)
     L = build_simplex_laplacian(lambda_surface)
     evals, evecs = eigen(Matrix(L))
     modes = evecs[:, 1:min(mode_rank, size(evecs, 2))]
 
-    # Fields
     lambda_vals = [n.lambda for n in nodes]
     local_energy = [sum(abs.(n.R_real)) for n in nodes]
     local_entropy = [sum(abs.(n.flux)) for n in nodes]
     psi = [alpha * e + beta * s for (e, s) in zip(local_energy, local_entropy)]
     phi = zeros(Float32, N)
 
-    # Spectral binning
+    curvature_vals = [mean(n.R_real) for n in nodes]
+    anisotropy_vals = [mean(n.A_real) for n in nodes]
+
     edge_sets = Dict{Symbol, Vector{Vector{Int}}}()
     edge_sets[:curvature] = group_by(spectral_bin_indices(modes, spectral_bins))
     edge_sets[:divergence] = group_by(spectral_bin_indices(modes, spectral_bins))
     edge_sets[:action_cost] = group_by(spectral_bin_indices(modes, spectral_bins))
 
-    # Fourier-like grouping
     trace_bin_groups = Dict{Int, Vector{Int}}()
     for (i, feats) in enumerate(trace_features)
         score = sum(values(feats))
@@ -120,35 +148,26 @@ function build_hypergraph_from_simplex(simplex, trace_metadata, trace_features, 
     end
     edge_sets[:fourier_spectral] = collect(values(trace_bin_groups))
 
-    # Weights
     weights = Dict{Symbol, Vector{Float32}}()
     for k in keys(edge_sets)
         weights[k] = ones(Float32, length(edge_sets[k]))
     end
 
     return HypergraphBrain1(
-        edge_sets,
-        weights,
-        phi,
-        psi,
-        lambda_vals,
-        sparse(L),
-        modes,
+        edge_sets, weights, phi, psi, lambda_vals, sparse(L), modes,
         [m[:patterns] for m in trace_metadata],
         [m[:delta] for m in trace_metadata],
-        trace_features,
-        trace_basis,
-        zeros(Float32, N),
-        zeros(Float32, N)
+        trace_features, trace_basis,
+        zeros(Float32, N), zeros(Float32, N),
+        curvature_vals, anisotropy_vals
     )
 end
 
 # =============================================================================
-# Ricci Flow Learning (with λ convergence and φ history)
+# Ricci Flow Learner
 # =============================================================================
 
-function update_info_potential!(brain::HypergraphBrain1, simplex;
-                                eta::Float32 = 0.1f0)
+function update_info_potential!(brain::HypergraphBrain1, simplex; eta::Float32=0.1f0)
     nodes = reduce(vcat, simplex)
     N = length(nodes)
     delta_phi = zeros(Float32, N)
@@ -157,14 +176,15 @@ function update_info_potential!(brain::HypergraphBrain1, simplex;
         for edge in edges
             lambda_vals = [nodes[i].lambda for i in edge]
             avg_lambda = mean(abs, lambda_vals)
-
             for i in edge
                 total_error = brain.spectral_error[i] + brain.fourier_error[i] + 1f-8
                 spectral_weight = (brain.fourier_error[i] + 1f-8) / total_error
                 fourier_weight  = (brain.spectral_error[i] + 1f-8) / total_error
                 combined_weight = 0.5f0 * (spectral_weight + fourier_weight)
-
-                delta_phi[i] += eta * combined_weight * (avg_lambda - abs(nodes[i].lambda))
+                curvature_factor = 1f0 + abs(brain.curvature[i])
+                anisotropy_factor = 1f0 + abs(brain.anisotropy[i])
+                geom_weight = curvature_factor * anisotropy_factor
+                delta_phi[i] += eta * combined_weight * geom_weight * (avg_lambda - abs(nodes[i].lambda))
             end
         end
     end
@@ -177,7 +197,6 @@ function ricci_flow_learn!(brain::HypergraphBrain1, simplex;
                            eta::Float32 = 0.1f0,
                            max_steps::Int = 20,
                            tol::Float32 = 0.00001f0)
-
     nodes = reduce(vcat, simplex)
     phi_history = [copy(brain.phi)]
     prev_lambda = [abs(n.lambda) for n in nodes]
@@ -186,16 +205,13 @@ function ricci_flow_learn!(brain::HypergraphBrain1, simplex;
         println("→ Ricci flow step $step")
         update_info_potential!(brain, simplex; eta=eta)
         push!(phi_history, copy(brain.phi))
-
         curr_lambda = [abs(n.lambda) for n in nodes]
         delta = maximum(abs.(curr_lambda .- prev_lambda))
         println("   λ smoothness Δ = $delta")
-
         if delta < tol
             println("✅ Converged at step $step (Δλ < $tol)")
             break
         end
-
         prev_lambda = curr_lambda
     end
 
@@ -203,10 +219,10 @@ function ricci_flow_learn!(brain::HypergraphBrain1, simplex;
 end
 
 # =============================================================================
-# Run Full Learning
+# Run and Save
 # =============================================================================
+
 brain = build_hypergraph_from_simplex(simplex, trace_metadata, spectral_features, basis)
 brain, phi_history = ricci_flow_learn!(brain, simplex; eta=0.1f0, max_steps=20, tol=0.00001f0)
-
 @save "ricci_learned_brain_$(batch_id).bson" brain phi_history
 println("✔ Ricci flow learning complete and brain + φ evolution saved.")
