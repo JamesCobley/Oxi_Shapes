@@ -6,7 +6,9 @@ A breif overview of the scripts by their use-case is as follows:
 2. Figure_2. The flat and curved Oxi-Shapes were initially derived using the static scripts (e.g., [R4_oxi](https://github.com/JamesCobley/Oxi_Shapes/blob/main/Oxi_Shapes_R4.py)) before the application was generated to automate the process and enable dynamic paramater tuning with an automatic Oxi-Shape PNG download image at 300 DPI. 
 3. Static and dynamic geometry calculator. The [C_shapes](https://github.com/JamesCobley/Oxi_Shapes/blob/main/C_shapes.py) script prints the i-space cardinality, k-space strucutre (binomial coefficients), and allowed and barred transition as an excel file for any R interger. This was extended to an [app](https://cshapes.streamlit.app/).
 4. Application. The Oxi-Shapes [Streamlit](https://streamlit.io/) app was generated using the [app](https://github.com/JamesCobley/Oxi_Shapes/blob/main/App.py) script. The application can be accessed for free [online](https://oxishapes.streamlit.app/). The application was used to create Extended Figure 3 and 4.
-# ProteoGeoFlow
+# ALIVE
+
+# Generative Geometry 
 
 # Resources 
 This repository contains the white paper, where the detailed mathematical basis of Oxi-Shapes is elaborated (supplemental information), and the  methods section. 
