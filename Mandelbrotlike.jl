@@ -23,40 +23,36 @@ end
 @load "flow_traces_batch_20250524_152552.bson" flow_traces
 println("✔ Loaded ", length(flow_traces), " flow traces.")
 
-# --- Recompute corrected Lyapunov exponent ---
+# --- Use updated Lyapunov if defined ---
 function lyapunov_start_end(series::Vector{Vector{Float32}})
     norm_start = norm(series[1])
     norm_diff = norm(series[end] .- series[1])
     return (norm_start > 0f0 && norm_diff > 0f0) ? log(norm_diff / norm_start) : 0f0
 end
 
-lyapunov_values = [lyapunov_start_end(ft.ρ_series) for ft in flow_traces]
-
-# --- Filter chaotic traces ---
-chaotic_traces = [(ft, lyap) for (ft, lyap) in zip(flow_traces, lyapunov_values) if lyap > 0f0]
-println("✔ Using ", length(chaotic_traces), " chaotic traces.")
-
-# --- Define state space ---
+# --- Setup ---
 states = ["000", "001", "010", "011", "100", "101", "110", "111"]
 state_to_index = Dict(s => i-1 for (i, s) in enumerate(states))
 
-# --- Project onto complex plane ---
 points = ComplexF32[]
 weights = Float32[]
 
-for (ft, lyap) in chaotic_traces
-    for (t, ρ) in enumerate(ft.ρ_series)
-        idx = argmax(ρ)
-        real_part = state_to_index[states[idx]]
-        im_part = mean(ft.R_series[min(t, end)])  # Ricci curvature at step
-        push!(points, ComplexF32(real_part, im_part))
-        push!(weights, lyap)  # Weight by corrected Lyapunov
+for ft in flow_traces
+    lyap = lyapunov_start_end(ft.ρ_series)
+    if lyap > 0  # Only include chaotic
+        for (t, ρ) in enumerate(ft.ρ_series)
+            idx = argmax(ρ)
+            real_part = state_to_index[states[idx]]
+            im_part = mean(ft.R_series[min(t, end)])
+            push!(points, ComplexF32(real_part, im_part))
+            push!(weights, lyap)
+        end
     end
 end
 
-# --- Create complex plane grid ---
-x_bins = 0:0.05:7  # State space (000–111)
-y_bins = -0.05:0.001:0.05  # Curvature range (adjust if needed)
+# --- Grid ---
+x_bins = 0:1:7
+y_bins = -0.04:0.002:0.04
 Z = zeros(Float32, length(x_bins), length(y_bins))
 
 for (z, w) in zip(points, weights)
@@ -67,13 +63,23 @@ for (z, w) in zip(points, weights)
     end
 end
 
+# Log scale
+Z_log = log.(1 .+ Z)
+Z_log ./= maximum(Z_log)
+
 # --- Plot ---
+fig = Figure(size = (1000, 500))
+ax = Axis(fig[1, 1], 
+    xlabel = "Proteoform State", 
+    ylabel = "Mean Ricci Curvature",
+    xticks = (0:7, states),
+    yticks = y_bins[1:5:end],
+    title = "Fractal-Constrained Chaos in Redox Geometry"
+)
 
-fig = Figure(size = (1000, 500))  # ← use `size` instead of `resolution`
-ax = Axis(fig[1, 1], xlabel="State Index", ylabel="Mean Ricci Curvature")
+hm = heatmap!(ax, x_bins[1:end-1], y_bins[1:end-1], Z_log[1:end-1, 1:end-1]', colormap = :magma)
 
-hm = heatmap!(ax, x_bins[1:end-1], y_bins[1:end-1], Z[1:end-1, 1:end-1]', colormap = :viridis)
-Colorbar(fig[1, 2], hm, label = "Lyapunov Exponent")  # ← use `hm` directly here
+Colorbar(fig[1, 2], hm, label = "Normalized Lyapunov")
 
-save("/content/chaos_geometry_map_corrected.png", fig; px_per_unit=3)
+save("/content/chaos_geometric_signature.png", fig; px_per_unit=3)
 fig
