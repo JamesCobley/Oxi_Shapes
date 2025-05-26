@@ -106,6 +106,53 @@ function update_geometry!(G::GeoGraphReal2, rho::Vector{Float32}; eps::Float32=1
     return violated
 end
 
+# Simulate sulfenic deformation by displacing oxidized cysteines
+function simulate_sulfenic_deformation(coords::Vector{SVector{3, Float64}}, oxidized_idxs::Vector{Int})
+    displaced = copy(coords)
+    for idx in oxidized_idxs
+        # Sulfenic acid: approximate as +0.5 Å outward from centroid
+        normal = normalize(displaced[idx])  # crude outward direction
+        displaced[idx] += 0.5 * normal      # displace 0.5 Å
+    end
+    return displaced
+end
+
+# Estimate crude SASA for Cys residues as 1 / (sum of nearby atoms)
+function estimate_sasa(coords::Vector{SVector{3, Float64}}, cys_indices::Vector{Int}; cutoff=5.0)
+    sasa = zeros(Float64, length(cys_indices))
+    for (i, cys_idx) in enumerate(cys_indices)
+        center = coords[cys_idx]
+        sasa_count = 0
+        for (j, atom) in enumerate(coords)
+            if j == cys_idx
+                continue
+            end
+            if norm(atom - center) < cutoff
+                sasa_count += 1
+            end
+        end
+        sasa[i] = 1.0 / (sasa_count + 1e-3)  # more crowded = less exposed
+    end
+    return sasa
+end
+
+# Build Omega_coords using sulfenic deformation
+function build_deformed_Omega_coords(pf_states, coords, cys_indices)
+    Omega_coords = Dict{String, Vector{SVector{3, Float64}}}()
+    for state in pf_states
+        bits = BitVector([c == '1' for c in state])
+        oxidized = cys_indices[findall(bits)]
+        Omega_coords[state] = simulate_sulfenic_deformation(coords, oxidized)
+    end
+    return Omega_coords
+end
+
+# SASA bonus penalty to add to coupling term
+function sasa_penalty(coords::Vector{SVector{3, Float64}}, cys_indices::Vector{Int})
+    sasa_scores = estimate_sasa(coords, cys_indices)
+    return sum(sasa_scores)
+end
+
 # Morse function based on Ricci, anisotropy, and deformation
 function compute_morse_function(G::GeoGraphReal2, Omega_coords::Dict{String, Vector{SVector{3, Float64}}}, reactant::Reactant)
     n = G.n
@@ -125,7 +172,6 @@ function compute_morse_function(G::GeoGraphReal2, Omega_coords::Dict{String, Vec
     end
     return f
 end
-
 
 # Morse saddle barrier = max(f(i), f(j)) + small constant
 function compute_saddle_points(G::GeoGraphReal2, f::Vector{Float64}; barrier=0.1)
@@ -210,11 +256,12 @@ function total_coupling_with_morse(
 )
     R_val = G.R_vals[x_j]
     A_val = norm(G.anisotropy[x_j])
-    C_real = rmsd(Omega_coords[G.pf_states[x_i]], Omega_coords[G.pf_states[x_j]])
+    C_real = real_deformation_energy(Omega_coords[G.pf_states[x_i]], Omega_coords[G.pf_states[x_j]])
     C_react = reactant_coupling_energy(Omega_coords[G.pf_states[x_j]], G.cys_indices, reactant)
+    sasa = sasa_penalty(Omega_coords[G.pf_states[x_j]], G.cys_indices)
     key = x_i < x_j ? (x_i, x_j) : (x_j, x_i)
     M_barrier = get(saddles, key, 0.0)
-    return R_val + A_val + C_real + C_react + M_barrier
+    return R_val + A_val + C_real + C_react + M_barrier + 0.1 * sasa
 end
 
 # Optional: quantum-style rate equation
@@ -252,10 +299,7 @@ pdb_path = "/content/AF-P04406-F1-model_v4.pdb"
 coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
 
 # Omega_coords for each pf_state (simplified: all same coords now)
-Omega_coords = Dict{String, Vector{SVector{3, Float64}}}()
-for state in pf_states
-    Omega_coords[state] = coords  # Replace with deformed Ω if available
-end
+Omega_coords = build_deformed_Omega_coords(pf_states, coords, cys_indices)
 
 G = GeoGraphReal2(pf_states, flat_pos, edges, cys_indices)
 
