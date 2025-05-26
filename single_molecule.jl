@@ -2,7 +2,144 @@ using StaticArrays
 using LinearAlgebra
 using Graphs
 
-# -- Your Working Standalone Redox Geometry Model --
+# =============================================================================
+# Geometric object 1: The GeoGraphReal (modal discrete states graph)
+# =============================================================================
+
+pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
+flat_pos = Dict(
+    "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
+    "100" => (2.0, 2.0), "011" => (-1.0, 1.0), "101" => (0.0, 1.0),
+    "110" => (1.0, 1.0), "111" => (0.0, 0.0)
+)
+edges = [
+    ("000", "001"), ("000", "010"), ("000", "100"),
+    ("001", "011"), ("001", "101"), ("010", "011"), ("010", "110"),
+    ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
+]
+
+struct GeoGraphReal2
+    pf_states::Vector{String}
+    flat_pos::Dict{String, Tuple{Float64, Float64}}
+    edges::Vector{Tuple{String, String}}
+
+    n::Int
+    flat_x::Vector{Float32}
+    flat_y::Vector{Float32}
+    neighbors::Vector{Vector{Int}}
+    d0::Vector{Vector{Float32}}
+    edges_idx::Vector{Tuple{Int, Int}}
+    adjacency::Matrix{Float32}
+
+    R_vals::Vector{Float32}
+    anisotropy::Vector{SVector{3, Float32}}  # a 3D vector per node
+
+    cys_indices::Vector{Int}                  # cysteine residue indices for Omega coords
+end
+
+function GeoGraphReal2(pf_states, flat_pos, edges, cys_indices)
+    n = length(pf_states)
+    idx_map = Dict(s => i for (i, s) in enumerate(pf_states))
+    fx = Float32[flat_pos[s][1] for s in pf_states]
+    fy = Float32[flat_pos[s][2] for s in pf_states]
+    eidx = [(idx_map[u], idx_map[v]) for (u, v) in edges]
+    nbrs = [Int[] for _ in 1:n]
+    for (i, j) in eidx
+        push!(nbrs[i], j)
+        push!(nbrs[j], i)
+    end
+    d0 = [Float32[sqrt((fx[i] - fx[j])^2 + (fy[i] - fy[j])^2) for j in nbrs[i]] for i in 1:n]
+    g = SimpleGraph(n)
+    for (i, j) in eidx
+        add_edge!(g, i, j)
+    end
+    A = Float32.(adjacency_matrix(g))
+    Rbuf = zeros(Float32, n)
+    anis = [SVector{3, Float32}(0f0, 0f0, 0f0) for _ in 1:n]
+
+    return GeoGraphReal2(pf_states, flat_pos, edges, n, fx, fy, nbrs, d0, eidx, A, Rbuf, anis, cys_indices)
+end
+
+
+function update_geometry!(G::GeoGraphReal2, rho::Vector{Float32}; eps::Float32=1e-3)
+    n = G.n
+    # Reset R_vals
+    fill!(G.R_vals, 0f0)
+
+    # Compute discrete Laplacian (Ricci curvature proxy) R_i = sum neighbors (rho_j - rho_i)
+    @inbounds for i in 1:n
+        ri = rho[i]
+        for j in G.neighbors[i]
+            G.R_vals[i] += rho[j] - ri
+        end
+    end
+
+    # Compute anisotropy vectors A_i (directional bias)
+    @inbounds for i in 1:n
+        pi = SVector(G.flat_x[i], G.flat_y[i], 0f0)
+        bundle = SVector{3, Float32}(0f0, 0f0, 0f0)
+        for j in G.neighbors[i]
+            pj = SVector(G.flat_x[j], G.flat_y[j], 0f0)
+            ΔR = G.R_vals[i] - G.R_vals[j]
+            dir = pi - pj
+            normdir = norm(dir)
+            if normdir > 1e-6
+                bundle += (ΔR / normdir^2) * dir
+            end
+        end
+        n_nbrs = length(G.neighbors[i])
+        G.anisotropy[i] = n_nbrs > 0 ? bundle / n_nbrs : bundle
+    end
+
+    # Optional: check volume and shape constraints (not needed for rho with one 1 and rest 0)
+    violated = Int[]
+    for i in 1:n
+        vol = rho[i] + sum(rho[j] for j in G.neighbors[i])
+        expected_vol = (1 + length(G.neighbors[i])) / n
+        vol_ok = abs(vol - expected_vol) ≤ eps
+        shape_ok = abs(G.R_vals[i]) ≤ eps * (1.0f0 + norm(G.anisotropy[i]))
+        if !(vol_ok && shape_ok)
+            push!(violated, i)
+        end
+    end
+
+    return violated
+end
+
+# Morse function based on Ricci, anisotropy, and deformation
+function compute_morse_function(G::GeoGraphReal2, Omega_coords::Dict{String, Vector{SVector{3, Float64}}}, reactant::Reactant)
+    n = G.n
+    f = zeros(Float64, n)
+    for i in 1:n
+        R = G.R_vals[i]
+        A = norm(G.anisotropy[i])
+
+        # Use RMSD between the state's own Omega and itself = 0
+        D = 0.0
+
+        # Optional: reactant coupling energy (still geometric)
+        shape = Omega_coords[G.pf_states[i]]
+        C_react = reactant_coupling_energy(shape, G.cys_indices, reactant)
+
+        f[i] = R + A + D + C_react
+    end
+    return f
+end
+
+
+# Morse saddle barrier = max(f(i), f(j)) + small constant
+function compute_saddle_points(G::GeoGraphReal2, f::Vector{Float64}; barrier=0.1)
+    saddles = Dict{Tuple{Int,Int}, Float64}()
+    for (i, j) in G.edges_idx
+        key = i < j ? (i,j) : (j,i)
+        saddles[key] = max(f[i], f[j]) + barrier
+    end
+    return saddles
+end
+
+# =============================================================================
+# Redox real shape Omega loader and RMSD
+# =============================================================================
 
 function load_ca_trace_and_cysteines(pdb_path::String)
     coords = SVector{3, Float64}[]
@@ -27,199 +164,119 @@ function load_ca_trace_and_cysteines(pdb_path::String)
     return coords, cys_indices
 end
 
-function OmegaReal1(pdb_path::String, istate::BitVector)
-    coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
-    # No deformation: use coords directly
-    deformed = copy(coords)
-    energy = 0.0  # No deformation, so zero energy
-    return OmegaReal1(coords, cys_indices, istate, deformed, energy)
-end
-
-
 function rmsd(c1::Vector{SVector{3, Float64}}, c2::Vector{SVector{3, Float64}})
     sqrt(sum(norm(c1[i] - c2[i])^2 for i in 1:length(c1)) / length(c1))
 end
 
-mutable struct OmegaReal1
-    coords::Vector{SVector{3, Float64}}         # original real shape
-    cys_indices::Vector{Int}                    # positions of CYS
-    redox_state::BitVector                      # redox i-state
-    deformed::Vector{SVector{3, Float64}}       # Ω(x)
-    deformation_energy::Float64                 # ||Ω(x) - coords||
+# Simplified deformation energy between two coordinate sets
+function real_deformation_energy(coords1::Vector{SVector{3, Float64}}, coords2::Vector{SVector{3, Float64}})
+    rmsd(coords1, coords2)
 end
 
-function OmegaReal1(pdb_path::String, istate::BitVector)
-    coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
-    deformed = generate_Omega_x(coords, cys_indices, istate)
-    energy = rmsd(coords, deformed)
-    return OmegaReal1(coords, cys_indices, istate, deformed, energy)
+# =============================================================================
+# Reactant structure type and example reactants
+# =============================================================================
+
+struct Reactant
+    name::String
+    coords::Vector{SVector{3, Float64}}  # simplified shape points
+    interaction_radius::Float64           # effective radius for interaction decay
 end
 
-# -- Modal graph states and edges --
-
-pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
-
-flat_pos = Dict(
-    "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
-    "100" => (2.0, 2.0), "011" => (-1.0, 1.0), "101" => (0.0, 1.0),
-    "110" => (1.0, 1.0), "111" => (0.0, 0.0)
+# Example reductant and oxidant shapes (simple 3-point models)
+reductant = Reactant(
+    "reductant",
+    [SVector(0.0, 0.0, 0.0), SVector(1.0, 0.0, 0.0), SVector(0.0, 1.0, 0.0)],
+    5.0
 )
 
-edges = [
-    ("000", "001"), ("000", "010"), ("000", "100"),
-    ("001", "011"), ("001", "101"), ("010", "011"), ("010", "110"),
-    ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
-]
+oxidant = Reactant(
+    "oxidant",
+    [SVector(0.0, 0.0, 0.0), SVector(-1.0, 0.0, 0.0), SVector(0.0, -1.0, 0.0)],
+    5.0
+)
 
-# -- Integrated GeoGraphReal struct --
+# =============================================================================
+# Reactant coupling energy calculation
+# =============================================================================
 
-mutable struct GeoGraphReal1
-    pf_states::Vector{String}
-    flat_pos::Dict{String, Tuple{Float64, Float64}}
-    edges::Vector{Tuple{String, String}}
-
-    n::Int
-    flat_x::Vector{Float32}
-    flat_y::Vector{Float32}
-    neighbors::Vector{Vector{Int}}
-    d0::Vector{Vector{Float32}}
-    edges_idx::Vector{Tuple{Int, Int}}
-    adjacency::Matrix{Float32}
-
-    points3D::Vector{SVector{3, Float32}}       # 2D pos + height (modal)
-    R_vals::Vector{Float32}                      # Ricci curvature at each node
-    anisotropy::Vector{SVector{3, Float32}}     # Residue-level directional functional
-
-    omega_states::Vector{OmegaReal1}             # The real proteoform shape at each modal node
+# Total geometric coupling (curvature + anisotropy + deformation + saddle)
+function total_coupling_with_morse(
+    x_i::Int, x_j::Int,
+    G::GeoGraphReal2,
+    Omega_coords::Dict{String, Vector{SVector{3, Float64}}},
+    reactant::Reactant,
+    saddles::Dict{Tuple{Int,Int}, Float64}
+)
+    R_val = G.R_vals[x_j]
+    A_val = norm(G.anisotropy[x_j])
+    C_real = rmsd(Omega_coords[G.pf_states[x_i]], Omega_coords[G.pf_states[x_j]])
+    C_react = reactant_coupling_energy(Omega_coords[G.pf_states[x_j]], G.cys_indices, reactant)
+    key = x_i < x_j ? (x_i, x_j) : (x_j, x_i)
+    M_barrier = get(saddles, key, 0.0)
+    return R_val + A_val + C_real + C_react + M_barrier
 end
 
-function GeoGraphReal1(pf_states, flat_pos, edges, pdb_path::String)
-    n = length(pf_states)
-    idx_map = Dict(s => i for (i, s) in enumerate(pf_states))
-    fx = Float32[flat_pos[s][1] for s in pf_states]
-    fy = Float32[flat_pos[s][2] for s in pf_states]
-    eidx = [(idx_map[u], idx_map[v]) for (u, v) in edges]
-    nbrs = [Int[] for _ in 1:n]
-    for (i, j) in eidx
-        push!(nbrs[i], j)
-        push!(nbrs[j], i)
-    end
-    d0 = [Float32[sqrt((fx[i] - fx[j])^2 + (fy[i] - fy[j])^2) for j in nbrs[i]] for i in 1:n]
-
-    g = SimpleGraph(n)
-    for (i, j) in eidx
-        add_edge!(g, i, j)
-    end
-    A = Float32.(adjacency_matrix(g))
-
-    pts3D = [SVector{3, Float32}(fx[i], fy[i], 0f0) for i in 1:n]
-    Rbuf = zeros(Float32, n)
-    anis = [SVector{3, Float32}(0f0, 0f0, 0f0) for _ in 1:n]
-
-    # Load all OmegaReal1 redox states ONCE here
-    omega_states = Vector{OmegaReal1}(undef, n)
-    for (i, state_str) in enumerate(pf_states)
-        istate = BitVector([c == '1' for c in state_str])
-        omega_states[i] = OmegaReal1(pdb_path, istate)
-    end
-
-    return GeoGraphReal1(pf_states, flat_pos, edges, n, fx, fy, nbrs, d0, eidx, A, pts3D, Rbuf, anis, omega_states)
+# Optional: quantum-style rate equation
+function transition_rate(x_i::Int, x_j::Int, G::GeoGraphReal2, Omega_coords, reactant, saddles; α=1.0)
+    ΔF = total_coupling_with_morse(x_i, x_j, G, Omega_coords, reactant, saddles)
+    return exp(-2α * ΔF)
 end
 
-# -- Update geometry and anisotropy --
+# =============================================================================
+# Total coupling function incorporating all terms
+# =============================================================================
 
-function compute_ricci_curvature(G::GeoGraphReal, rho::Vector{Float32})
-    R = zeros(Float32, G.n)
-    for i in 1:G.n
-        sum_neigh = 0f0
-        for j in G.neighbors[i]
-            sum_neigh += rho[j] - rho[i]
-        end
-        R[i] = sum_neigh
-    end
-    return R
+function total_coupling_with_morse(
+    x_i::Int, x_j::Int,
+    G::GeoGraphReal2,
+    Omega_coords::Dict{String, Vector{SVector{3, Float64}}},
+    reactant::Reactant,
+    saddles::Dict{Tuple{Int,Int}, Float64}
+)
+    R_val = G.R_vals[x_j]
+    A_val = norm(G.anisotropy[x_j])
+    C_real = real_deformation_energy(Omega_coords[G.pf_states[x_i]], Omega_coords[G.pf_states[x_j]])
+    C_react = reactant_coupling_energy(Omega_coords[G.pf_states[x_j]], G.cys_indices, reactant)
+    # Get Morse saddle barrier if edge exists; else 0
+    key = x_i < x_j ? (x_i, x_j) : (x_j, x_i)
+    M_barrier = haskey(saddles, key) ? saddles[key] : 0.0
+    return R_val + A_val + C_real + C_react + M_barrier
 end
 
-function update_real_geometry!(G::GeoGraphReal, rho::Vector{Float32}; eps::Float32=1f-3)
-    violated = Int[]
+# =============================================================================
+# Example usage
+# =============================================================================
 
-    # Update 3D points height for visualization only (optional)
-    @inbounds for i in 1:G.n
-        G.points3D[i] = SVector{3, Float32}(G.flat_x[i], G.flat_y[i], -rho[i])
-    end
+pdb_path = "/content/AF-P04406-F1-model_v4.pdb"
+coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
 
-    # Compute Ricci curvature as graph Laplacian on rho
-    G.R_vals = compute_ricci_curvature(G, rho)
-
-    # Compute anisotropy A(x) as before (residue-level directional functional)
-    @inbounds for i in 1:G.n
-        pi = G.points3D[i]
-        A_vec = SVector{3, Float32}(0f0, 0f0, 0f0)
-        for j in G.neighbors[i]
-            shape_i = G.omega_states[i].deformed
-            shape_j = G.omega_states[j].deformed
-            diff = 0.0f0
-            for k in 1:length(shape_i)
-                diff += norm(shape_i[k] - shape_j[k])^2
-            end
-            diff = sqrt(diff / length(shape_i))
-
-            dir = pi - G.points3D[j]
-            if norm(dir) > 1e-6
-                A_vec += (diff / norm(dir)^2) * dir
-            end
-        end
-        n_neighbors = length(G.neighbors[i])
-        G.anisotropy[i] = n_neighbors > 0 ? A_vec / n_neighbors : A_vec
-    end
-
-    # Check violations as before
-    for i in 1:G.n
-        vol = rho[i] + sum(rho[j] for j in G.neighbors[i])
-        expected_vol = (1 + length(G.neighbors[i])) / G.n
-        vol_ok = abs(vol - expected_vol) ≤ eps
-        shape_ok = abs(G.R_vals[i]) ≤ eps * (1.0f0 + norm(G.anisotropy[i]))
-        if !(vol_ok && shape_ok)
-            push!(violated, i)
-        end
-    end
-
-    return violated
+# Omega_coords for each pf_state (simplified: all same coords now)
+Omega_coords = Dict{String, Vector{SVector{3, Float64}}}()
+for state in pf_states
+    Omega_coords[state] = coords  # Replace with deformed Ω if available
 end
 
-function one_hot_rho(pf_states, target_state)
-    n = length(pf_states)
-    rho = zeros(Float32, n)
-    idx = findfirst(==(target_state), pf_states)
-    if isnothing(idx)
-        error("Target state $target_state not found in pf_states")
-    end
-    rho[idx] = 1.0f0
-    return rho
-end
-rho = one_hot_rho(pf_states, "000")
+G = GeoGraphReal2(pf_states, flat_pos, edges, cys_indices)
 
-# =================
-# Example test code
-# =================
+rho = zeros(Float32, length(pf_states))
+rho[findfirst(==( "000"), pf_states)] = 1.0f0
 
-function test_single_state(pdb_path::String, target_state::String)
-    G = GeoGraphReal1(pf_states, flat_pos, edges, pdb_path)
-    rho = one_hot_rho(pf_states, target_state)
+println("Testing occupancy in state: 000")
+violated_nodes = update_geometry!(G, rho; eps=1f-3)
+println("Violated nodes after update: ", violated_nodes)
+println("R_vals after update: ", G.R_vals)
+println("Anisotropy vectors after update: ", G.anisotropy)
 
-    println("Testing occupancy in state: $target_state at index $(findfirst(==(target_state), pf_states))")
-    println("Before update:")
-    println("R_vals = ", G.R_vals)
-    println("anisotropy = ", G.anisotropy)
+# -- Morse analysis --
+morse_vals = compute_morse_function(G, Omega_coords, oxidant)
+saddle_points = compute_saddle_points(G, morse_vals; barrier=0.1)
 
-    # Use Float32 literal for eps
-    violated = update_real_geometry!(G, rho; eps=1f-3)
+idx_000 = findfirst(==( "000"), pf_states)
+idx_100 = findfirst(==( "100"), pf_states)
 
-    println("\nAfter update:")
-    println("R_vals = ", G.R_vals)
-    println("anisotropy = ", G.anisotropy)
-    println("Violated nodes: ", violated)
-end
+coupling_val = total_coupling_with_morse(idx_000, idx_100, G, Omega_coords, oxidant, saddle_points)
+rate_val = transition_rate(idx_000, idx_100, G, Omega_coords, oxidant, saddle_points)
 
-# Run:
-test_single_state("/content/AF-P04406-F1-model_v4.pdb", "000")
+println("Total coupling (000 → 100) including oxidant and Morse saddle: ", coupling_val)
+println("Transition rate (000 → 100) with tunneling suppression: ", rate_val)
