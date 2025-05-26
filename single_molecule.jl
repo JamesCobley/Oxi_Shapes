@@ -272,11 +272,27 @@ println("Anisotropy vectors after update: ", G.anisotropy)
 morse_vals = compute_morse_function(G, Omega_coords, oxidant)
 saddle_points = compute_saddle_points(G, morse_vals; barrier=0.1)
 
+# Define neighbors of "000"
+neighbors = ["001", "010", "100"]
 idx_000 = findfirst(==( "000"), pf_states)
-idx_100 = findfirst(==( "100"), pf_states)
 
-coupling_val = total_coupling_with_morse(idx_000, idx_100, G, Omega_coords, oxidant, saddle_points)
-rate_val = transition_rate(idx_000, idx_100, G, Omega_coords, oxidant, saddle_points)
+# Prepare to store results
+results = Dict{String, Tuple{Float64, Float64}}()  # state => (coupling, rate)
 
-println("Total coupling (000 → 100) including oxidant and Morse saddle: ", coupling_val)
-println("Transition rate (000 → 100) with tunneling suppression: ", rate_val)
+for nbr in neighbors
+    idx_nbr = findfirst(==(nbr), pf_states)
+    coupling = total_coupling_with_morse(idx_000, idx_nbr, G, Omega_coords, oxidant, saddle_points)
+    rate = transition_rate(idx_000, idx_nbr, G, Omega_coords, oxidant, saddle_points)
+    results[nbr] = (coupling, rate)
+end
+
+println("\n--- Transition Summary from 000 ---")
+for (state, (coupling, rate)) in results
+    println("000 → $state: Coupling = $(round(coupling, digits=4)), Rate = $(round(rate, digits=6))")
+end
+
+# Sort to find the most likely
+most_likely = argmax(rate for (_, (_, rate)) in results)
+sorted = sort(collect(results), by = x -> x[2][2], rev = true)
+
+println("\nMost likely transition from 000: 000 → $(sorted[1][1])")
