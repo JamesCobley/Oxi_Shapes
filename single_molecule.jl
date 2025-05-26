@@ -242,6 +242,24 @@ oxidant = Reactant(
     5.0
 )
 
+ΔG_CHEM_site = Dict(
+    1 => -3.23,  # CYS 152 → bit 1 (rightmost in "xyz")
+    2 => 0.94,   # CYS 156 → bit 2
+    3 => 1.29    # CYS 247 → bit 3
+)
+
+function chemical_penalty(x_i::Int, x_j::Int, G::GeoGraphReal2, ΔG_CHEM_site::Dict{Int, Float64})
+    state_i = G.pf_states[x_i]
+    state_j = G.pf_states[x_j]
+    ΔG_total = 0.0
+    for k in 1:3
+        if state_i[k] == '0' && state_j[k] == '1'
+            ΔG_total += get(ΔG_CHEM_site, k, 0.0)
+        end
+    end
+    return ΔG_total
+end
+
 # =============================================================================
 # Reactant coupling energy calculation
 # =============================================================================
@@ -252,43 +270,24 @@ function total_coupling_with_morse(
     G::GeoGraphReal2,
     Omega_coords::Dict{String, Vector{SVector{3, Float64}}},
     reactant::Reactant,
-    saddles::Dict{Tuple{Int,Int}, Float64}
+    saddles::Dict{Tuple{Int,Int}, Float64},
+    ΔG_CHEM_site::Dict{Int, Float64}
 )
+    pf_j = G.pf_states[x_j]
     R_val = G.R_vals[x_j]
     A_val = norm(G.anisotropy[x_j])
-    C_real = real_deformation_energy(Omega_coords[G.pf_states[x_i]], Omega_coords[G.pf_states[x_j]])
-    C_react = reactant_coupling_energy(Omega_coords[G.pf_states[x_j]], G.cys_indices, reactant)
-    sasa = sasa_penalty(Omega_coords[G.pf_states[x_j]], G.cys_indices)
-    key = x_i < x_j ? (x_i, x_j) : (x_j, x_i)
-    M_barrier = get(saddles, key, 0.0)
-    return R_val + A_val + C_real + C_react + M_barrier + 0.1 * sasa
+    C_real = real_deformation_energy(Omega_coords[G.pf_states[x_i]], Omega_coords[pf_j])
+    C_react = reactant_coupling_energy(Omega_coords[pf_j], G.cys_indices, reactant)
+    M_barrier = get(saddles, x_i < x_j ? (x_i, x_j) : (x_j, x_i), 0.0)
+    ΔG_chem = chemical_penalty(x_i, x_j, G, ΔG_CHEM_site)
+
+    return R_val + A_val + C_real + C_react + M_barrier + ΔG_chem
 end
 
 # Optional: quantum-style rate equation
 function transition_rate(x_i::Int, x_j::Int, G::GeoGraphReal2, Omega_coords, reactant, saddles; α=1.0)
     ΔF = total_coupling_with_morse(x_i, x_j, G, Omega_coords, reactant, saddles)
     return exp(-2α * ΔF)
-end
-
-# =============================================================================
-# Total coupling function incorporating all terms
-# =============================================================================
-
-function total_coupling_with_morse(
-    x_i::Int, x_j::Int,
-    G::GeoGraphReal2,
-    Omega_coords::Dict{String, Vector{SVector{3, Float64}}},
-    reactant::Reactant,
-    saddles::Dict{Tuple{Int,Int}, Float64}
-)
-    R_val = G.R_vals[x_j]
-    A_val = norm(G.anisotropy[x_j])
-    C_real = real_deformation_energy(Omega_coords[G.pf_states[x_i]], Omega_coords[G.pf_states[x_j]])
-    C_react = reactant_coupling_energy(Omega_coords[G.pf_states[x_j]], G.cys_indices, reactant)
-    # Get Morse saddle barrier if edge exists; else 0
-    key = x_i < x_j ? (x_i, x_j) : (x_j, x_i)
-    M_barrier = haskey(saddles, key) ? saddles[key] : 0.0
-    return R_val + A_val + C_real + C_react + M_barrier
 end
 
 # =============================================================================
