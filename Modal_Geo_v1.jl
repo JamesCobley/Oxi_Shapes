@@ -50,6 +50,7 @@ function dirichlet_energy(coords::Vector{SVector{3, Float64}})
     return sum(norm(coord - center)^2 for coord in coords)
 end
 
+
 # =============================================================================
 # Graph + Geometry Structure
 # =============================================================================
@@ -277,7 +278,6 @@ h2o2_coords = [
 E_D_h2o2 = dirichlet_energy(h2o2_coords)
 println("Dirichlet Energy of Reactant (H₂O₂): ", round(E_D_h2o2, digits=4))
 
-
 # =============================================================================
 # Delta chem
 # =============================================================================
@@ -311,24 +311,44 @@ function compute_delta_chem(sasa::Vector{Float64}, pKa::Vector{Float64})
     return Δ_chem
 end
 
-function bitwise_dirichlet_energy(cys_coords::Vector{SVector{3, Float64}}; cutoff=8.0)
-    N = length(cys_coords)
-    energies = zeros(Float64, N)
-
-    for i in 1:N
-        xi = cys_coords[i]
-        for j in 1:N
-            if i == j
-                continue
-            end
-            xj = cys_coords[j]
-            d = norm(xi - xj)
-            if d < cutoff
-                energies[i] += (1.0 / d) * norm(xi - xj)^2
-            end
+function dirichlet_energy_shape_only(coords::Vector{SVector{3, Float64}}; cutoff=8.0)
+    E = 0.0
+    for i in 1:length(coords), j in i+1:length(coords)
+        d = norm(coords[i] - coords[j])
+        if d < cutoff
+            E += (1.0 - 1.0)^2  # constant field — so energy = 0
         end
     end
+    return E  # trivially zero
+end
 
+function shape_energy(coords::Vector{SVector{3, Float64}}; cutoff=8.0)
+    E = 0.0
+    for i in 1:length(coords), j in i+1:length(coords)
+        d = norm(coords[i] - coords[j])
+        if d < cutoff
+            E += d^2
+        end
+    end
+    return E
+end
+
+function local_dirichlet_energy(coords::Vector{SVector{3, Float64}}, cys_indices::Vector{Int}; cutoff=8.0)
+    energies = zeros(length(cys_indices))
+    for (i, cys_idx) in enumerate(cys_indices)
+        cys_coord = coords[cys_idx]
+        E = 0.0
+        for (j, atom) in enumerate(coords)
+            if j == cys_idx
+                continue
+            end
+            dist = norm(atom - cys_coord)
+            if dist < cutoff
+                E += dist^2
+            end
+        end
+        energies[i] = E
+    end
     return energies
 end
 
@@ -385,11 +405,9 @@ for state in pf_states
 end
 
 coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
-cys_coords = [coords[i] for i in cys_indices]
-E_D_real_molecule = dirichlet_energy(cys_coords)
-println("Dirichlet Energy of Real Molecule (Cys only): ", round(E_D_real_molecule, digits=4))
-bit_E = bitwise_dirichlet_energy(cys_coords)
-println("\nBitwise Dirichlet Energy of Each Cys:")
-for (i, e) in enumerate(bit_E)
-    println("  Cys $i → E = $(round(e, digits=4))")
+cys_ED = local_dirichlet_energy(coords, cys_indices)
+
+println("\nLocal Dirichlet Energy of Each Cys (Real Structure):")
+for (i, E) in enumerate(cys_ED)
+    println("  Cys $(i) → E = $(round(E, digits=4))")
 end
