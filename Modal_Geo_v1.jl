@@ -7,26 +7,32 @@ using Graphs
 # =============================================================================
 function load_ca_trace_and_cysteines(pdb_path::String)
     coords = SVector{3, Float64}[]
-    resnames = String[]
+    cys_indices = Int[]
 
     open(pdb_path, "r") do io
         for line in eachline(io)
             startswith(line, "ATOM") || continue
             atom_name = strip(line[13:16])
             resname   = strip(line[18:20])
+
             if atom_name == "CA"
                 x = parse(Float64, line[31:38])
                 y = parse(Float64, line[39:46])
                 z = parse(Float64, line[47:54])
                 push!(coords, SVector(x, y, z))
-                push!(resnames, resname)
+                if resname == "CYS"
+                    push!(cys_indices, length(coords))  # aligned index
+                end
             end
         end
     end
 
-    cys_indices = findall(x -> x == "CYS", resnames)
     return coords, cys_indices
 end
+
+println("Length of coords: ", length(coords))
+println("cys_indices: ", cys_indices)
+
 # =============================================================================
 # Normalize occupancy volume
 # =============================================================================
@@ -36,6 +42,12 @@ function normalize_volume!(ρ::Vector{Float32})
         ρ ./= total
     end
     return ρ
+end
+
+function dirichlet_energy(coords::Vector{SVector{3, Float64}})
+    n = length(coords)
+    center = sum(coords) / n
+    return sum(norm(coord - center)^2 for coord in coords)
 end
 
 # =============================================================================
@@ -241,6 +253,85 @@ for state in pf_states
     end
 end
 
+# =============================================================================
+# Define Reactant: Hydrogen Peroxide (H2O2)
+# =============================================================================
+h2o2 = Reactant(
+    "H2O2",
+    [
+        SVector(0.000,  0.000,  0.000),   # O1
+        SVector(1.480,  0.000,  0.000),   # O2
+        SVector(-0.320, 0.890,  0.780),   # H1
+        SVector(1.800, -0.890, -0.780)    # H2
+    ],
+    6.0  # Effective interaction radius in Å
+)
+
+h2o2_coords = [
+    SVector(0.000,  0.000,  0.000),   # O1
+    SVector(1.480,  0.000,  0.000),   # O2
+    SVector(-0.320, 0.890,  0.780),   # H1
+    SVector(1.800, -0.890, -0.780)    # H2
+]
+
+E_D_h2o2 = dirichlet_energy(h2o2_coords)
+println("Dirichlet Energy of Reactant (H₂O₂): ", round(E_D_h2o2, digits=4))
+
+
+# =============================================================================
+# Delta chem
+# =============================================================================
+function estimate_sasa(coords::Vector{SVector{3, Float64}}, cys_indices::Vector{Int}; cutoff=5.0)
+    sasa = zeros(Float64, length(cys_indices))
+    for (i, cys_idx) in enumerate(cys_indices)
+        center = coords[cys_idx]
+        sasa_count = 0
+        for (j, atom) in enumerate(coords)
+            if j == cys_idx
+                continue
+            end
+            if norm(atom - center) < cutoff
+                sasa_count += 1
+            end
+        end
+        sasa[i] = 1.0 / (sasa_count + 1e-3)  # more crowded = less exposed
+    end
+    return sasa
+end
+
+# Example: pKa values for 3 cysteines
+pKa_values = [5.57, 9.93, 10.29]  # Must match order of cys_indices
+
+function compute_delta_chem(sasa::Vector{Float64}, pKa::Vector{Float64})
+    Δ_chem = Float64[]
+    for i in 1:length(sasa)
+        # Lower pKa and higher SASA = higher chemical reactivity
+        push!(Δ_chem, sasa[i] * (12.0 - pKa[i]))  # 12 as an arbitrary max scale
+    end
+    return Δ_chem
+end
+
+function bitwise_dirichlet_energy(cys_coords::Vector{SVector{3, Float64}}; cutoff=8.0)
+    N = length(cys_coords)
+    energies = zeros(Float64, N)
+
+    for i in 1:N
+        xi = cys_coords[i]
+        for j in 1:N
+            if i == j
+                continue
+            end
+            xj = cys_coords[j]
+            d = norm(xi - xj)
+            if d < cutoff
+                energies[i] += (1.0 / d) * norm(xi - xj)^2
+            end
+        end
+    end
+
+    return energies
+end
+
 
 # =============================================================================
 # Example Inputs and Simulation
@@ -264,7 +355,7 @@ Omega_coords = build_state_geometry(pf_states, coords, cys_indices)
 G = GeoGraphReal1(pf_states, flat_pos, edges, cys_indices)
 
 rho = zeros(Float32, length(pf_states))
-rho[findfirst(==("111"), pf_states)] = 1.0f0
+rho[findfirst(==("000"), pf_states)] = 1.0f0
 normalize_volume!(rho)
 
 violated_nodes = update_geometry!(G, rho; eps=1f-3)
@@ -291,4 +382,14 @@ for state in pf_states
         energy = get(E_bit, i, 0.0)
         println("  Cys $i → A = $(round.(vec, digits=4)), E = $(round(energy, digits=4))")
     end
+end
+
+coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
+cys_coords = [coords[i] for i in cys_indices]
+E_D_real_molecule = dirichlet_energy(cys_coords)
+println("Dirichlet Energy of Real Molecule (Cys only): ", round(E_D_real_molecule, digits=4))
+bit_E = bitwise_dirichlet_energy(cys_coords)
+println("\nBitwise Dirichlet Energy of Each Cys:")
+for (i, e) in enumerate(bit_E)
+    println("  Cys $i → E = $(round(e, digits=4))")
 end
