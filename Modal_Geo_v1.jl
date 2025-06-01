@@ -3,6 +3,31 @@ using StaticArrays
 using Graphs
 
 # =============================================================================
+# Load coordinates and identify cysteines from PDB
+# =============================================================================
+function load_ca_trace_and_cysteines(pdb_path::String)
+    coords = SVector{3, Float64}[]
+    resnames = String[]
+
+    open(pdb_path, "r") do io
+        for line in eachline(io)
+            startswith(line, "ATOM") || continue
+            atom_name = strip(line[13:16])
+            resname   = strip(line[18:20])
+            if atom_name == "CA"
+                x = parse(Float64, line[31:38])
+                y = parse(Float64, line[39:46])
+                z = parse(Float64, line[47:54])
+                push!(coords, SVector(x, y, z))
+                push!(resnames, resname)
+            end
+        end
+    end
+
+    cys_indices = findall(x -> x == "CYS", resnames)
+    return coords, cys_indices
+end
+# =============================================================================
 # Normalize occupancy volume
 # =============================================================================
 function normalize_volume!(ρ::Vector{Float32})
@@ -176,7 +201,6 @@ function update_geometry!(G::GeoGraphReal1, rho::Vector{Float32}, Omega_coords::
     return violated
 end
 
-
 # =============================================================================
 # Deformation Sim: Sulfenic Acid
 # =============================================================================
@@ -207,6 +231,16 @@ function build_state_geometry(pf_states, coords, cys_indices)
     end
     return Omega_coords
 end
+
+println("\nΩ(x) Coordinate Map:")
+for state in pf_states
+    coords = Omega_coords[state]
+    println("State $state:")
+    for (i, coord) in enumerate(coords)
+        println("  Cys $i → (x=$(round(coord[1], digits=3)), y=$(round(coord[2], digits=3)), z=$(round(coord[3], digits=3)))")
+    end
+end
+
 
 # =============================================================================
 # Example Inputs and Simulation
