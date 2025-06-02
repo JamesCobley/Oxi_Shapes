@@ -511,7 +511,6 @@ for state in pf_states
     end
 end
 
-
 # -----------------------------------------------------------------------------
 # Discrete Morse Field over Modal Manifold
 # -----------------------------------------------------------------------------
@@ -568,3 +567,99 @@ end
 grad = morse_gradient(G, f_morse)
 minima, maxima, saddles = find_morse_critical_points(G, f_morse)
 label_morse_states(pf_states, minima, maxima, saddles)
+
+
+# -----------------------------------------------------------------------------
+# Set physical constants
+# -----------------------------------------------------------------------------
+α = 1.0  # quantum decay constant (unitless)
+ε = 78.5         # dielectric constant of water
+T = 298.15       # temperature in Kelvin
+Φ_PHYSRT = compute_Φ_PHYSRT(ε, T)
+
+function compute_Φ_PHYSRT(ε::Float64, T::Float64; q::Float64=1.6e-19, r::Float64=5e-10)
+    ε₀ = 8.854e-12  # vacuum permittivity (F/m)
+    k_B = 1.38e-23  # Boltzmann constant (J/K)
+    solvation_energy = (q^2) / (4π * ε₀ * ε * r)
+    return solvation_energy / (k_B * T)
+end
+# -----------------------------------------------------------------------------
+# Compute Δ_chem (from SASA and pKa)
+# -----------------------------------------------------------------------------
+sasa = estimate_sasa(coords, cys_indices)
+delta_chem = compute_delta_chem(sasa, pKa_values)
+
+# -----------------------------------------------------------------------------
+# Bitflip neighbor function
+# -----------------------------------------------------------------------------
+function get_bitflip_neighbors(state::String, pf_states::Vector{String})
+    neighbors = String[]
+    for i in 1:length(state)
+        bits = collect(state)
+        bits[i] = bits[i] == '0' ? '1' : '0'
+        flipped = join(bits)
+        if flipped in pf_states
+            push!(neighbors, flipped)
+        end
+    end
+    return neighbors
+end
+
+# -----------------------------------------------------------------------------
+# Δ_chem for a given bitflip transition
+# -----------------------------------------------------------------------------
+function delta_chem_transition(xi::String, xj::String, Δ_chem::Vector{Float64})
+    bits_i = collect(xi)
+    bits_j = collect(xj)
+    Δ_sum = 0.0
+    for i in 1:length(bits_i)
+        if bits_i[i] != bits_j[i]
+            Δ_sum += Δ_chem[i]
+        end
+    end
+    return Δ_sum
+end
+
+# -----------------------------------------------------------------------------
+# Transition matrix k[xi][xj]
+# -----------------------------------------------------------------------------
+transition_matrix = Dict{String, Dict{String, Float64}}()
+
+for xi in pf_states
+    neighbors = get_bitflip_neighbors(xi, pf_states)
+    transition_matrix[xi] = Dict{String, Float64}()
+
+    for xj in neighbors
+        idx_xj = G.pf_states_map[xj]
+
+        # Geometry-based penalties
+        Rj = G.R_vals[idx_xj]
+        Aj = norm(G.anisotropy[idx_xj])
+
+        # Shape deformation penalty
+        coords_xi = Omega_coords[xi]
+        local_cys = collect(1:length(coords_xi))  # = [1, 2, 3]
+        C_real = sum(dirichlet_shape_coupling_bitwise(coords_xi, local_cys, dirichlet_energy(h2o2.coords)))
+
+        # Chemically grounded Δ_chem term for this bitflip
+        Δ_chem_term = delta_chem_transition(xi, xj, delta_chem)
+
+        # Total coupling cost
+        C = Rj + Aj + C_real
+
+        # Final transition rate
+        k = exp(-2 * α * C + Δ_chem_term + Φ_PHYSRT)
+        transition_matrix[xi][xj] = k
+    end
+end
+
+# -----------------------------------------------------------------------------
+# Print results
+# -----------------------------------------------------------------------------
+println("\nTransition Rate Matrix (physical + chemical):")
+for (xi, neighbors) in transition_matrix
+    println("From $xi:")
+    for (xj, k) in neighbors
+        println("  → $xj : k = $(round(k, digits=6))")
+    end
+end
