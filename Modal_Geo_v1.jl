@@ -65,6 +65,24 @@ function dirichlet_energy(coords::Vector{SVector{3, Float64}})
     return sum(norm(coord - center)^2 for coord in coords)
 end
 
+# Cross-Dirichlet energy between a proteoform geometry and a reactant
+function dirichlet_interaction_energy(
+    omega::Vector{SVector{3, Float64}},
+    reactant::Vector{SVector{3, Float64}}
+)
+    center_omega = sum(omega) / length(omega)
+    center_reactant = sum(reactant) / length(reactant)
+
+    total_energy = 0.0
+    for coord_omega in omega
+        for coord_react in reactant
+            d = norm((coord_omega - center_omega) - (coord_react - center_reactant))
+            total_energy += d^2
+        end
+    end
+    return total_energy
+end
+
 # =============================================================================
 # Graph + Geometry Structure
 # =============================================================================
@@ -452,6 +470,14 @@ println("\nLocal Dirichlet Energy of Each Cys (Real Structure):")
 for (i, E) in enumerate(cys_ED)
     println("  Cys $(i) → E = $(round(E, digits=4))")
 end
+
+println("\nDirichlet Coupling Energy to Reactant (Ω_STATE ↔ Ω_REACTANT):")
+for state in pf_states
+    omega = Omega_coords[state]
+    E_coupling = dirichlet_interaction_energy(omega, h2o2.coords)
+    println("  State $state → Eᴿᴱᴬᴸ = $(round(E_coupling, digits=4))")
+end
+
 # -----------------------------------------------------------------------------
 # Discrete Morse Field over Modal Manifold
 # -----------------------------------------------------------------------------
