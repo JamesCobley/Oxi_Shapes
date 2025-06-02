@@ -595,43 +595,25 @@ label_morse_states(pf_states, minima, maxima, saddles)
 # -----------------------------------------------------------------------------
 # Set physical constants
 # -----------------------------------------------------------------------------
-α = 1.0  # quantum decay constant (unitless)
-ε = 78.5         # dielectric constant of water
-T = 298.15       # temperature in Kelvin
+α = 0.01                        # quantum decay constant (unitless)
+ε = 78.5                      # dielectric constant of water
+T = 298.15                    # temperature in Kelvin
 
 function compute_Φ_PHYSRT(ε::Float64, T::Float64; q::Float64=1.6e-19, r::Float64=5e-10)
-    ε₀ = 8.854e-12  # vacuum permittivity (F/m)
-    k_B = 1.38e-23  # Boltzmann constant (J/K)
+    ε₀ = 8.854e-12             # vacuum permittivity (F/m)
+    k_B = 1.38e-23             # Boltzmann constant (J/K)
     solvation_energy = (q^2) / (4π * ε₀ * ε * r)
     return solvation_energy / (k_B * T)
 end
 
 Φ_PHYSRT = compute_Φ_PHYSRT(ε, T)
-
 println("Φ_PHYSRT (solvation penalty in kT) = $(round(Φ_PHYSRT, digits=2))")
-
 
 # -----------------------------------------------------------------------------
 # Compute Δ_chem (from SASA and pKa)
 # -----------------------------------------------------------------------------
 sasa = estimate_sasa(coords, cys_indices)
 delta_chem = compute_delta_chem(sasa, pKa_values)
-
-# -----------------------------------------------------------------------------
-# Bitflip neighbor function
-# -----------------------------------------------------------------------------
-function get_bitflip_neighbors(state::String, pf_states::Vector{String})
-    neighbors = String[]
-    for i in 1:length(state)
-        bits = collect(state)
-        bits[i] = bits[i] == '0' ? '1' : '0'
-        flipped = join(bits)
-        if flipped in pf_states
-            push!(neighbors, flipped)
-        end
-    end
-    return neighbors
-end
 
 # -----------------------------------------------------------------------------
 # Δ_chem for a given bitflip transition
@@ -649,45 +631,98 @@ function delta_chem_transition(xi::String, xj::String, Δ_chem::Vector{Float64})
 end
 
 # -----------------------------------------------------------------------------
-# Transition matrix k[xi][xj]
+# Get bitwise neighbor states (1-bit flip)
 # -----------------------------------------------------------------------------
+function get_bitflip_neighbors(state::String, pf_states::Vector{String})
+    neighbors = String[]
+    for i in 1:length(state)
+        bits = collect(state)
+        bits[i] = bits[i] == '0' ? '1' : '0'
+        flipped = join(bits)
+        if flipped in pf_states
+            push!(neighbors, flipped)
+        end
+    end
+    return neighbors
+end
+
+# -----------------------------------------------------------------------------
+# Modular Geometry-Physics Coupled Transition Cost Function
+# -----------------------------------------------------------------------------
+function compute_transition_cost(
+    xi::String,
+    xj::String,
+    G::GeoGraphReal1,
+    Omega_coords::Dict{String, Vector{SVector{3, Float64}}},
+    rho::Vector{Float32},
+    delta_chem::Vector{Float64},
+    E_react::Float64
+)::Float64
+
+    # Validate occupancy: mass should be at xi
+    idx_i = G.pf_states_map[xi]
+    idx_j = G.pf_states_map[xj]
+    @assert rho[idx_i] ≈ 1.0f0 "Occupancy must be at source state xi"
+
+    # Identify bit flips (oxidation transitions)
+    bits_i = collect(xi)
+    bits_j = collect(xj)
+    flip_idxs = findall(i -> bits_i[i] != bits_j[i], 1:length(bits_i))
+    n_flips = length(flip_idxs)
+
+    # -------------------------------
+    # Real ↔ Abstract Coupling Terms
+    # -------------------------------
+
+    # Dirichlet deformation energy due to flipping Cys
+    coords_i = Omega_coords[xi]
+    ΔE_shape = sum(dirichlet_shape_coupling_bitwise(coords_i, flip_idxs, E_react))
+
+    # Bitwise redox chemistry penalty
+    ΔE_chem = sum(delta_chem[i] for i in flip_idxs)
+
+    # Ricci curvature at target xj (abstract geometry penalty)
+    κ_j = G.R_vals[idx_j]  # This is Ricci curvature (real geometry projected to abstract)
+    ΔE_curvature = κ_j < 0 ? abs(κ_j) : 0.0  # Penalize negative curvature (concave saddle)
+
+    # Anisotropy penalty at xj (geometric gradient barrier)
+    A_j = norm(G.anisotropy[idx_j])
+
+    # Morse saddle penalty — enforces directional stability on the manifold
+    ΔE_morse = n_flips * ΔE_curvature  # i.e., per-flip curvature barrier
+
+    # -------------------------------
+    # Total Cost
+    # -------------------------------
+    total_cost = ΔE_shape + ΔE_chem + A_j + ΔE_morse
+
+    return total_cost
+end
+
 transition_matrix = Dict{String, Dict{String, Float64}}()
 
 for xi in pf_states
-    neighbors = get_bitflip_neighbors(xi, pf_states)
     transition_matrix[xi] = Dict{String, Float64}()
+    rho_tmp = zeros(Float32, length(pf_states))
+    rho_tmp[G.pf_states_map[xi]] = 1.0f0  # only xi occupied
 
-    for xj in neighbors
-        idx_xj = G.pf_states_map[xj]
-
-        # Geometry-based penalties
-        Rj = G.R_vals[idx_xj]
-        Aj = norm(G.anisotropy[idx_xj])
-
-        # Shape deformation penalty
-        coords_xi = Omega_coords[xi]
-        local_cys = collect(1:length(coords_xi))  # = [1, 2, 3]
-        C_real = sum(dirichlet_shape_coupling_bitwise(coords_xi, local_cys, dirichlet_energy(h2o2.coords)))
-
-        # Chemically grounded Δ_chem term for this bitflip
-        Δ_chem_term = delta_chem_transition(xi, xj, delta_chem)
-
-        # Total coupling cost
-        C = Rj + Aj + C_real
-
-        # Final transition rate
-        k = exp(-2α * C + Δ_chem_term - Φ_PHYSRT)
+    for xj in get_bitflip_neighbors(xi, pf_states)
+        C = compute_transition_cost(xi, xj, G, Omega_coords, rho_tmp, delta_chem, dirichlet_energy(h2o2.coords))
+        k = exp(-2 * α * C - Φ_PHYSRT)
         transition_matrix[xi][xj] = k
     end
 end
 
-# -----------------------------------------------------------------------------
-# Print results
-# -----------------------------------------------------------------------------
-println("\nTransition Rate Matrix (physical + chemical):")
-for (xi, neighbors) in transition_matrix
-    println("From $xi:")
-    for (xj, k) in neighbors
-        println("  → $xj : k = $(round(k, digits=6))")
-    end
-end
+sasa = estimate_sasa(coords, cys_indices)
+delta_chem = compute_delta_chem(sasa, pKa_values)
+xi = "000"
+xj = "001"
+
+rho = zeros(Float32, length(pf_states))
+rho[findfirst(==(xi), pf_states)] = 1.0f0
+normalize_volume!(rho)
+
+# Compute transition cost from physical-to-abstract coupling
+C = compute_transition_cost(xi, xj, G, Omega_coords, rho, delta_chem, E_D_h2o2)
+
+println("\nTransition cost from $xi → $xj = $(round(C, digits=6))")
