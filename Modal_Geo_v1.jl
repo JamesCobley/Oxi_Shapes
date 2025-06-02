@@ -2,9 +2,6 @@ using LinearAlgebra
 using StaticArrays
 using Graphs
 
-pdb_path = "/content/AF-P04406-F1-model_v4.pdb"
-coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
-
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 flat_pos = Dict(
     "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
@@ -44,10 +41,33 @@ function load_ca_trace_and_cysteines(pdb_path::String)
 
     return coords, cys_indices
 end
-
+pdb_path = "/content/AF-P04406-F1-model_v4.pdb"
+coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
 println("Length of coords: ", length(coords))
 println("cys_indices: ", cys_indices)
 
+# =============================================================================
+# Define Reactant: Hydrogen Peroxide (H2O2)
+# =============================================================================
+struct Reactant
+    name::String
+    coords::Vector{SVector{3, Float64}}
+    radius::Float64  # effective interaction radius or similar
+end
+
+h2o2 = Reactant(
+    "H2O2",
+    [
+        SVector(0.000,  0.000,  0.000),   # O1
+        SVector(1.480,  0.000,  0.000),   # O2
+        SVector(-0.320, 0.890,  0.780),   # H1
+        SVector(1.800, -0.890, -0.780)    # H2
+    ],
+    6.0
+)
+
+E_D_h2o2 = dirichlet_energy(h2o2.coords)
+println("Dirichlet Energy of Reactant (H₂O₂): ", round(E_D_h2o2, digits=4))
 # =============================================================================
 # Normalize occupancy volume
 # =============================================================================
@@ -88,7 +108,7 @@ end
 # =============================================================================
 # Graph + Geometry Structure
 # =============================================================================
-struct GeoGraphReal1
+mutable struct GeoGraphReal1
     pf_states::Vector{String}
     pf_states_map::Dict{String, Int}
     flat_pos::Dict{String, Tuple{Float64, Float64}}
@@ -446,10 +466,14 @@ rho = zeros(Float32, length(pf_states))
 rho[findfirst(==("000"), pf_states)] = 1.0f0
 normalize_volume!(rho)
 
-println("\nA(x) anisotropy magnitudes:")
+# Update geometry
+update_geometry!(G, rho, Omega_coords; eps = 0.001f0)  # ✅ Float32
+
+println("\nA(x) anisotropy magnitudes and curvature:")
 for (state, idx) in zip(pf_states, 1:length(pf_states))
     A_mag = norm(G.anisotropy[idx])
-    println("State $state → |A| = $(round(A_mag, digits=4))")
+    κ = G.R_vals[idx]  # ✅ R(x) = curvature
+    println("State $state → |A| = $(round(A_mag, digits=4)), κ = $(round(κ, digits=4))")
 end
 
 # Bitwise outputs
@@ -568,14 +592,12 @@ grad = morse_gradient(G, f_morse)
 minima, maxima, saddles = find_morse_critical_points(G, f_morse)
 label_morse_states(pf_states, minima, maxima, saddles)
 
-
 # -----------------------------------------------------------------------------
 # Set physical constants
 # -----------------------------------------------------------------------------
 α = 1.0  # quantum decay constant (unitless)
 ε = 78.5         # dielectric constant of water
 T = 298.15       # temperature in Kelvin
-Φ_PHYSRT = compute_Φ_PHYSRT(ε, T)
 
 function compute_Φ_PHYSRT(ε::Float64, T::Float64; q::Float64=1.6e-19, r::Float64=5e-10)
     ε₀ = 8.854e-12  # vacuum permittivity (F/m)
@@ -583,6 +605,12 @@ function compute_Φ_PHYSRT(ε::Float64, T::Float64; q::Float64=1.6e-19, r::Float
     solvation_energy = (q^2) / (4π * ε₀ * ε * r)
     return solvation_energy / (k_B * T)
 end
+
+Φ_PHYSRT = compute_Φ_PHYSRT(ε, T)
+
+println("Φ_PHYSRT (solvation penalty in kT) = $(round(Φ_PHYSRT, digits=2))")
+
+
 # -----------------------------------------------------------------------------
 # Compute Δ_chem (from SASA and pKa)
 # -----------------------------------------------------------------------------
@@ -648,7 +676,7 @@ for xi in pf_states
         C = Rj + Aj + C_real
 
         # Final transition rate
-        k = exp(-2 * α * C + Δ_chem_term + Φ_PHYSRT)
+        k = exp(-2α * C + Δ_chem_term - Φ_PHYSRT)
         transition_matrix[xi][xj] = k
     end
 end
