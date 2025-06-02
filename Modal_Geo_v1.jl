@@ -438,7 +438,6 @@ for (i, state) in enumerate(pf_states)
     println("  E_D = $(round(E_D, digits=4))")
 end
 
-
 # Build graph
 G = GeoGraphReal1(pf_states, flat_pos, edges, cys_indices, E_D_vec)
 
@@ -474,49 +473,41 @@ for (i, E) in enumerate(cys_ED)
 end
 
 # -----------------------------------------------------------------------------
-# Dirichlet Coupling Energy between Modal States and Reactant (H₂O₂)
+# Dirichlet Shape Coupling Between Modal States and Reactant (H₂O₂)
 # -----------------------------------------------------------------------------
 
-function real_coupling_energy_bitwise(
+# Make sure these are relative to modal Ω(x) coords
+cys_indices = collect(1:length(Omega_coords["000"]))  # = [1, 2, 3]
+
+function dirichlet_shape_coupling_bitwise(
     coords::Vector{SVector{3, Float64}},
-    state::String,
     cys_indices::Vector{Int},
-    reactant::Reactant;
-    cutoff=8.0
+    E_D_ref::Float64
 )
-    bits = collect(state)
     E_bitwise = zeros(length(cys_indices))
-    for (i, bit) in enumerate(bits)
-        if bit == '0'
-            cys_coord = coords[cys_indices[i]]
-            E = 0.0
-            for r_atom in reactant.coords
-                dist = norm(r_atom - cys_coord)
-                if dist < cutoff
-                    E += dist^2
-                end
-            end
-            E_bitwise[i] = E
-        end
+    for (i, idx) in enumerate(cys_indices)
+        E_cys = local_dirichlet_energy(coords, [idx])[1]
+        E_bitwise[i] = abs(E_cys - E_D_ref)
     end
     return E_bitwise
 end
 
-# Precompute index vector for reuse
-cys_idxs = collect(1:length(cys_indices))
-
-# Bitwise coupling energy per Cys for each state
-bitwise_coupling = Dict{String, Vector{Float64}}()
+bitwise_shape_coupling = Dict{String, Vector{Float64}}()
 for state in pf_states
     coords = Omega_coords[state]
-    bitwise_coupling[state] = real_coupling_energy_bitwise(coords, state, cys_idxs, h2o2)
+    bitwise_shape_coupling[state] = dirichlet_shape_coupling_bitwise(coords, cys_indices, E_D_h2o2)
 end
 
-println("\nBitwise Dirichlet Coupling Energy to Reactant (Ω_STATE ↔ Ω_REACTANT):")
+println("\nBitwise Dirichlet Shape Coupling to Reactant (Ω_STATE ↔ Ω_REACTANT):")
 for state in pf_states
     println("  State $state:")
-    for (i, e) in enumerate(bitwise_coupling[state])
-        println("    Cys $(i) → Eᴿᴱᴬᴸ = $(round(e, digits=4))")
+    bits = collect(state)
+    for (i, ΔE) in enumerate(bitwise_shape_coupling[state])
+        if bits[i] == '0'  # Only reduced sites can interact with H₂O₂
+            println("    Cys $(i) → ΔE_shape = $(round(ΔE, digits=4))")
+        else
+            println("    Cys $(i) → (oxidized)")
+        end
     end
 end
 
