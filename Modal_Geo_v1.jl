@@ -66,21 +66,23 @@ function dirichlet_energy(coords::Vector{SVector{3, Float64}})
 end
 
 # Cross-Dirichlet energy between a proteoform geometry and a reactant
-function dirichlet_interaction_energy(
-    omega::Vector{SVector{3, Float64}},
-    reactant::Vector{SVector{3, Float64}}
+function real_coupling_energy(
+    Omega_coords::Vector{SVector{3, Float64}},
+    state::String,
+    cys_indices::Vector{Int},
+    reactant::Reactant
 )
-    center_omega = sum(omega) / length(omega)
-    center_reactant = sum(reactant) / length(reactant)
-
-    total_energy = 0.0
-    for coord_omega in omega
-        for coord_react in reactant
-            d = norm((coord_omega - center_omega) - (coord_react - center_reactant))
-            total_energy += d^2
+    bits = collect(state)
+    E_total = 0.0
+    for (local_idx, bit) in enumerate(bits)
+        if bit == '0'
+            # Get the Cys coordinate for this site
+            cys_coord = Omega_coords[local_idx]
+            # Compute coupling: deformational Dirichlet energy with reactant
+            E_total += dirichlet_energy([cys_coord; reactant.coords...])
         end
     end
-    return total_energy
+    return E_total
 end
 
 # =============================================================================
@@ -471,12 +473,53 @@ for (i, E) in enumerate(cys_ED)
     println("  Cys $(i) → E = $(round(E, digits=4))")
 end
 
-println("\nDirichlet Coupling Energy to Reactant (Ω_STATE ↔ Ω_REACTANT):")
-for state in pf_states
-    omega = Omega_coords[state]
-    E_coupling = dirichlet_interaction_energy(omega, h2o2.coords)
-    println("  State $state → Eᴿᴱᴬᴸ = $(round(E_coupling, digits=4))")
+# -----------------------------------------------------------------------------
+# Dirichlet Coupling Energy between Modal States and Reactant (H₂O₂)
+# -----------------------------------------------------------------------------
+
+function real_coupling_energy_bitwise(
+    coords::Vector{SVector{3, Float64}},
+    state::String,
+    cys_indices::Vector{Int},
+    reactant::Reactant;
+    cutoff=8.0
+)
+    bits = collect(state)
+    E_bitwise = zeros(length(cys_indices))
+    for (i, bit) in enumerate(bits)
+        if bit == '0'
+            cys_coord = coords[cys_indices[i]]
+            E = 0.0
+            for r_atom in reactant.coords
+                dist = norm(r_atom - cys_coord)
+                if dist < cutoff
+                    E += dist^2
+                end
+            end
+            E_bitwise[i] = E
+        end
+    end
+    return E_bitwise
 end
+
+# Precompute index vector for reuse
+cys_idxs = collect(1:length(cys_indices))
+
+# Bitwise coupling energy per Cys for each state
+bitwise_coupling = Dict{String, Vector{Float64}}()
+for state in pf_states
+    coords = Omega_coords[state]
+    bitwise_coupling[state] = real_coupling_energy_bitwise(coords, state, cys_idxs, h2o2)
+end
+
+println("\nBitwise Dirichlet Coupling Energy to Reactant (Ω_STATE ↔ Ω_REACTANT):")
+for state in pf_states
+    println("  State $state:")
+    for (i, e) in enumerate(bitwise_coupling[state])
+        println("    Cys $(i) → Eᴿᴱᴬᴸ = $(round(e, digits=4))")
+    end
+end
+
 
 # -----------------------------------------------------------------------------
 # Discrete Morse Field over Modal Manifold
