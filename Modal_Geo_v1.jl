@@ -2,6 +2,21 @@ using LinearAlgebra
 using StaticArrays
 using Graphs
 
+pdb_path = "/content/AF-P04406-F1-model_v4.pdb"
+coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
+
+pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
+flat_pos = Dict(
+    "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
+    "100" => (2.0, 2.0), "011" => (-1.0, 1.0), "101" => (0.0, 1.0),
+    "110" => (1.0, 1.0), "111" => (0.0, 0.0)
+)
+edges = [
+    ("000", "001"), ("000", "010"), ("000", "100"),
+    ("001", "011"), ("001", "101"), ("010", "011"), ("010", "110"),
+    ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
+]
+
 # =============================================================================
 # Load coordinates and identify cysteines from PDB
 # =============================================================================
@@ -50,7 +65,6 @@ function dirichlet_energy(coords::Vector{SVector{3, Float64}})
     return sum(norm(coord - center)^2 for coord in coords)
 end
 
-
 # =============================================================================
 # Graph + Geometry Structure
 # =============================================================================
@@ -72,29 +86,46 @@ struct GeoGraphReal1
     anisotropy::Vector{SVector{3, Float32}}
 
     cys_indices::Vector{Int}
+    E_D_vals::Vector{Float32}  # ← New field for Dirichlet energy
 end
 
-function GeoGraphReal1(pf_states, flat_pos, edges, cys_indices)
+function GeoGraphReal1(
+    pf_states::Vector{String},
+    flat_pos::Dict{String, Tuple{Float64, Float64}},
+    edges::Vector{Tuple{String, String}},
+    cys_indices::Vector{Int},
+    E_D_vals::Vector{Float32}  # <- pass it in
+)
     n = length(pf_states)
-    idx_map = Dict(s => i for (i, s) in enumerate(pf_states))
-    fx = Float32[flat_pos[s][1] for s in pf_states]
-    fy = Float32[flat_pos[s][2] for s in pf_states]
-    eidx = [(idx_map[u], idx_map[v]) for (u, v) in edges]
-    nbrs = [Int[] for _ in 1:n]
-    for (i, j) in eidx
-        push!(nbrs[i], j)
-        push!(nbrs[j], i)
-    end
-    d0 = [Float32[sqrt((fx[i] - fx[j])^2 + (fy[i] - fy[j])^2) for j in nbrs[i]] for i in 1:n]
-    g = SimpleGraph(n)
-    for (i, j) in eidx
-        add_edge!(g, i, j)
-    end
-    A = Float32.(adjacency_matrix(g))
-    Rbuf = zeros(Float32, n)
-    anis = [SVector{3, Float32}(0f0, 0f0, 0f0) for _ in 1:n]
+    pf_states_map = Dict(s => i for (i, s) in enumerate(pf_states))
+    flat_x = Float32[flat_pos[s][1] for s in pf_states]
+    flat_y = Float32[flat_pos[s][2] for s in pf_states]
 
-    return GeoGraphReal1(pf_states, idx_map, flat_pos, edges, n, fx, fy, nbrs, d0, eidx, A, Rbuf, anis, cys_indices)
+    neighbors = [Int[] for _ in 1:n]
+    d0 = [Float32[] for _ in 1:n]
+    adjacency = zeros(Float32, n, n)
+    edges_idx = Tuple{Int, Int}[]
+
+    for (s1, s2) in edges
+        i, j = pf_states_map[s1], pf_states_map[s2]
+        push!(neighbors[i], j)
+        push!(neighbors[j], i)
+        push!(d0[i], 1.0f0)
+        push!(d0[j], 1.0f0)
+        adjacency[i, j] = 1.0
+        adjacency[j, i] = 1.0
+        push!(edges_idx, (i, j))
+    end
+
+    R_vals = zeros(Float32, n)
+    anisotropy = [SVector{3, Float32}(0.0, 0.0, 0.0) for _ in 1:n]
+
+    return GeoGraphReal1(
+        pf_states, pf_states_map, flat_pos, edges,
+        n, flat_x, flat_y, neighbors, d0,
+        edges_idx, adjacency, R_vals, anisotropy,
+        cys_indices, E_D_vals
+    )
 end
 
 # =============================================================================
@@ -231,6 +262,7 @@ end
 # =============================================================================
 function build_state_geometry(pf_states, coords, cys_indices)
     Omega_coords = Dict{String, Vector{SVector{3, Float64}}}()
+    
     for state in pf_states
         bits = collect(state)
         cys_coords = [coords[i] for i in cys_indices]
@@ -242,21 +274,26 @@ function build_state_geometry(pf_states, coords, cys_indices)
         end
         Omega_coords[state] = displaced
     end
-    return Omega_coords
-end
 
-println("\nΩ(x) Coordinate Map:")
-for state in pf_states
-    coords = Omega_coords[state]
-    println("State $state:")
-    for (i, coord) in enumerate(coords)
-        println("  Cys $i → (x=$(round(coord[1], digits=3)), y=$(round(coord[2], digits=3)), z=$(round(coord[3], digits=3)))")
+    # 👉 Add Dirichlet energy values for each state
+    E_D_vals = Dict{String, Float64}()
+    for state in pf_states
+        E_D_vals[state] = dirichlet_energy(Omega_coords[state])
     end
+    E_D_vec = Float32[E_D_vals[state] for state in pf_states]
+
+    return Omega_coords, E_D_vec
 end
 
 # =============================================================================
 # Define Reactant: Hydrogen Peroxide (H2O2)
 # =============================================================================
+struct Reactant
+    name::String
+    coords::Vector{SVector{3, Float64}}
+    radius::Float64  # effective interaction radius or similar
+end
+
 h2o2 = Reactant(
     "H2O2",
     [
@@ -265,17 +302,10 @@ h2o2 = Reactant(
         SVector(-0.320, 0.890,  0.780),   # H1
         SVector(1.800, -0.890, -0.780)    # H2
     ],
-    6.0  # Effective interaction radius in Å
+    6.0
 )
 
-h2o2_coords = [
-    SVector(0.000,  0.000,  0.000),   # O1
-    SVector(1.480,  0.000,  0.000),   # O2
-    SVector(-0.320, 0.890,  0.780),   # H1
-    SVector(1.800, -0.890, -0.780)    # H2
-]
-
-E_D_h2o2 = dirichlet_energy(h2o2_coords)
+E_D_h2o2 = dirichlet_energy(h2o2.coords)
 println("Dirichlet Energy of Reactant (H₂O₂): ", round(E_D_h2o2, digits=4))
 
 # =============================================================================
@@ -352,10 +382,10 @@ function local_dirichlet_energy(coords::Vector{SVector{3, Float64}}, cys_indices
     return energies
 end
 
-
 # =============================================================================
 # Example Inputs and Simulation
 # =============================================================================
+
 pf_states = ["000", "001", "010", "100", "011", "101", "110", "111"]
 flat_pos = Dict(
     "000" => (0.0, 3.0), "001" => (-2.0, 2.0), "010" => (0.0, 2.0),
@@ -368,23 +398,34 @@ edges = [
     ("100", "110"), ("100", "101"), ("011", "111"), ("101", "111"), ("110", "111")
 ]
 
-# Load your structure
+# Load structure and build modal state geometry
+
+# Load PDB structure first
 pdb_path = "/content/AF-P04406-F1-model_v4.pdb"
 coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
-Omega_coords = build_state_geometry(pf_states, coords, cys_indices)
-G = GeoGraphReal1(pf_states, flat_pos, edges, cys_indices)
 
+# Build modal geometry and compute Dirichlet energy per state
+Omega_coords, E_D_vec = build_state_geometry(pf_states, coords, cys_indices)
+
+println("\nΩ(x) Coordinate Map with Dirichlet Energy:")
+for (i, state) in enumerate(pf_states)
+    coords = Omega_coords[state]
+    E_D = E_D_vec[i]
+    println("State $state:")
+    for (j, coord) in enumerate(coords)
+        println("  Cys $j → (x=$(round(coord[1], digits=3)), y=$(round(coord[2], digits=3)), z=$(round(coord[3], digits=3)))")
+    end
+    println("  E_D = $(round(E_D, digits=4))")
+end
+
+
+# Build graph
+G = GeoGraphReal1(pf_states, flat_pos, edges, cys_indices, E_D_vec)
+
+# Define occupancy
 rho = zeros(Float32, length(pf_states))
 rho[findfirst(==("000"), pf_states)] = 1.0f0
 normalize_volume!(rho)
-
-violated_nodes = update_geometry!(G, rho; eps=1f-3)
-
-println("Violated nodes after update: ", violated_nodes)
-println("\nR(x) values:")
-for (state, idx) in zip(pf_states, 1:length(pf_states))
-    println("State $state → R = $(round(G.R_vals[idx], digits=4))")
-end
 
 println("\nA(x) anisotropy magnitudes:")
 for (state, idx) in zip(pf_states, 1:length(pf_states))
@@ -392,7 +433,7 @@ for (state, idx) in zip(pf_states, 1:length(pf_states))
     println("State $state → |A| = $(round(A_mag, digits=4))")
 end
 
-# Step 7: Compute and print bitwise A(x) and internal energy for each proteoform state
+# Bitwise outputs
 println("\nBitwise A(x) vectors and Dirichlet energy:")
 for state in pf_states
     A_bitwise, E_bit = bitwise_Ax(state, G, Omega_coords)
@@ -404,10 +445,66 @@ for state in pf_states
     end
 end
 
+# Dirichlet energy of real structure
 coords, cys_indices = load_ca_trace_and_cysteines(pdb_path)
 cys_ED = local_dirichlet_energy(coords, cys_indices)
-
 println("\nLocal Dirichlet Energy of Each Cys (Real Structure):")
 for (i, E) in enumerate(cys_ED)
     println("  Cys $(i) → E = $(round(E, digits=4))")
 end
+# -----------------------------------------------------------------------------
+# Discrete Morse Field over Modal Manifold
+# -----------------------------------------------------------------------------
+
+# Step 1: Use Dirichlet energy as the Morse scalar field
+f_morse = Float64.(G.E_D_vals)
+
+# Step 2: Compute gradient on edges
+function morse_gradient(G::GeoGraphReal1, f::Vector{Float64})
+    grad_edges = Dict{Tuple{Int, Int}, Float64}()
+    for (i, neighbors) in enumerate(G.neighbors)
+        for j in neighbors
+            if i < j
+                Δf = f[j] - f[i]
+                grad_edges[(i, j)] = Δf
+            end
+        end
+    end
+    return grad_edges
+end
+
+# Step 3: Identify Morse critical points
+function find_morse_critical_points(G::GeoGraphReal1, f::Vector{Float64})
+    minima, maxima, saddles = Int[], Int[], Int[]
+    for (i, neighbors) in enumerate(G.neighbors)
+        f_i = f[i]
+        f_neighbors = f[collect(neighbors)]
+        if all(f_i < f_j for f_j in f_neighbors)
+            push!(minima, i)
+        elseif all(f_i > f_j for f_j in f_neighbors)
+            push!(maxima, i)
+        else
+            push!(saddles, i)
+        end
+    end
+    return minima, maxima, saddles
+end
+
+# Step 4: Label and print Morse critical points
+function label_morse_states(pf_states, minima, maxima, saddles)
+    println("\nMorse Critical Points:")
+    for i in minima
+        println("  Minimum: ", pf_states[i])
+    end
+    for i in maxima
+        println("  Maximum: ", pf_states[i])
+    end
+    for i in saddles
+        println("  Saddle:  ", pf_states[i])
+    end
+end
+
+# Run the Morse computation
+grad = morse_gradient(G, f_morse)
+minima, maxima, saddles = find_morse_critical_points(G, f_morse)
+label_morse_states(pf_states, minima, maxima, saddles)
