@@ -47,36 +47,22 @@ L = Diagonal(deg) - G.adjacency
 # =============================================================================
 
 function update_geometry!(G::GeoGraphReal2, rho::Vector{Float64}, coords, cys)
+    # --- 1. Ricci curvature: R(x) = Δρ(x)
     fill!(G.R_vals, 0.0)
     for i in 1:length(G.R_vals), j in G.neighbors[i]
         G.R_vals[i] += rho[j] - rho[i]
     end
 
-    for i in 1:length(G.R_vals)
-        bits = BitVector(c == '1' for c in collect(G.pf_states[i]))
-        on_idx = findall(bits)
-        if isempty(on_idx)
-            G.anisotropy[i] = SVector(0., 0., 0.)
-            continue
-        end
-        # Safely get 3D coordinates of active cysteines
-        pos = []
-        for k in on_idx
-            if k <= length(cys) && cys[k] <= length(coords)
-                push!(pos, coords[cys[k]])
-            end
-        end
-        if isempty(pos)
-            G.anisotropy[i] = SVector(0., 0., 0.)
-            continue
-        end
+    # --- 2. Anisotropy A(x): relative to full-molecule COM
+    com_all = sum(coords) / length(coords)
+    cys_coords = [coords[i] for i in cys]
+    A_vecs = [p - com_all for p in cys_coords]
 
-        com = sum(pos) / length(pos)
-        disp = [p - com for p in pos]
-        G.anisotropy[i] = sum(disp) / length(disp)
+    A_vector = sum(A_vecs) / length(A_vecs)              # direction vector
+    A_scalar = sum(norm.(A_vecs)) / length(A_vecs)       # optional magnitude
 
-        # Optional debug
-        # println("State $(G.pf_states[i]) → bits on: $on_idx → cys: ", [cys[k] for k in on_idx])
+    for i in 1:length(G.pf_states)
+        G.anisotropy[i] = A_vector
     end
 end
 
@@ -87,6 +73,7 @@ end
 
 function load_ca_and_cys(pdb_path::String)
     coords, resnams = SVector{3,Float64}[], String[]
+    cys_indices = Int[]
     open(pdb_path, "r") do io
         for ln in eachline(io)
             if startswith(ln, "ATOM")
@@ -97,11 +84,14 @@ function load_ca_and_cys(pdb_path::String)
                     z = parse(Float64, ln[47:54])
                     push!(coords, SVector(x,y,z))
                     push!(resnams, res)
+                    if res == "CYS"
+                        push!(cys_indices, length(coords))  # store index into coords
+                    end
                 end
             end
         end
     end
-    return coords, findall(x->x=="CYS", resnams)
+    return coords, cys_indices
 end
 
 function deform_sulfenic(coords::Vector{SVector{3,Float64}}, bits::BitVector)
@@ -214,7 +204,14 @@ for i in 1:length(pf_states)
     println("  State $(pf_states[i]): R = $R_val, A = $A_val")
 end
 
+
 println("\n3D Coordinates of Cysteines:")
 for i in cys
     println("  CYS index $i: ", coords[i])
+end
+
+println("\nBitwise Aₖ vectors relative to molecule COM:")
+for (k, idx) in enumerate(cys)
+    a = coords[idx] - sum(coords)/length(coords)
+    println("  Bit $k (CYS @ index $idx): Aₖ = ", round.(a, digits=4), " | norm = ", round(norm(a), digits=4))
 end
