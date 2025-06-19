@@ -1,5 +1,18 @@
 using StaticArrays, LinearAlgebra, Graphs
 
+# --- Build real-space proximity graph (CA atom network)
+function build_proximity_graph(coords; cutoff=5.0)
+    n = length(coords)
+    neighbors = [Int[] for _ in 1:n]
+    for i in 1:n-1, j in i+1:n
+        if norm(coords[i] - coords[j]) ≤ cutoff
+            push!(neighbors[i], j)
+            push!(neighbors[j], i)
+        end
+    end
+    return neighbors
+end
+
 # =============================================================================
 # 1️⃣ Build modal graph and compute Laplacian eigenmodes
 # =============================================================================
@@ -46,26 +59,21 @@ L = Diagonal(deg) - G.adjacency
 # 2️⃣ Ricci curvature & anisotropy update function
 # =============================================================================
 
-function update_geometry!(G::GeoGraphReal2, rho::Vector{Float64}, coords, cys)
-    # --- 1. Ricci curvature: R(x) = Δρ(x)
+function update_geometry!(G::GeoGraphReal2, rho::Vector{Float64}, coords, cys, neighbors)
+    # --- 1. Ricci curvature from modal Laplacian
     fill!(G.R_vals, 0.0)
     for i in 1:length(G.R_vals), j in G.neighbors[i]
         G.R_vals[i] += rho[j] - rho[i]
     end
 
-    # --- 2. Anisotropy A(x): relative to full-molecule COM
-    com_all = sum(coords) / length(coords)
-    cys_coords = [coords[i] for i in cys]
-    A_vecs = [p - com_all for p in cys_coords]
+    # --- 2. Real-space Laplacian curvature vectors at cysteines
+    cys_curvatures = real_laplacian_curvature(coords, neighbors, cys)
 
-    A_vector = sum(A_vecs) / length(A_vecs)              # direction vector
-    A_scalar = sum(norm.(A_vecs)) / length(A_vecs)       # optional magnitude
-
+    # --- 3. Assign A(x): average of real-space curvature field
     for i in 1:length(G.pf_states)
-        G.anisotropy[i] = A_vector
+        G.anisotropy[i] = sum(cys_curvatures) / length(cys_curvatures)
     end
 end
-
 
 # =============================================================================
 # 3️⃣ Real-space shape handling
@@ -118,6 +126,7 @@ function estimate_sasa(coords, cys_idx; cutoff=5.0)
         for i in cys_idx)
 end
 
+
 # =============================================================================
 # 4️⃣ Reactant and vibrational alignment
 # =============================================================================
@@ -146,6 +155,17 @@ end
 
 function cos_theta(c1, c2, rxn::Reactant)
     dot(real_deformation_vector(c1, c2), reactant_orbital_vector(rxn))
+end
+
+# --- Compute Laplacian curvature at each cysteine (vector field)
+function real_laplacian_curvature(coords, neighbors, cys)
+    curvature = Vector{SVector{3,Float64}}(undef, length(cys))
+    for (k, idx) in enumerate(cys)
+        nbrs = neighbors[idx]
+        Δ = sum(coords[j] - coords[idx] for j in nbrs)
+        curvature[k] = Δ / max(length(nbrs), 1)
+    end
+    return curvature
 end
 
 # =============================================================================
@@ -180,10 +200,9 @@ transition_rate(i, j, G, Omega, cys_idx, rxn, saddles; α=1.0) =
 # =============================================================================
 
 coords, cys = load_ca_and_cys("AF-P04406-F1-model_v4.pdb")
-Omega = build_Omega_coords(pf_states, coords, cys)
-
+neighbors = build_proximity_graph(coords, cutoff=5.0)
 rho = zeros(length(pf_states)); rho[1] = 1.0
-update_geometry!(G, rho, coords, cys)
+update_geometry!(G, rho, coords, cys, neighbors)
 
 total_curvature = sum(G.R_vals)
 println("\n🔍 Total Ricci curvature across all modes: ", round(total_curvature, digits=6))
@@ -208,10 +227,4 @@ end
 println("\n3D Coordinates of Cysteines:")
 for i in cys
     println("  CYS index $i: ", coords[i])
-end
-
-println("\nBitwise Aₖ vectors relative to molecule COM:")
-for (k, idx) in enumerate(cys)
-    a = coords[idx] - sum(coords)/length(coords)
-    println("  Bit $k (CYS @ index $idx): Aₖ = ", round.(a, digits=4), " | norm = ", round(norm(a), digits=4))
 end
