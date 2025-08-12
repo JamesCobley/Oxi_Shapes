@@ -1,5 +1,8 @@
 # =============================================================================
-# Modal Geometric Field (MGF) — single-molecule demo (with anisotropy & tunneling)
+# Modal Geometric Field (MGF) — single-molecule demo
+# - Exposure-weighted deformation (bit-specific curvature)
+# - Directional anisotropy + tunneling weight
+# - Axiom checks: volume invariance (∑ρ=1) and ∑Δρ=0
 # =============================================================================
 
 using LinearAlgebra, Statistics
@@ -9,7 +12,7 @@ using SparseArrays
 using Printf
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Helpers & Axiom checks
 # -----------------------------------------------------------------------------
 safe_normalize(v::SVector{3,T}) where {T<:Real} = (n = norm(v); n == 0 ? v*zero(T) : v/n)
 
@@ -22,6 +25,23 @@ function bit_to_cys_map(cys_idx::Vector{Int}, R::Int; mapping::Union{Nothing,Vec
         @assert length(mapping) == R
         return mapping
     end
+end
+
+renormalize_rho!(ρ::AbstractVector{<:Real}) = (s = sum(ρ); s ≈ 1 ? ρ : (ρ ./= s))
+
+# Laplacian of ρ on the modal graph (unsigned; standard graph Laplacian Lρ)
+function laplacian_rho(GA::AbstractMatrix{<:Real}, ρ::AbstractVector{<:Real})
+    # GA is adjacency; L = D - A
+    d = vec(sum(GA, dims=2))
+    L = Diagonal(d) .- GA
+    return L * ρ
+end
+
+function check_axioms(GA::AbstractMatrix{<:Real}, ρ::AbstractVector{<:Real}; tol=1e-6)
+    vol_ok = abs(sum(ρ) - 1) ≤ tol
+    Δρ = laplacian_rho(GA, ρ)
+    lap_ok = abs(sum(Δρ)) ≤ tol
+    return vol_ok, lap_ok, sum(ρ), sum(Δρ)
 end
 
 # -----------------------------------------------------------------------------
@@ -88,7 +108,7 @@ function mock_coords(n::Int=60; cys_every::Int=10)
 end
 
 # -----------------------------------------------------------------------------
-# 2. Real-space proximity graph (optional)
+# 2. Real-space proximity graph (for exposure)
 # -----------------------------------------------------------------------------
 function build_proximity_graph(coords; cutoff=5.0)
   n = length(coords)
@@ -101,15 +121,36 @@ function build_proximity_graph(coords; cutoff=5.0)
   return neigh
 end
 
+# Exposure score per residue: lever arm (radius) + inverse crowding
+# Exposure score per residue: lever arm (radius) + inverse crowding
+function exposure_scores(coords::Vector{SVector{3,Float64}}, prox_neigh; w_radius=0.7, w_crowd=0.3)
+    n = length(coords)
+    com = sum(coords) / n
+    r = [norm(coords[i] - com) for i in 1:n]
+    r = r ./ (mean(r) + eps())                  # normalize ~1
+    deg = [length(prox_neigh[i]) for i in 1:n]
+    crowd = [1.0 / (d + 1) for d in deg]
+    crowd = crowd ./ (mean(crowd) + eps())      # normalize ~1
+    e = [w_radius*r[i] + w_crowd*crowd[i] for i in 1:n]
+    return e ./ (mean(e) + eps())               # mean ~1
+end
+
+
 # -----------------------------------------------------------------------------
 # 3. Modal deformation: sulfenic-like shift along COM-relative direction
+#    (exposure-weighted so curvature is bit/residue-specific)
 # -----------------------------------------------------------------------------
-function deform_sulfenic_COM(coords::Vector{SVector{3,Float64}}, on_indices::Vector{Int}; delta=0.5)
+function deform_sulfenic_COM(coords::Vector{SVector{3,Float64}},
+                             on_indices::Vector{Int};
+                             delta=0.5,
+                             exposure::Union{Nothing,Vector{Float64}}=nothing)
     com = sum(coords) / length(coords)
     d = copy(coords)
     for k in on_indices
-        dir = safe_normalize(SVector{3,Float64}(coords[k] - com))
-        d[k] = d[k] + delta * dir
+        dir = coords[k] - com
+        dir = norm(dir) == 0 ? dir : dir / norm(dir)
+        scale = exposure === nothing ? 1.0 : exposure[k]
+        d[k] = d[k] + delta * scale * dir
     end
     return d
 end
@@ -117,12 +158,15 @@ end
 # Build Ω(state) = deformed coordinates for each bitstring state (on full coords)
 function build_Omega_coords(states::Vector{String},
                             all_coords::Vector{SVector{3,Float64}},
-                            cys_map::Vector{Int})
+                            cys_map::Vector{Int},
+                            exposure::Union{Nothing,Vector{Float64}}=nothing;
+                            delta=0.5)
     Omega = Dict{String,Vector{SVector{3,Float64}}}()
     for s in states
         bits = [c == '1' for c in s]   # length R
         on_idx = [cys_map[r] for r in 1:length(bits) if bits[r]]
-        Omega[s] = deform_sulfenic_COM(all_coords, on_idx)
+        Omega[s] = deform_sulfenic_COM(all_coords, on_idx;
+                                       delta=delta, exposure=exposure)
     end
     return Omega
 end
@@ -221,13 +265,13 @@ function transition_weight(Rj, Aj, proj, cosθ; α=3.0f0)
 end
 
 # -----------------------------------------------------------------------------
-# 6. Transition gate (patched)
+# 6. Transition gate
 # -----------------------------------------------------------------------------
 function is_transition_allowed(i,j,G,V,Omega,rho,rxn,cys_map; θ_thresh=0.0, α=3.0f0)
   M   = modal_curvature_vectors(G, Omega, rho, cys_map)
   H,A = extract_curv_and_aniso(M, length(G.pf_states), length(cys_map))
   Rj  = sum(H[j, :])                                     # modal curvature magnitude
-  Aj  = directional_anisotropy(j, H, A, rxn)             # directional anisotropy (patched)
+  Aj  = directional_anisotropy(j, H, A, rxn)             # directional anisotropy
 
   c1   = Omega[pf_states[i]]
   c2   = Omega[pf_states[j]]
@@ -244,7 +288,8 @@ end
 # -----------------------------------------------------------------------------
 # 7. Main demo
 # -----------------------------------------------------------------------------
-function main(pdb_path::Union{Nothing,String}=nothing; R_bits::Int=3, θ_thresh=0.0, α=3.0f0, delta=0.5)
+function main(pdb_path::Union{Nothing,String}=nothing; R_bits::Int=3, θ_thresh=0.0, α=3.0f0, delta=0.5,
+              w_radius=0.7, w_crowd=0.3)
   # Load structure (PDB if provided and readable, else mock)
   coords = SVector{3,Float64}[]; cys_idx = Int[]
   if pdb_path !== nothing && isfile(pdb_path)
@@ -257,28 +302,25 @@ function main(pdb_path::Union{Nothing,String}=nothing; R_bits::Int=3, θ_thresh=
   @assert length(cys_idx) ≥ R_bits "Not enough cysteines to map $R_bits bits."
   cys_map = bit_to_cys_map(cys_idx, R_bits)
 
-  # Build Ω for all states (respect chosen deformation magnitude)
-  local function build_Omega_with_delta(states, coords, cys_map)
-      Omega = Dict{String,Vector{SVector{3,Float64}}}()
-      for s in states
-          bits = [c == '1' for c in s]
-          on_idx = [cys_map[r] for r in 1:length(bits) if bits[r]]
-          Omega[s] = deform_sulfenic_COM(coords, on_idx; delta=delta)
-      end
-      return Omega
-  end
-  Omega = build_Omega_with_delta(pf_states, coords, cys_map)
-
-  # Modal Laplacian eigenvectors on the hypercube
-  g_bool = SimpleGraph(length(pf_states))
-  for (u,v) in edges; add_edge!(g_bool, idx[u], idx[v]); end
-  A_bool = Float32.(Matrix(adjacency_matrix(g_bool)))
-  L_bool = Diagonal(sum(A_bool, dims=2)[:]) .- A_bool
+  # Modal graph (for Laplacian and eigenvectors)
+  G   = GeoGraphReal7(pf_states, edges)
+  A_bool = G.adjacency
+  L_bool = Diagonal(vec(sum(A_bool, dims=2))) .- A_bool
   V      = eigen(Symmetric(Matrix(L_bool))).vectors
 
-  # Initialize graph & occupancy (ρ=1 at '000')
-  G   = GeoGraphReal7(pf_states, edges)
-  rho = zeros(Float32, length(pf_states)); rho[1] = 1.0f0
+  # Occupancy (ρ=1 at '000', volume-invariant by construction)
+  ρ = zeros(Float32, length(pf_states)); ρ[1] = 1.0f0
+  renormalize_rho!(ρ)  # enforce ∑ρ=1 exactly
+
+  # AXIOM CHECKS
+  vol_ok, lap_ok, s_rho, s_lap = check_axioms(A_bool, ρ; tol=1e-7)
+  @printf("\nAxiom checks: volume ∑ρ=%.6f (%s),  ∑Δρ=%.6e (%s)\n",
+          s_rho, vol_ok ? "OK" : "VIOLATION", s_lap, lap_ok ? "OK" : "VIOLATION")
+
+  # Exposure & Ω build
+  prox_neigh = build_proximity_graph(coords)
+  E = exposure_scores(coords, prox_neigh; w_radius=w_radius, w_crowd=w_crowd)
+  Omega = build_Omega_coords(pf_states, coords, cys_map, E; delta=delta)
 
   # Simple reactant vector (replace with realistic trajectory if desired)
   rxn = Reactant("oxidant",
@@ -286,7 +328,7 @@ function main(pdb_path::Union{Nothing,String}=nothing; R_bits::Int=3, θ_thresh=
 
   println("\nTransitions from '000':")
   for j in G.neighbors[1]
-    ok,Rj,Aj,proj,cosr,w,H,A = is_transition_allowed(1, j, G, V, Omega, rho, rxn, cys_map; θ_thresh=θ_thresh, α=α)
+    ok,Rj,Aj,proj,cosr,w,H,A = is_transition_allowed(1, j, G, V, Omega, ρ, rxn, cys_map; θ_thresh=θ_thresh, α=α)
     @printf("  000 → %s : allowed=%s | Rj=%.4f  Aj=%.4f  proj=%.4f  cosθ=%.4f  weight=%.4f\n",
             pf_states[j], string(ok), Rj, Aj, proj, cosr, w)
     for k in 1:length(cys_map)
@@ -297,7 +339,7 @@ end
 
 # ---- Run: provide your PDB path or leave nothing to use mock data ----------
 # With your file:
- main("/content/AF-P04406-F1-model_v4.pdb"; R_bits=3, θ_thresh=0.0, α=3.0f0, delta=0.5)
+main("/content/AF-P04406-F1-model_v4.pdb"; R_bits=3, θ_thresh=0.0, α=3.0f0, delta=0.5)
 
 # Mock demo:
- #main(nothing; R_bits=3, θ_thresh=0.0, α=3.0f0, delta=0.5)
+# main(nothing; R_bits=3, θ_thresh=0.0, α=3.0f0, delta=0.5)
