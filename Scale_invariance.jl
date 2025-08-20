@@ -1,14 +1,9 @@
-# =============================================================================
-# Unified Oxi‑Shapes (R‑agnostic) – Modal topology + Simulation pipeline
-# =============================================================================
-
-using LinearAlgebra, SparseArrays, StaticArrays, GeometryBasics, Graphs
-using StatsBase, Statistics: mean
-using Random, UUIDs, BSON: @save, @load
-using Dates
+using LinearAlgebra, Statistics, Random, SparseArrays, UUIDs, Dates
+using StaticArrays, Graphs, StatsBase, GeometryBasics, BSON
+using BSON: @save
 
 # =========================
-# 1) R‑agnostic modal topology
+# 1) R-agnostic modal topology
 # =========================
 
 "All 2^R proteoform states as fixed-width binary strings."
@@ -66,35 +61,6 @@ function build_modal_topology(R::Int)
     return pf_states, flat_pos, edges
 end
 
-"Sample M canonical shortest geodesics from 0…0 to 1…1 by permuting bit-flip order."
-function sample_geodesics(R::Int; M::Int=6, seed::Int=0)
-    Random.seed!(seed)
-    start = lpad("0", R, '0')
-    goal  = lpad("1", R, '1')
-
-    orders = Vector{Vector{Int}}()
-    push!(orders, collect(1:R))
-    push!(orders, collect(R:-1:1))
-    while length(orders) < M
-        ord = collect(1:R)
-        shuffle!(ord)
-        any(==(ord), orders) || push!(orders, ord)
-    end
-
-    geodesics = Vector{Vector{String}}()
-    for ord in orders
-        s = start
-        path = String[s]
-        buf = Vector{UInt8}(s)
-        for i in ord
-            buf[i] = UInt8('1')  # flip 0→1 along this coordinate
-            push!(path, String(buf))
-        end
-        push!(geodesics, path)
-    end
-    return geodesics
-end
-
 # =========================
 # 2) Geometry on the modal graph
 # =========================
@@ -141,7 +107,6 @@ function GeoGraphReal(pf_states, flat_pos, edges)
     return GeoGraphReal(pf_states, flat_pos, edges, n, fx, fy, nbrs, d0, eidx, A, pts3D, Rbuf, anis)
 end
 
-"Update 3D embedding (z = −ρ) and compute discrete curvature + anisotropy bundles."
 function update_real_geometry!(G::GeoGraphReal, rho::Vector{Float32}; eps::Float32 = 1f-3)
     violated = Int[]
 
@@ -175,10 +140,11 @@ function update_real_geometry!(G::GeoGraphReal, rho::Vector{Float32}; eps::Float
     end
 
     for i in 1:G.n
-        vol = rho[i] + sum(rho[j] for j in G.neighbors[i])
+        # ✅ add init=0f0 so empty neighbor sets don’t crash
+        vol = rho[i] + sum(rho[j] for j in G.neighbors[i]; init=0f0)
         expected_vol = (1 + length(G.neighbors[i])) / G.n
-        vol_ok = abs(vol - expected_vol) ≤ eps
-        shape_ok = abs(G.R_vals[i]) ≤ eps * (1.0f0 + norm(G.anisotropy[i]))
+        vol_ok = abs(vol - expected_vol) <= eps
+        shape_ok = abs(G.R_vals[i]) <= eps * (1.0f0 + norm(G.anisotropy[i]))
         if !(vol_ok && shape_ok)
             push!(violated, i)
         end
@@ -196,8 +162,26 @@ end
     action_cost::Float32
 end
 
+struct Trace
+    steps::Vector{String}
+end
+
+struct FlowTrace
+    run_id::String
+    ρ_series::Vector{Vector{Float32}}
+    flux_series::Vector{Vector{Float32}}
+    R_series::Vector{Vector{Float32}}
+    k_states::Vector{Dict{Int, Float32}}
+    mean_oxidation_series::Vector{Float32}
+    shannon_entropy_series::Vector{Float32}
+    fisher_info_series::Vector{Float32}
+    transition_classes::Vector{Symbol}
+    lyapunov::Float32
+    action_cost::Float32
+end
+
 # =========================
-# 3) Real‑flow (Oxi‑Shapes Alive)
+# 3) Real-flow (Oxi-Shapes Alive)
 # =========================
 
 "Buffers derived from topology; includes degeneracy penalty by Hamming weight."
@@ -215,7 +199,7 @@ function init_alive_buffers!(G::GeoGraphReal, pf_states::Vector{String})
 end
 
 "Single step of occupancy transport with geometric penalties."
-function oxi_shapes_alive!(rho:Vector{Float32}, G::GeoGraphReal, buffers; max_moves::Int=10)
+function oxi_shapes_alive!(rho::Vector{Float32}, G::GeoGraphReal, buffers; max_moves::Int=10)
     n = G.n
     counts = buffers.counts
 
@@ -236,7 +220,7 @@ function oxi_shapes_alive!(rho:Vector{Float32}, G::GeoGraphReal, buffers; max_mo
         isempty(nonzero) && break
         i = rand(nonzero)
 
-        if counts[i] - buffers.outflow_int[i] ≤ 0
+        if counts[i] - buffers.outflow_int[i] <= 0
             continue
         end
 
@@ -269,7 +253,7 @@ function oxi_shapes_alive!(rho:Vector{Float32}, G::GeoGraphReal, buffers; max_mo
         chosen = nbrs[1]
         for (kk, j) in enumerate(nbrs)
             cum += ws[kk+1]
-            if cum ≥ r
+            if cum >= r
                 chosen = j
                 break
             end
@@ -295,6 +279,7 @@ function oxi_shapes_alive!(rho:Vector{Float32}, G::GeoGraphReal, buffers; max_mo
 
     return rho
 end
+
 
 # =========================
 # 4) Simplex + metrics
@@ -354,27 +339,11 @@ function classify_transition(prev::Vector{Float32}, curr::Vector{Float32}, pf_st
     end
 end
 
-"Pick the 'dominant' geodesic (most overlap with visited states)."
-function dominant_geodesic(trajectory::Vector{String}, geodesics::Vector{Vector{String}})
-    best_path, max_score = nothing, 0
-    for path in geodesics
-        score = count(s -> s in trajectory, path)
-        if score > max_score
-            max_score = score
-            best_path = path
-        end
-    end
-    return best_path
-end
-
-struct Trace
-    steps::Vector{String}
-end
 transitions(trace::Trace) = [(trace.steps[i], trace.steps[i+1]) for i in 1:length(trace.steps)-1]
 function compress(trace::Trace)
     compressed = String[]
     for step in trace.steps
-        if length(compressed) ≥ 2 && step == compressed[end-1]
+        if length(compressed) >= 2 && step == compressed[end-1]
             pop!(compressed)
         else
             push!(compressed, step)
@@ -400,27 +369,11 @@ end
 # 5) Flow tracing + rollout
 # =========================
 
-struct FlowTrace
-    run_id::String
-    ρ_series::Vector{Vector{Float32}}
-    flux_series::Vector{Vector{Float32}}
-    R_series::Vector{Vector{Float32}}
-    k_states::Vector{Dict{Int, Float32}}
-    mean_oxidation_series::Vector{Float32}
-    shannon_entropy_series::Vector{Float32}
-    fisher_info_series::Vector{Float32}
-    transition_classes::Vector{Symbol}
-    on_geodesic_flags::Vector{Bool}
-    geodesic_path::Vector{String}
-    lyapunov::Float32
-    action_cost::Float32
-end
-
-"One run: evolve ρ for T steps; compute metrics; mark geodesic overlap."
+"One run: evolve ρ for T steps; compute metrics."
 function record_flow_trace!(
     ρ0::Vector{Float32}, T::Int,
     pf_states::Vector{String}, flat_pos::Dict{String, Tuple{Float64, Float64}}, edges::Vector{Tuple{String, String}};
-    geodesics::Vector{Vector{String}}, max_moves_per_step::Int=10, run_id::String="default_run"
+    max_moves_per_step::Int=10, run_id::String="default_run"
 )
     ρ = copy(ρ0)
     ρ_series = [copy(ρ)]
@@ -431,7 +384,6 @@ function record_flow_trace!(
     shannon_entropy_series = Float32[]
     fisher_info_series = Float32[]
     transition_classes = Symbol[]
-    on_geodesic_flags = Bool[]
     trajectory = String[]
 
     cumulative_entropy = 0.0f0
@@ -470,15 +422,8 @@ function record_flow_trace!(
         push!(transition_classes, class)
     end
 
-    geo_path = dominant_geodesic(trajectory, geodesics)
-    for state in trajectory
-        push!(on_geodesic_flags, state in geo_path)
-    end
-
     lyap = Float32(lyapunov_exponent(ρ_series))
     action_cost = cumulative_entropy / Float32(max(T, 1))
-
-    trace_meta = trace_analysis(trajectory) # (optional, not returned here)
 
     return FlowTrace(
         run_id,
@@ -490,15 +435,13 @@ function record_flow_trace!(
         shannon_entropy_series,
         fisher_info_series,
         transition_classes,
-        on_geodesic_flags,
-        geo_path,
         lyap,
         action_cost
     )
 end
 
 "Batch rollout over many initials; returns FlowTraces + a simplex view."
-function rollout_batch(batch_id::String, initials, pf_states, flat_pos, edges, geodesics, T::Int)
+function rollout_batch(batch_id::String, initials, pf_states, flat_pos, edges, T::Int)
     flow_traces = FlowTrace[]
     simplex = Vector{Vector{GeoNode}}()
 
@@ -506,10 +449,9 @@ function rollout_batch(batch_id::String, initials, pf_states, flat_pos, edges, g
         ρ0 = sample.rho
         run_id = string(sample.uuid)
 
-        ft = record_flow_trace!(ρ0, T, pf_states, flat_pos, edges;
-                                geodesics=geodesics, run_id=run_id)
+        ft = record_flow_trace!(ρ0, T, pf_states, flat_pos, edges; run_id=run_id)
 
-        # Build a lightweight simplex of GeoNodes (per-step snapshots) for visualization/analysis
+        # Build a lightweight simplex of GeoNodes (per-step snapshots)
         nodes = Vector{GeoNode}()
         for t in 2:length(ft.ρ_series)
             ρ = ft.ρ_series[t]
@@ -555,14 +497,14 @@ function generate_safe_random_initials(n::Int, num_bins::Int; total::Int = 100)
         push!(samples, (uuid=uuid4(), counts=counts, rho=rho))
     end
 
-    @save "initials_$batch_id.bson" samples
+    BSON.@save "initials_$batch_id.bson" samples
     return batch_id, samples
 end
 
 "Persist run artifacts."
 function save_run_data(batch_id::String, flow_traces, simplex)
-    @save "flow_traces_$batch_id.bson" flow_traces
-    @save "simplex_$batch_id.bson" simplex
+    BSON.@save "flow_traces_$batch_id.bson" flow_traces
+    BSON.@save "simplex_$batch_id.bson" simplex
     println("✔ Saved run summary:")
     println("→ FlowTraces: ", length(flow_traces))
     println("→ Simplex: ", length(simplex))
@@ -572,22 +514,17 @@ end
 # 6) Simulation config & execution
 # =========================
 
-# ---- Choose dimensionality here ----
-R = 3                     # set e.g. 4, 6, 8, 10 for scale-invariance tests
+R = 4  # dimensionality
 pf_states, flat_pos, edges = build_modal_topology(R)
-geodesics = sample_geodesics(R; M=min(6, max(2, R)))  # a small canonical set
 
-# ---- Workload parameters (adjust as needed) ----
-num_initials      = 200        # number of initial distributions (bins = 2^R)
-total_molecules   = 100        # discrete mass per distribution
-simulation_steps  = 200        # steps per simulation
+num_initials      = 10     # number of initial distributions
+total_molecules   = 100    # discrete mass per distribution
+simulation_steps  = 100    # steps per simulation
 
-# ---- Generate initials ----
 batch_id, initials = generate_safe_random_initials(num_initials, length(pf_states); total=total_molecules)
 println("✔ Generated initials for batch: $batch_id  (R = $R, states = $(length(pf_states)))")
 
-# ---- Run rollout ----
-flow_traces, simplex = rollout_batch(batch_id, initials, pf_states, flat_pos, edges, geodesics, simulation_steps)
+flow_traces, simplex = rollout_batch(batch_id, initials, pf_states, flat_pos, edges, simulation_steps)
 
 println("→ FlowTraces: ", length(flow_traces))
 println("→ Simplex:    ", length(simplex))
