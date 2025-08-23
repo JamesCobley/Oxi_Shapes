@@ -1,2 +1,2 @@
-# Oxi_Shapes
+# Modal Geometry Governs Proteoform Dynamics
 This 
