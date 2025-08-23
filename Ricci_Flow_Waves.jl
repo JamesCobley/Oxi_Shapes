@@ -2,9 +2,9 @@ using BSON: @load
 using Statistics
 using PyPlot
 using FFTW
-using DSP  # windowing + stft + hilbert
+using DSP    # hanning, hilbert
 
-# --- Re-declare FlowTrace so BSON can reconstruct it ---
+# --- FlowTrace type so @load can reconstruct ---
 struct FlowTrace
     run_id::String
     ρ_series::Vector{Vector{Float32}}
@@ -21,10 +21,10 @@ struct FlowTrace
     action_cost::Float32
 end
 
-# --- Load trajectories ---
 @load "flow_traces_batch_20250524_152552.bson" flow_traces
 
-# === Ricci spread function ===
+# Ricci spread Φ and degeneracy D
+const N = 8
 ricci_spread(ρ::Vector{Float32}) = begin
     p = ρ ./ sum(ρ)
     s = 0.0
@@ -36,109 +36,52 @@ ricci_spread(ρ::Vector{Float32}) = begin
     return s
 end
 
-# === Compute Ricci time series for each trajectory ===
-ricci_series = [ [ricci_spread(ρ) for ρ in ft.ρ_series] for ft in flow_traces ]
+degeneracy_from_phi(phi::Float64) = 1.0 / (phi + 1/N)             # in [1, N]
+norm_amplitude(phi::Float64) = (degeneracy_from_phi(phi) - 1) / (N - 1)  # in [0,1]
 
-# -------------------------
-# 1) Waveform bundle plot
-# -------------------------
+# Build time series
+phi_series = [ [ricci_spread(ρ) for ρ in ft.ρ_series] for ft in flow_traces ]
+len = minimum(length.(phi_series))
+Φmat = hcat([Float64.(s[1:len]) for s in phi_series]...)'   # (traj × time)
+
+# Degeneracy amplitude
+Dmat = 1.0 ./ (Φmat .+ 1/N)                 # (traj × time), values in [1,8]
+Amat = (Dmat .- 1.0) ./ (N - 1.0)           # normalized [0,1]
+
+# Plot bundle (degeneracy as amplitude)
 fig, ax = subplots(figsize=(8,5))
-
-m = min(length(ricci_series), 50)
-for rs in ricci_series[1:m]
-    ax.plot(rs, alpha=0.2)
+m = min(size(Dmat,1), 50)
+for i in 1:m
+    ax.plot(Dmat[i, :], alpha=0.25)
 end
-
-len = minimum(length.(ricci_series))               # align length
-mat = hcat([Float64.(rs[1:len]) for rs in ricci_series]...)'  # rows=traj, cols=time
-mean_curve = mean(mat, dims=1)[:]
-std_curve  = std(mat,  dims=1)[:]
-
-ax.plot(mean_curve, lw=2, label="Mean Ricci flow", color="black")
-ax.fill_between(1:len, mean_curve .- std_curve, mean_curve .+ std_curve,
-                alpha=0.3, label="±1 std", color="gray")
+meanD = mean(Dmat, dims=1)[:]
+stdD  = std(Dmat,  dims=1)[:]
+ax.plot(meanD, color="black", lw=2, label="Mean degeneracy D(t)")
+ax.fill_between(1:len, meanD .- stdD, meanD .+ stdD, color="gray", alpha=0.3, label="±1 sd")
 ax.set_xlabel("Time step")
-ax.set_ylabel("Ricci spread Φ(ρ)")
-ax.set_title("Ricci flow as a bundle of waves")
-ax.legend(loc="best")
+ax.set_ylabel("Degeneracy D(t)  (1…8)")
+ax.set_title("Ricci-flow amplitude as modal degeneracy")
+ax.legend()
 tight_layout()
-savefig("ricci_flow_shape.png", dpi=300)
-println("Saved: ricci_flow_shape.png")
+savefig("degeneracy_wave_bundle.png", dpi=300)
 
-# -----------------------------------
-# 2) Frequency basis (Fourier modes)
-# -----------------------------------
-L = len
-w  = hanning(L)                               # mild taper to reduce leakage
+# Analytic signal on *degeneracy* (instantaneous frequency)
+z = hilbert(meanD .- mean(meanD))
+amp_D   = abs.(z)                       # envelope (still in degeneracy units)
+phase_D = angle.(z)
+instfreq = vcat(0.0, diff(unwrap(phase_D)) ./ (2π))   # cycles per step
 
-power_spectrum(x::Vector{Float64}) = begin
-    y = (x .- mean(x)) .* w
-    Y = rfft(y)
-    P = abs.(Y).^2 / length(y)                # simple power (one-sided)
-    return P
-end
+fig2, (ax1, ax2) = subplots(2,1, figsize=(8,5), sharex=true)
+ax1.plot(meanD, lw=1.5, label="D(t)")
+ax1.plot(amp_D, lw=1.0, label="Hilbert envelope", alpha=0.8)
+ax1.set_ylabel("Degeneracy")
+ax1.legend(loc="best")
+ax1.set_title("Degeneracy amplitude and instantaneous frequency")
 
-spectra = [ power_spectrum(vec(mat[i, :])) for i in 1:size(mat,1) ]
-Smat    = hcat(spectra...)                    # rows=freq bins, cols=trajectories
-Pmean   = mean(Smat, dims=2)[:]
-Pstd    = std(Smat,  dims=2)[:]
-freqs   = collect(0:div(L,2)) ./ L            # Δt=1 ⇒ freq in 1/steps
-
-fig2, ax2 = subplots(figsize=(8,4))
-ax2.plot(freqs, Pmean, lw=2, label="Mean power")
-ax2.fill_between(freqs, max.(Pmean .- Pstd, 0), Pmean .+ Pstd, alpha=0.25, label="±1 std")
-ax2.set_xlim(0, maximum(freqs))
-ax2.set_xlabel("Frequency (1/steps)")
-ax2.set_ylabel("Power")
-ax2.set_title("Ricci wave frequency basis (ensemble)")
-ax2.legend(loc="best")
+ax2.plot(instfreq)
+ax2.set_xlabel("Time (steps)")
+ax2.set_ylabel("Inst. frequency (cycles/step)")
 tight_layout()
-savefig("ricci_wave_spectrum.png", dpi=300)
-println("Saved: ricci_wave_spectrum.png")
+savefig("degeneracy_wave_analytic.png", dpi=300)
 
-# --------------------------------------------------------
-# 3) Time–frequency view (STFT) on the ensemble mean curve
-# --------------------------------------------------------
-# Short-Time Fourier Transform using DSP.stft
-wlen = min(64, L)                  # window length
-hop  = max(1, Int(wlen ÷ 4))       # hop size
-x    = mean_curve .- mean(mean_curve)
-
-# stft(signal, nwin, noverlap? via hop; window=windowfunc, nfft=?, fs=?)
-# Here: nwin = wlen, hop = hop, window = hanning (built-in generator)
-S = stft(x, wlen, hop; window = hanning)  # returns (freq_bins × frames) complex matrix
-
-nfbins, nframes = size(S)
-tfreqs = collect(0:nfbins-1) ./ wlen      # frequency axis (1/steps)
-ttimes = collect(0:nframes-1) .* hop .+ wlen/2  # time at window centers
-
-fig3, ax3 = subplots(figsize=(8,4))
-im = ax3.imshow(abs.(S); origin="lower", aspect="auto",
-                extent=[ttimes[1], ttimes[end], tfreqs[1], tfreqs[end]])
-ax3.set_xlabel("Time (steps)")
-ax3.set_ylabel("Frequency (1/steps)")
-ax3.set_title("Ricci flow spectrogram (ensemble mean)")
-fig3.colorbar(im, ax=ax3, label="Magnitude")
-tight_layout()
-savefig("ricci_wave_spectrogram.png", dpi=300)
-println("Saved: ricci_wave_spectrogram.png")
-
-
-# --------------------------------------------------------
-# 4) Optional: analytic signal (amplitude & phase) of mean Ricci wave
-# --------------------------------------------------------
-z = hilbert(mean_curve .- mean(mean_curve))        # complex Ricci wave
-amp = abs.(z)
-phase = angle.(z)
-
-fig4, (ax4a, ax4b) = subplots(2, 1, figsize=(8,5), sharex=true)
-ax4a.plot(amp, lw=1.5)
-ax4a.set_ylabel("Amplitude")
-ax4a.set_title("Analytic Ricci wave (ensemble mean)")
-
-ax4b.plot(phase, lw=1.0)
-ax4b.set_xlabel("Time (steps)")
-ax4b.set_ylabel("Phase (rad)")
-tight_layout()
-savefig("ricci_wave_analytic.png", dpi=300)
-println("Saved: ricci_wave_analytic.png")
+println("Saved: degeneracy_wave_bundle.png, degeneracy_wave_analytic.png")
