@@ -341,10 +341,11 @@ for b in 1:3
 end
 
 # Persistent topology on the substrate → Morse landscape
-w_morse, tau0, tau1 = morse_topology_weights(coords, cys_map)
+w_morse, tau0, tau1 = morse_topology_weights(coords, cys_map, Wreal)
 println("\n=== Substrate topology → Morse weights ===")
 for b in 1:3
-    @printf("bit %d : depth(H0)=%.6f  loops(H1)=%.6f  wM=%.6f\n", b, tau0[b], tau1[b], w_morse[b])
+    @printf("bit %d : depth(H0)=%.6f  loops(H1)=%.6f  wM=%.6f\n", 
+            b, tau0[b], tau1[b], w_morse[b])
 end
 
 # Build three modal Laplacians: energy-only, morse-only, and fused (average & tropical)
