@@ -269,6 +269,23 @@ function modal_curvature(Ld::AbstractMatrix; src_state::String="000")
     return R, φ
 end
 
+# ---------- Vibrational eigenmodes of modal Laplacian ----------
+"""
+    vibrational_modes(Ld; k=5)
+
+Compute the lowest-k nonzero eigenvalues/eigenvectors of the modal Laplacian.
+Eigenvalues λ correspond to squared vibrational frequencies ω²,
+and eigenvectors are the vibrational eigenmodes.
+"""
+function vibrational_modes(Ld::AbstractMatrix; k::Int=5)
+    F = eigen(Symmetric(Matrix(Ld)))
+    vals, vecs = F.values, F.vectors
+    # Discard near-zero eigenvalues (numerical nullspace)
+    idxs = findall(>(1e-8), vals)
+    keep = first(idxs, min(k, length(idxs)))
+    return vals[keep], vecs[:, keep]
+end
+
 # =============================== RUN =============================
 pdb = "/content/AF-P04406-F1-model_v4.pdb"   # <-- your PDB
 T   = 293.15                                  # 20 °C test
@@ -315,4 +332,10 @@ println("\n--- ΔG‡-weighted channel diagnostics ---")
 @printf("Curvature sum: %.3e\n", sum(R_G))
 for s in STATES[1:5]
     @printf("  %s : R=%.3e\n", s, R_G[IDX[s]])
+end
+
+println("\n=== Vibrational eigenmodes of modal Laplacian (ΔG‡ channel) ===")
+eigvals, eigvecs = vibrational_modes(LdG; k=5)
+for i in 1:length(eigvals)
+    @printf("mode %d : ω²=%.6f   ω=%.6f\n", i, eigvals[i], sqrt(eigvals[i]))
 end
