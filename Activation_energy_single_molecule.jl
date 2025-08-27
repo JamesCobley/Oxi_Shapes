@@ -332,63 +332,67 @@ Returns:
 - report   : summary string
 """
 # ---------- Spectroscopic vibrational gating ----------
-"""
-    vibrational_gating(T, Eb; ν0=700.0, entropy_corr=true)
-
-Rescale geometric Dirichlet-derived energies into chemically realistic
-activation energies by anchoring them to a vibrational quantum.
-
-Arguments:
-- `T`   : temperature (K)
-- `Eb`  : vector of geometric Dirichlet energies per bit (dimensionless)
-- `ν0`  : reference vibrational frequency (cm^-1). Default = 700 cm^-1
-- `entropy_corr` : whether to include a small entropic correction term
-
-Returns:
-- ΔG_gated : vector of gated activation energies (J/mol)
-- weights  : normalized Boltzmann weights exp(-ΔG_gated/RT)
-- table    : human-readable summary (for printing)
-"""
-function vibrational_gating(
+function vibrational_gating_spectrum(
     T::Float64,
-    Eb::Vector{Float64};
+    Eb::Vector{Float64},
+    S_modal::Matrix{Float64},
+    λ::Vector{Float64};
     ν0::Float64 = 700.0,
-    entropy_corr::Bool = true
+    γ_modal::Float64 = 1.0,
+    target_mean_quanta::Float64 = 3.5  # sets scale of N; tweak if you want 2–5, etc.
 )
-    # Physical constants
-    Rgas = 8.314462618          # J/mol/K
-    hc_per_cm = 0.01196e3       # J/mol per cm^-1 (≈0.01196 kJ/mol)
-    RT = Rgas * T
+    Rgas = 8.314462618
+    RT   = Rgas * T
+    hc_per_cm = 0.01196e3          # J/mol per cm^-1
+    one_quantum = hc_per_cm * ν0
 
-    # Energy per quantum at ν0
-    one_quantum = hc_per_cm * ν0   # J/mol
     nbits = length(Eb)
+    @assert nbits <= length(λ)-1 "Need at least nbits nonzero λ entries (λ1=0)."
+
+    # Map bit b ↔ smallest nonzero modes λ[2], λ[3], λ[4], ...
+    ω = sqrt.(max.(λ[2:1+nbits], 1e-15))  # dimensionless “frequencies”
+
+    # Choose a scale κ so that mean(N_raw) ≈ target_mean_quanta
+    # N_raw = κ * ω / ν0  ⇒  κ = target_mean_quanta * ν0 / mean(ω)
+    κ = target_mean_quanta * ν0 / mean(ω)
 
     ΔG_gated = zeros(Float64, nbits)
     weights  = zeros(Float64, nbits)
-    table = IOBuffer()
-
-    println(table, "\n=== Spectroscopic vibrational gating at ν0=$(ν0) cm^-1 ===")
-    @printf(table, "One quantum = %.2f kJ/mol\n", one_quantum/1e3)
+    io = IOBuffer()
+    println(io, "\n=== Spectroscopic vibrational gating (spectrum-tied) ===")
+    @printf(io, "ν0 = %.1f cm^-1  →  one quantum = %.2f kJ/mol\n", ν0, one_quantum/1e3)
 
     for b in 1:nbits
-        ΔG_geom = RT * Eb[b]                      # small geometric penalty
-        N = round(Int, one_quantum > 0 ? (ΔG_geom / RT * 8) : 0)  # toy scaling for N
+        # Real term (protein PDE)
+        ΔG_real  = RT * Eb[b]
+
+        # Modal Morse saddle: take the edge 000 → flip(bit b)
+        s = "000"
+        t = hamming1_neighbors(s)[b]
+        i, j = IDX[s], IDX[t]
+        ΔG_modal = γ_modal * RT * S_modal[i,j]
+
+        # Geometric barrier: real + modal (in J/mol)
+        ΔG_geom = ΔG_real + ΔG_modal
+
+        # Quanta from spectrum: N_b = round( κ * ω_b / ν0 ), at least 1
+        N = max(1, round(Int, κ * ω[b] / ν0))
+
         add_vib = N * one_quantum
-        TΔS = entropy_corr ? ( (randn()*0.2) * 1e3 ) : 0.0  # stub: can refine later
+        ΔG_g = ΔG_geom + add_vib              # gated barrier
+        ΔG_gated[b] = ΔG_g
+        weights[b]  = exp(-ΔG_g / RT)
 
-        ΔG_gated[b] = ΔG_geom + add_vib - TΔS
-        weights[b] = exp(-ΔG_gated[b]/RT)
-
-        @printf(table,
-            "bit %d : N=%d  ΔG_geom=%.2f  add_vib=%.2f  TΔS=%.2f  ⇒  ΔG_gated=%.2f kJ/mol\n",
-            b, N, ΔG_geom/1e3, add_vib/1e3, TΔS/1e3, ΔG_gated[b]/1e3)
+        @printf(io,
+            "bit %d : ΔG_real=%.2f  ΔG_modal=%.2f  N=%d  add_vib=%.2f  ⇒  ΔG_gated=%.2f kJ/mol\n",
+            b, ΔG_real/1e3, ΔG_modal/1e3, N, add_vib/1e3, ΔG_g/1e3)
     end
 
-    weights ./= sum(weights)  # normalize to 1
-    @printf(table, "\nGated weights [bits] = %s\n", string(round.(weights, digits=3)))
+    # Normalize weights
+    weights ./= sum(weights)
+    @printf(io, "\nGated weights [bits] = %s\n", string(round.(weights, digits=3)))
 
-    return ΔG_gated, weights, String(take!(table))
+    return ΔG_gated, weights, String(take!(io))
 end
 
 # =============================== RUN =============================
@@ -451,5 +455,13 @@ for k in 1:length(vals_curved)
     @printf("λ[%d] = %.6f  (ω = %.6f)\n", k, vals_curved[k], sqrt(max(vals_curved[k],0.0)))
 end
 
-ΔG_gated, w_gated, report = vibrational_gating(T, Eb; ν0=700.0)
+
+# after you've computed φ and S_modal, and have Ldρ already:
+F = eigen(Symmetric(Matrix(Ldρ)))
+λ = F.values
+
+F = eigen(Symmetric(Matrix(Ldρ)))
+λ = F.values
+
+ΔG_gated, w_gated, report = vibrational_gating_spectrum(T, Eb, S_modal, λ; ν0=700.0, γ_modal=1.0)
 println(report)
